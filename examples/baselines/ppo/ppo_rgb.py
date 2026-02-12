@@ -294,6 +294,7 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
+    run_dir = f"{args.env_id}/{run_name}"
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -318,13 +319,13 @@ if __name__ == "__main__":
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
     if args.capture_video:
-        eval_output_dir = f"runs/{run_name}/videos"
+        eval_output_dir = f"runs/{run_dir}/videos"
         if args.evaluate:
             eval_output_dir = f"{os.path.dirname(args.checkpoint)}/test_videos"
         print(f"Saving eval videos to {eval_output_dir}")
         if args.save_train_video_freq is not None:
             save_video_trigger = lambda x : (x // args.num_steps) % args.save_train_video_freq == 0
-            envs = RecordEpisode(envs, output_dir=f"runs/{run_name}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
+            envs = RecordEpisode(envs, output_dir=f"runs/{run_dir}/train_videos", save_trajectory=False, save_video_trigger=save_video_trigger, max_steps_per_video=args.num_steps, video_fps=30)
         eval_envs = RecordEpisode(eval_envs, output_dir=eval_output_dir, save_trajectory=args.evaluate, trajectory_name="trajectory", max_steps_per_video=args.num_eval_steps, video_fps=30)
     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
@@ -349,7 +350,7 @@ if __name__ == "__main__":
                 group=args.wandb_group,
                 tags=["ppo", "walltime_efficient"]
             )
-        writer = SummaryWriter(f"runs/{run_name}")
+        writer = SummaryWriter(f"runs/{run_dir}")
         writer.add_text(
             "hyperparameters",
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
@@ -415,7 +416,7 @@ if __name__ == "__main__":
             if args.evaluate:
                 break
         if args.save_model and iteration % args.eval_freq == 1:
-            model_path = f"runs/{run_name}/ckpt_{iteration}.pt"
+            model_path = f"runs/{run_dir}/ckpt_{iteration}.pt"
             torch.save(agent.state_dict(), model_path)
             print(f"model saved to {model_path}")
         # Annealing the rate if instructed to do so.
@@ -586,7 +587,7 @@ if __name__ == "__main__":
             logger.add_scalar(f"time/total_{k}", v, global_step)
         logger.add_scalar("time/total_rollout+update_time", cumulative_times["rollout_time"] + cumulative_times["update_time"], global_step)
     if args.save_model and not args.evaluate:
-        model_path = f"runs/{run_name}/final_ckpt.pt"
+        model_path = f"runs/{run_dir}/final_ckpt.pt"
         torch.save(agent.state_dict(), model_path)
         print(f"model saved to {model_path}")
 

@@ -6,7 +6,8 @@ _ext
 build/
 dist/
 *.egg-info/
-
+.venv
+wandb
 # ipython/jupyter notebooks
 # *.ipynb
 **/.ipynb_checkpoints/

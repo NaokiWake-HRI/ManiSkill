@@ -101,6 +101,8 @@ class Args:
     """evaluation frequency in terms of iterations"""
     save_train_video_freq: Optional[int] = None
     """frequency to save training videos in terms of iterations"""
+    output_dir: Optional[str] = None
+    """override the run directory under runs/ (e.g. 'debug')"""
     finite_horizon_gae: bool = False
 
 
@@ -181,7 +183,11 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
-    run_dir = f"{args.env_id}/{run_name}"
+    date_str = time.strftime("%Y-%m-%d")
+    if args.output_dir is not None:
+        run_dir = f"{args.output_dir}/{date_str}/{run_name}"
+    else:
+        run_dir = f"{args.env_id}/{date_str}/{run_name}"
 
 
     # TRY NOT TO MODIFY: seeding

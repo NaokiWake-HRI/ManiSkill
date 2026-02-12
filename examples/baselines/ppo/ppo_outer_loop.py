@@ -553,12 +553,23 @@ def run_ppo_training(
             latest_eval_reward_breakdowns = step_breakdowns_list
 
             # Record learning curve point (Eureka-style)
-            learning_curve.append({
+            lc_point = {
                 "step": global_step,
                 "avg_return": latest_eval_metrics.get("return", 0.0),
                 "success_at_end": latest_eval_metrics.get("success_at_end", 0.0),
                 "success_once": latest_eval_metrics.get("success_once", 0.0),
-            })
+                "success_rate": latest_eval_metrics.get("success_at_end", 0.0),
+            }
+            # Add per-component reward means (Eureka-style)
+            if step_breakdowns_list:
+                comp_means = {}
+                for key in step_breakdowns_list[0]:
+                    if key == "norm_scale":
+                        continue
+                    vals = [bd[key] for bd in step_breakdowns_list]
+                    comp_means[key] = sum(vals) / len(vals)
+                lc_point["reward_components"] = comp_means
+            learning_curve.append(lc_point)
 
         if args.save_model and iteration % args.eval_freq == 1:
             model_path = f"runs/{run_dir}/iter_{outer_iter+1:02d}_ckpt_{iteration}.pt"
@@ -931,35 +942,30 @@ if __name__ == "__main__":
                         "length": args.num_eval_steps,
                     }
 
-                    try:
-                        vlm_score, vlm_comment, _ = vlm.evaluate(frames, episode_info)
-                        print(f"[VLM] Analysis:\n{vlm_comment}")
+                    vlm_score, vlm_comment, _ = vlm.evaluate(frames, episode_info)
+                    print(f"[VLM] Analysis:\n{vlm_comment}")
 
-                        # Save VLM debug HTML
-                        debug_dir = Path(f"runs/{run_dir}/debug_html")
-                        vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
-                        save_vlm_debug_html(
-                            frames=frames,
-                            prompt=build_vlm_prompt(args.env_id),
-                            episode_info=episode_info,
-                            vlm_score=vlm_score,
-                            vlm_comment=vlm_comment,
-                            save_path=vlm_html_path,
-                            max_frames=args.vlm_max_frames,
+                    # Save VLM debug HTML
+                    debug_dir = Path(f"runs/{run_dir}/debug_html")
+                    vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
+                    save_vlm_debug_html(
+                        frames=frames,
+                        prompt=build_vlm_prompt(args.env_id),
+                        episode_info=episode_info,
+                        vlm_score=vlm_score,
+                        vlm_comment=vlm_comment,
+                        save_path=vlm_html_path,
+                        max_frames=args.vlm_max_frames,
+                    )
+
+                    # Append per-step reward plot
+                    if args.vlm_reward_plot and result["step_rewards"]:
+                        step_rewards_tensor = torch.stack(result["step_rewards"])
+                        plot_html = generate_reward_plot_html(
+                            step_rewards_tensor, args.num_eval_envs,
+                            breakdowns=result["reward_breakdowns"],
                         )
-
-                        # Append per-step reward plot
-                        if args.vlm_reward_plot and result["step_rewards"]:
-                            step_rewards_tensor = torch.stack(result["step_rewards"])
-                            plot_html = generate_reward_plot_html(
-                                step_rewards_tensor, args.num_eval_envs,
-                                breakdowns=result["reward_breakdowns"],
-                            )
-                            append_html_to_file(vlm_html_path, plot_html)
-
-                    except Exception as e:
-                        print(f"[VLM] Error: {e}")
-                        vlm_comment = f"VLM analysis failed: {e}"
+                        append_html_to_file(vlm_html_path, plot_html)
                 else:
                     print("[warn] No frames extracted from video")
             else:
@@ -1016,6 +1022,16 @@ if __name__ == "__main__":
                     ),
                 }
 
+                # Compute per-component reward means from final eval (Eureka-style)
+                reward_components = {}
+                if result.get("reward_breakdowns"):
+                    bds = result["reward_breakdowns"]
+                    for key in bds[0]:
+                        if key == "norm_scale":
+                            continue
+                        vals = [bd[key] for bd in bds]
+                        reward_components[key] = sum(vals) / len(vals)
+
                 training_summary = {
                     "current_weights": dict(current_weights),
                     "initial_weights": initial_weights,
@@ -1023,6 +1039,7 @@ if __name__ == "__main__":
                     "total_iterations": args.num_outer_iters,
                     "total_timesteps": global_step_offset,
                     "avg_return": avg_return,
+                    "success_rate": success_at_end,
                     "success_at_end": success_at_end,
                     "success_once": success_once,
                     "vlm_avg_score": 0.5,
@@ -1030,6 +1047,7 @@ if __name__ == "__main__":
                     "num_episodes": int(eval_metrics.get("num_episodes", 0)),
                     "llm_task_description": _llm_task_descs.get(task_id, ""),
                     "learning_curve": result["learning_curve"],
+                    "reward_components": reward_components,
                 }
 
                 # Add past iteration history for LLM context
@@ -1040,6 +1058,7 @@ if __name__ == "__main__":
                             "iteration": h["outer_iter"],
                             "weights": h["weights"],
                             "avg_return": h["avg_return"],
+                            "success_rate": h["success_at_end"],
                             "success_at_end": h["success_at_end"],
                             "success_once": h["success_once"],
                             "learning_curve": h.get("learning_curve", []),
@@ -1047,12 +1066,13 @@ if __name__ == "__main__":
                         for h in outer_loop_history
                     ]
                     # Weight change history: what was changed and why
-                    training_summary["param_change_history"] = [
+                    training_summary["history_summary"] = [
                         {
                             "iteration": h["outer_iter"],
-                            "weights_used": h["weights"],
+                            "changes": h.get("rationale", "N/A"),
                             "result": {
                                 "avg_return": h["avg_return"],
+                                "success_rate": h["success_at_end"],
                                 "success_at_end": h["success_at_end"],
                                 "success_once": h["success_once"],
                             },
@@ -1062,39 +1082,36 @@ if __name__ == "__main__":
                         for h in outer_loop_history
                     ]
 
-                try:
-                    suggestions = llm.suggest_parameters(training_summary)
+                suggestions = llm.suggest_parameters(training_summary)
 
-                    # Save LLM debug HTML
-                    query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                    llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
-                    llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
-                    debug_dir = Path(f"runs/{run_dir}/debug_html")
-                    save_llm_debug_html(
-                        iteration=outer_iter,
-                        prompt=llm_prompt,
-                        response_text=llm_response,
-                        suggestions=suggestions,
-                        summary_for_llm=training_summary,
-                        save_path=debug_dir / f"iter_{outer_iter+1:02d}_llm.html",
-                    )
+                # Save LLM debug HTML
+                query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                debug_dir = Path(f"runs/{run_dir}/debug_html")
+                save_llm_debug_html(
+                    iteration=outer_iter,
+                    prompt=llm_prompt,
+                    response_text=llm_response,
+                    suggestions=suggestions,
+                    summary_for_llm=training_summary,
+                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_llm.html",
+                )
 
-                    if suggestions and suggestions.get("type") == "params":
-                        new_params = suggestions.get("params", {})
-                        rationale = suggestions.get("rationale", "No rationale")
-                        if new_params:
-                            print(f"[LLM] Rationale: {rationale}")
-                            print(f"[LLM] Suggested weights: {new_params}")
-                            new_weights_suggestion = {
-                                "params": new_params,
-                                "rationale": rationale,
-                            }
-                        else:
-                            print("[LLM] No weight changes suggested")
+                if suggestions and suggestions.get("type") == "params":
+                    new_params = suggestions.get("params", {})
+                    rationale = suggestions.get("rationale", "No rationale")
+                    if new_params:
+                        print(f"[LLM] Rationale: {rationale}")
+                        print(f"[LLM] Suggested weights: {new_params}")
+                        new_weights_suggestion = {
+                            "params": new_params,
+                            "rationale": rationale,
+                        }
                     else:
-                        print(f"[LLM] Unexpected suggestion type: {suggestions}")
-                except Exception as e:
-                    print(f"[LLM] Error: {e}")
+                        print("[LLM] No weight changes suggested")
+                else:
+                    print(f"[LLM] Unexpected suggestion type: {suggestions}")
 
         # Record history
         iter_record = {

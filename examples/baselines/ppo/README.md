@@ -90,6 +90,133 @@ python -m mani_skill.trajectory.replay_trajectory \
 
 This will use environment states to replay trajectories, turn on the ray-tracer (There is also "rt" which is higher quality but slower), and save all videos including failed trajectories.
 
+## PickCubePandaAllegro (Dexterous Hand)
+
+Training PPO for the Panda + Allegro dexterous hand on PickCube.
+
+### Scripted Demo (Reference Trajectory Generation)
+
+Scripted phase-based heuristic that generates approach -> descend -> grasp -> lift trajectories. Useful for producing demonstration data or verifying the environment.
+
+```bash
+# Visualise:
+python -m mani_skill.examples.demo_scripted_pick_cube_allegro \
+    --render-mode human --shader rt-fast
+
+# Record HDF5 trajectories:
+python -m mani_skill.examples.demo_scripted_pick_cube_allegro \
+    --num-episodes 100 --record-dir demos/PickCubePandaAllegro-v1
+
+# Convert to coupled control mode for RL:
+python -m mani_skill.trajectory.replay_trajectory \
+    demos/PickCubePandaAllegro-v1/trajectory.h5 \
+    --save-traj -c pd_joint_delta_pos_coupled -o state
+```
+
+Key parameters in `mani_skill/examples/demo_scripted_pick_cube_allegro.py`:
+
+| Parameter | Description |
+|---|---|
+| `GRASP_XY_OFFSET` | TCP XY offset from cube centre (negative X = toward robot base) |
+| `GRASP_Z_OFFSET` | TCP height above cube centre for grasping |
+| `APPROACH_Z_OFFSET` | Safe height above cube during approach |
+| `ARM_GAIN` | Proportional gain for position delta (lower = slower) |
+
+Control mode: `pd_ee_target_delta_pose` (22D: arm pos 3D + rot 3D + hand 16D absolute joint pos). Rotation delta is kept at zero to lock wrist orientation.
+
+### PPO Training (Coupled Fingers)
+
+```bash
+# Quick debug (see allegro_debug.sh):
+bash allegro_debug.sh
+
+# Manually:
+python ppo.py \
+  --env_id="PickCubePandaAllegro-v1" \
+  --control_mode="pd_joint_delta_pos_coupled" \
+  --num_envs=4096 --num_steps=100 --num_eval_steps=100 \
+  --update_epochs=8 --num_minibatches=32 \
+  --gamma=0.95 --gae_lambda=0.95 --ent_coef=0.01 \
+  --total_timesteps=50_000_000 \
+  --finite_horizon_gae --partial_reset
+```
+
+Control mode `pd_joint_delta_pos_coupled` uses 15D action space: 7 arm joints + 4 index finger + 4 thumb (middle/ring fingers mirror index via `PDJointPosMimicController`).
+
+The environment uses a 6-stage dense reward: reaching + contact (opposing grasp) + lift (gated by contact) + place (gated by grasp) + static.
+
+### Touch Variant (FSR Tactile Sensors)
+
+```bash
+python ppo.py \
+  --env_id="PickCubePandaAllegroTouch-v1" \
+  --control_mode="pd_joint_delta_pos_coupled" \
+  --num_envs=4096 --num_steps=100 \
+  --total_timesteps=50_000_000
+```
+
+Same as above but with FSR tactile sensor observations and direction-aware contact reward.
+
+## Iterative VLM/LLM Reward Tuning
+
+`ppo_iterative.py` splits training into segments and uses VLM (video analysis) + LLM for reward weight adjustment between segments.
+
+```bash
+# With VLM/LLM:
+export OPENAI_API_KEY=sk-... && python ppo_iterative.py \
+  --env_id="PickCubePandaAllegro-v1" \
+  --control_mode="pd_joint_delta_pos_coupled" \
+  --num_envs=256 --num_steps=100 \
+  --total_timesteps=10_000_000 --num_segments=10
+
+# Without VLM/LLM (reward wrapper only, for debugging):
+python ppo_iterative.py --env_id="PickCube-v1" \
+  --total_timesteps=10_000_000 --num_segments=10 --skip_vlm_llm
+```
+
+See `baselines_iterative.sh` for full baseline commands.
+
+## Outer Loop Reward Optimization
+
+`ppo_outer_loop.py` runs full PPO training with fixed weights per iteration, then uses VLM/LLM to suggest new weights and restarts from scratch. Iteration 1 (random weights) serves as the baseline.
+
+```bash
+# VLM + LLM mode (default):
+export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py \
+  --env_id="PickCube-v1" --num_outer_iters=5
+
+# Eureka mode (LLM-only, learning curve data):
+export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py \
+  --env_id="PickCube-v1" --eureka_mode
+
+# Debug (no VLM/LLM):
+python ppo_outer_loop.py --env_id="PickCube-v1" \
+  --skip_vlm_llm --num_outer_iters=2 --total_timesteps_per_iter=50000
+```
+
+See `outer_loop_run.sh` for multi-task experiment commands.
+
+### Reward Wrapper
+
+`reward_wrapper.py` provides a configurable `RewardWrapper` with per-component weights. Supported tasks: PickCube, PushCube, OpenCabinetDoor/Drawer. Use with `reward_mode="none"` and place before `ManiSkillVectorEnv`.
+
+## File Overview
+
+| File | Description |
+|---|---|
+| `ppo.py` | Standard PPO (CleanRL-based, state-based) |
+| `ppo_fast.py` | PPO with CUDA Graphs (requires torchrl/tensordict) |
+| `ppo_rgb.py` | PPO with RGB visual observations |
+| `ppo_iterative.py` | PPO + iterative VLM/LLM reward tuning (inner loop) |
+| `ppo_outer_loop.py` | PPO + outer-loop VLM/LLM reward optimization |
+| `reward_wrapper.py` | Configurable reward wrapper with tunable weights |
+| `generate_rollout_videos.py` | Generate videos from saved checkpoints |
+| `plot_outer_loop_iterations.py` | Plot outer-loop iteration results |
+| `allegro_debug.sh` | Allegro hand PPO training script |
+| `baselines.sh` | Standard PPO baseline commands |
+| `baselines_iterative.sh` | Iterative reward tuning baseline commands |
+| `outer_loop_run.sh` | Outer-loop multi-task experiment commands |
+
 ## Some Notes
 
 - Evaluation with GPU simulation (especially with randomized objects) is a bit tricky. We recommend reading through [our docs](https://maniskill.readthedocs.io/en/latest/user_guide/reinforcement_learning/baselines.html#evaluation) on online RL evaluation in order to understand how to fairly evaluate policies with GPU simulation.

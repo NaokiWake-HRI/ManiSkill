@@ -44,6 +44,7 @@ python ppo.py \
   --ent_coef=${ENT_COEF} \
   --learning_rate=${LR} \
   --reward_scale=${REWARD_SCALE} \
+  --output-dir=debug \
   --finite_horizon_gae \
   --partial_reset \
   --exp-name="ppo-${ENV}-coupled-${seed}" \

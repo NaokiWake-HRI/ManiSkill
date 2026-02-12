@@ -1,31 +1,50 @@
 #!/bin/bash
-# Debug script for PPO with Panda+Allegro (coupled fingers)
-# Quick test run with reduced timesteps to verify the environment works
+# PPO training for Panda+Allegro+FSR (PickCube, coupled fingers)
+#
+# Tuned for GPU-heavy training with sufficient resources.
 #
 # Usage:
 #   bash allegro_debug.sh
 
 seed=9351
-ENV="PickCubePandaAllegro-v1"
+ENV="PickCubePandaAllegroTouch-v1"
 CONTROL_MODE="pd_joint_delta_pos_coupled"
 
-# Keep these modest for a first look; bump TOTAL for longer runs.
-TOTAL=5_000_000
-NUM_ENVS=512
-NUM_STEPS=50
-UPDATE_EPOCHS=4
-NUM_MINIBATCHES=32
-NUM_EVAL_ENVS=8
+# --- Parallelism ---
+NUM_ENVS=4096          # max throughput; lower to 2048 if OOM
+NUM_EVAL_ENVS=16
+
+# --- Rollout ---
+NUM_STEPS=100          # = max_episode_steps (full-episode rollouts)
+NUM_EVAL_STEPS=100
+TOTAL=50_000_000       # dexterous tasks need more samples
+
+# --- PPO ---
+UPDATE_EPOCHS=8        # more gradient steps per rollout
+NUM_MINIBATCHES=32     # minibatch = 4096*100/32 = 12800
+GAMMA=0.95             # longer horizon for grasp→lift→place chain
+GAE_LAMBDA=0.95
+ENT_COEF=0.01          # entropy bonus for exploration
+LR=3e-4
+REWARD_SCALE=1.0
 
 python ppo.py \
   --env_id="${ENV}" \
   --seed=${seed} \
   --num_envs=${NUM_ENVS} \
   --num_steps=${NUM_STEPS} \
+  --num_eval_steps=${NUM_EVAL_STEPS} \
   --update_epochs=${UPDATE_EPOCHS} \
   --num_minibatches=${NUM_MINIBATCHES} \
   --total_timesteps=${TOTAL} \
   --num_eval_envs=${NUM_EVAL_ENVS} \
   --control_mode="${CONTROL_MODE}" \
-  --exp-name="debug-ppo-${ENV}-coupled-${seed}" \
+  --gamma=${GAMMA} \
+  --gae_lambda=${GAE_LAMBDA} \
+  --ent_coef=${ENT_COEF} \
+  --learning_rate=${LR} \
+  --reward_scale=${REWARD_SCALE} \
+  --finite_horizon_gae \
+  --partial_reset \
+  --exp-name="ppo-${ENV}-coupled-${seed}" \
   --track

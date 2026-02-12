@@ -1,12 +1,12 @@
 """PickCube task with Panda arm + Allegro dexterous hand."""
-from typing import Any
+from typing import Any, Union
 
 import numpy as np
 import sapien
 import torch
 
 import mani_skill.envs.utils.randomization as randomization
-from mani_skill.agents.robots import PandaAllegro
+from mani_skill.agents.robots import PandaAllegro, PandaAllegroTouch
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -14,6 +14,14 @@ from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
+
+
+# FSR tip indices within fsr_links (palm[0-3], thumb[4-6], index[7-9], middle[10-12], ring[13-15])
+_FSR_TIP_THUMB = 6    # allegro_link_15.0_tip_fsr
+_FSR_TIP_INDEX = 9    # allegro_link_3.0_tip_fsr
+_FSR_TIP_MIDDLE = 12  # allegro_link_7.0_tip_fsr
+_FSR_TIP_RING = 15    # allegro_link_11.0_tip_fsr
+_FSR_TIP_FINGER_GROUP = [_FSR_TIP_INDEX, _FSR_TIP_MIDDLE, _FSR_TIP_RING]
 
 
 @register_env("PickCubePandaAllegro-v1", max_episode_steps=100)
@@ -25,8 +33,8 @@ class PickCubePandaAllegroEnv(BaseEnv):
     dexterous grasping is harder and needs more time.
     """
 
-    SUPPORTED_ROBOTS = ["panda_allegro"]
-    agent: PandaAllegro
+    SUPPORTED_ROBOTS = ["panda_allegro", "panda_allegro_touch"]
+    agent: Union[PandaAllegro, PandaAllegroTouch]
     goal_thresh = 0.025
     cube_half_size = 0.02
     cube_spawn_half_size = 0.1
@@ -118,6 +126,54 @@ class PickCubePandaAllegroEnv(BaseEnv):
             )
         return obs
 
+    # ------------------------------------------------------------------
+    # Contact reward (RL_project inspired: opposing grasp detection)
+    # ------------------------------------------------------------------
+    def _compute_contact_reward(self):
+        """Compute smooth contact reward based on opposing grasp groups.
+
+        Groups (matching coupled finger synergy):
+          - Thumb: thumb tip FSR (or tip link force)
+          - Finger group: Index/Middle/Ring tip FSR (any one = contact)
+
+        Returns:
+            contact_r: (n_envs,) float tensor in [0, 1].
+                0.0 = no contact, 0.5 = one group only, 1.0 = opposing grasp
+        """
+        if hasattr(self.agent, "fsr_links"):
+            # FSR path: pair-wise contact between FSR tip pads and the cube
+            # FSR links have pad-side-only collision, so this is direction-aware
+            fsr_tip_indices = [_FSR_TIP_THUMB] + _FSR_TIP_FINGER_GROUP
+            tip_forces = []
+            for idx in fsr_tip_indices:
+                forces = self.scene.get_pairwise_contact_forces(
+                    self.agent.fsr_links[idx], self.cube
+                )
+                tip_forces.append(torch.linalg.norm(forces, axis=1))
+            tip_mags = torch.stack(tip_forces, dim=-1)  # (n_envs, 4)
+            threshold = 0.01
+            has_thumb = (tip_mags[:, 0] > threshold).float()
+            has_finger_group = (
+                tip_mags[:, 1:].max(dim=-1).values > threshold
+            ).float()
+        else:
+            # Fallback: use pairwise contact forces on tip links
+            # tip_links order: [thumb_tip, index_tip, middle_tip, ring_tip]
+            tip_forces = []
+            for tip_link in self.agent.tip_links:
+                forces = self.scene.get_pairwise_contact_forces(
+                    tip_link, self.cube
+                )
+                tip_forces.append(torch.linalg.norm(forces, axis=1))
+            tip_mags = torch.stack(tip_forces, dim=-1)  # (n_envs, 4)
+            has_thumb = (tip_mags[:, 0] >= 0.5).float()
+            has_finger_group = (tip_mags[:, 1:].max(dim=-1).values >= 0.5).float()
+
+        return (has_thumb + has_finger_group) / 2.0
+
+    # ------------------------------------------------------------------
+    # Evaluate
+    # ------------------------------------------------------------------
     def evaluate(self):
         is_obj_placed = (
             torch.linalg.norm(self.goal_site.pose.p - self.cube.pose.p, axis=1)
@@ -125,41 +181,64 @@ class PickCubePandaAllegroEnv(BaseEnv):
         )
         is_grasped = self.agent.is_grasping(self.cube)
         is_robot_static = self.agent.is_static(0.2)
+        contact_r = self._compute_contact_reward()
         return {
             "success": is_obj_placed & is_robot_static,
             "is_obj_placed": is_obj_placed,
             "is_robot_static": is_robot_static,
             "is_grasped": is_grasped,
+            "contact_r": contact_r,
         }
 
+    # ------------------------------------------------------------------
+    # Dense reward (6-stage, RL_project inspired)
+    # ------------------------------------------------------------------
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # Stage 1: Reach the cube with the palm/TCP
+        # Stage 1: Reach the cube
         tcp_to_obj_dist = torch.linalg.norm(
             self.cube.pose.p - self.agent.tcp_pose.p, axis=1
         )
         reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
-        reward = reaching_reward
 
-        # Stage 2: Grasp the cube (fingertips touching)
+        # Stage 2: Contact (smooth, opposing-grasp aware)
+        contact_r = info["contact_r"]
+
+        # Stage 3: Lift gated by contact (RL_project key insight)
+        # No lift reward without proper finger contact on the cube
+        cube_z = self.cube.pose.p[:, 2]
+        lift_height = cube_z - self.cube_half_size
+        lift_r = torch.clamp(lift_height / 0.05, 0.0, 1.0)
+        lift_reward = lift_r * contact_r
+
+        # Stage 4: Place at goal (gated by grasp)
         is_grasped = info["is_grasped"]
-        reward += is_grasped
-
-        # Stage 3: Move the cube to the goal
         obj_to_goal_dist = torch.linalg.norm(
             self.goal_site.pose.p - self.cube.pose.p, axis=1
         )
-        place_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
-        reward += place_reward * is_grasped
+        place_reward = (1 - torch.tanh(5 * obj_to_goal_dist)) * is_grasped
 
-        # Stage 4: Be static when placed
+        # Stage 5: Be static when placed
         qvel = self.agent.robot.get_qvel()[..., :7]  # arm joints only
-        static_reward = 1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
-        reward += static_reward * info["is_obj_placed"]
+        static_reward = (
+            1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
+        ) * info["is_obj_placed"]
 
-        reward[info["success"]] = 5
+        reward = reaching_reward + contact_r + lift_reward + place_reward + static_reward
+        reward[info["success"]] = 6
         return reward
 
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: dict
     ):
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 5
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 6
+
+
+@register_env("PickCubePandaAllegroTouch-v1", max_episode_steps=100)
+class PickCubePandaAllegroTouchEnv(PickCubePandaAllegroEnv):
+    """PickCube with Panda arm + Allegro hand + FSR tactile sensors."""
+
+    SUPPORTED_ROBOTS = ["panda_allegro_touch"]
+    agent: PandaAllegroTouch
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, robot_uids="panda_allegro_touch", **kwargs)

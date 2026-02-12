@@ -14,6 +14,7 @@ from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
 from mani_skill.utils.structs.pose import Pose
+from mani_skill.utils.structs.types import GPUMemoryConfig, SimConfig
 
 
 # FSR tip indices within fsr_links (palm[0-3], thumb[4-6], index[7-9], middle[10-12], ring[13-15])
@@ -239,6 +240,16 @@ class PickCubePandaAllegroTouchEnv(PickCubePandaAllegroEnv):
 
     SUPPORTED_ROBOTS = ["panda_allegro_touch"]
     agent: PandaAllegroTouch
+
+    @property
+    def _default_sim_config(self):
+        return SimConfig(
+            gpu_memory_config=GPUMemoryConfig(
+                max_rigid_contact_count=self.num_envs * max(1024, self.num_envs) * 16,
+                max_rigid_patch_count=self.num_envs * max(1024, self.num_envs) * 4,
+                found_lost_pairs_capacity=2**26,
+            )
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, robot_uids="panda_allegro_touch", **kwargs)

@@ -23,27 +23,92 @@ echo "Outer iterations: ${OUTER_ITERS}"
 echo "Weight seed: ${WSEED}"
 echo ""
 
-for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "PushChair-v1" "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1"
+for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1"
 do
-    # Set total timesteps based on task
-    if [ "${ENV}" == "PegInsertionSide-v1" ]; then
-        TOTAL=4_500_000
+    # Hyperparameters per task.
+    # Outer loop uses longer rollouts (num_steps >= episode length) to compensate
+    # for fewer total timesteps (3M/iter vs 50M baseline). Batch size ratios
+    # between tasks are preserved from baselines.sh.
+    #   Baseline reference batch sizes (num_envs * num_steps):
+    #     PushCube/PickCube  = 4096*4   = 16,384  (1x)
+    #     PegInsertion       = 2048*16  = 32,768  (2x)
+    #     OpenCabinet        = 1024*16  = 16,384  (1x)
+    #     PushT              = 4096*16  = 65,536  (4x)
+    #     UnitreeG1          = 1024*32  = 32,768  (2x)
+    #     AnymalC            = 4096*16  = 65,536  (4x)
+    if [ "${ENV}" == "PushCube-v1" ] || [ "${ENV}" == "PickCube-v1" ]; then
+        TOTAL=3_000_000          # Baseline: 50M
+        EVAL_STEPS=50
+        NUM_ENVS=256             # Baseline: 4096
+        NUM_STEPS=100            # Baseline: 4  (batch: 256*100=25,600  1x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG=""
+        GAE_LAMBDA_ARG=""
+    elif [ "${ENV}" == "PegInsertionSide-v1" ]; then
+        TOTAL=4_500_000          # Baseline: 75M
+        EVAL_STEPS=100
+        NUM_ENVS=512             # Baseline: 2048
+        NUM_STEPS=100            # Baseline: 16 (batch: 512*100=51,200  2x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG="--gamma=0.97"
+        GAE_LAMBDA_ARG="--gae_lambda=0.95"
+    elif [ "${ENV}" == "OpenCabinetDoor-v1" ] || [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
+        TOTAL=3_000_000          # Baseline: 50M
+        EVAL_STEPS=100
+        NUM_ENVS=256             # Baseline: 1024
+        NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG=""
+        GAE_LAMBDA_ARG=""
+    elif [ "${ENV}" == "PushT-v1" ]; then
+        TOTAL=3_000_000          # Baseline: 50M
+        EVAL_STEPS=100
+        NUM_ENVS=512             # Baseline: 4096
+        NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG="--gamma=0.99"
+        GAE_LAMBDA_ARG=""
+    elif [ "${ENV}" == "UnitreeG1PlaceAppleInBowl-v1" ]; then
+        TOTAL=3_000_000          # Baseline: 50M
+        EVAL_STEPS=100
+        NUM_ENVS=512             # Baseline: 1024
+        NUM_STEPS=100            # Baseline: 32 (batch: 512*100=51,200  2x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG=""
+        GAE_LAMBDA_ARG=""
+    elif [ "${ENV}" == "AnymalC-Reach-v1" ]; then
+        TOTAL=3_000_000          # Baseline: 50M
+        EVAL_STEPS=200
+        NUM_ENVS=512             # Baseline: 4096
+        NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG="--gamma=0.99"
+        GAE_LAMBDA_ARG="--gae_lambda=0.95"
     else
         TOTAL=3_000_000
+        EVAL_STEPS=50
+        NUM_ENVS=256
+        NUM_STEPS=100
+        UPDATE_EPOCHS=8
+        GAMMA_ARG=""
+        GAE_LAMBDA_ARG=""
     fi
 
     echo "=== ${ENV} ==="
     python ppo_outer_loop.py \
       --env_id="${ENV}" \
       --seed=${seed} \
-      --num_envs=512 \
-      --num_steps=50 \
-      --update_epochs=4 \
+      --num_envs=${NUM_ENVS} \
+      --num_steps=${NUM_STEPS} \
+      --update_epochs=${UPDATE_EPOCHS} \
       --num_minibatches=32 \
-      --num_eval_envs=8 \
+      --num_eval_envs=16 \
+      --num_eval_steps=${EVAL_STEPS} \
       --num_outer_iters=${OUTER_ITERS} \
       --total_timesteps_per_iter=${TOTAL} \
       --weight_seed=${WSEED} \
+      ${GAMMA_ARG} \
+      ${GAE_LAMBDA_ARG} \
       --vlm_reward_plot \
       --track \
       --exp-name="ppo-outer-loop-${ENV}-${seed}"

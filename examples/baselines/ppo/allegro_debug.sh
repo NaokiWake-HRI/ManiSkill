@@ -11,7 +11,7 @@ ENV="PickCubePandaAllegroTouch-v1"
 CONTROL_MODE="pd_joint_delta_pos_coupled"
 
 # --- Parallelism ---
-NUM_ENVS=4096          # max throughput; lower to 2048 if OOM
+NUM_ENVS=512           # FSR touch sensors need more GPU memory per env
 NUM_EVAL_ENVS=16
 
 # --- Rollout ---
@@ -21,7 +21,7 @@ TOTAL=50_000_000       # dexterous tasks need more samples
 
 # --- PPO ---
 UPDATE_EPOCHS=8        # more gradient steps per rollout
-NUM_MINIBATCHES=32     # minibatch = 4096*100/32 = 12800
+NUM_MINIBATCHES=32     # minibatch = 512*100/32 = 1600
 GAMMA=0.95             # longer horizon for grasp→lift→place chain
 GAE_LAMBDA=0.95
 ENT_COEF=0.01          # entropy bonus for exploration

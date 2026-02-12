@@ -183,11 +183,12 @@ if __name__ == "__main__":
         run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     else:
         run_name = args.exp_name
-    date_str = time.strftime("%Y-%m-%d")
     if args.output_dir is not None:
-        run_dir = f"{args.output_dir}/{date_str}/{run_name}"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        run_name = f"{run_name}-{timestamp}"
+        run_dir = f"{args.output_dir}/{args.env_id}/{run_name}"
     else:
-        run_dir = f"{args.env_id}/{date_str}/{run_name}"
+        run_dir = f"{args.env_id}/{run_name}"
 
 
     # TRY NOT TO MODIFY: seeding

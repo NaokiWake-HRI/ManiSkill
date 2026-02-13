@@ -24,6 +24,7 @@ Usage:
 """
 
 import base64
+import inspect
 import io
 import json
 import os
@@ -141,6 +142,8 @@ class Args:
     """skip VLM/LLM calls (for testing)"""
     eureka_mode: bool = False
     """pure Eureka mode: use LLM only without VLM (learning curve based optimization)"""
+    enable_function_code: bool = False
+    """allow LLM to generate custom reward code (Eureka-style). When False, params-only mode."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -856,7 +859,7 @@ if __name__ == "__main__":
             llm = LLMRewardTuner.from_openai(
                 api_key=api_key,
                 model=args.llm_model,
-                enable_function_code=False,
+                enable_function_code=args.enable_function_code,
                 max_param_change=2.0,
             )
             print(f"[VLM/LLM] Initialized LLM: {args.llm_model}")
@@ -994,8 +997,6 @@ if __name__ == "__main__":
                         "w_push (cube movement toward goal, gated by reach), "
                         "w_z_keep (keep cube on table surface), w_success (success bonus).\n\n"
                         "日本語補足: ロボットアームがキューブを目標位置まで押すタスク。"
-                        "w_reachはTCPのキューブ背面への接近、w_pushはゴールへの押し動作（到達後に有効）、"
-                        "w_z_keepはキューブをテーブルから落とさない制約、w_successは成功ボーナス。"
                         "回答の末尾に日本語での簡潔な要約も追加してください。"
                     ),
                     "PickCube": (
@@ -1004,8 +1005,6 @@ if __name__ == "__main__":
                         "w_place (cube toward goal, gated by grasp), "
                         "w_static (robot static with object placed), w_success (success bonus).\n\n"
                         "日本語補足: ロボットがキューブを掴んで目標位置に運ぶタスク。"
-                        "w_reachは接近、w_graspは把持成功、w_placeは把持状態でのゴールへの配置、"
-                        "w_staticは静止状態での配置完了、w_successは成功ボーナス。"
                         "回答の末尾に日本語での簡潔な要約も追加してください。"
                     ),
                     "OpenCabinetDoor": (
@@ -1020,6 +1019,58 @@ if __name__ == "__main__":
                         "w_static (maintain open state), w_success (success bonus).\n\n"
                         "日本語補足: キャビネットの引き出しを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
                     ),
+                    "PegInsertionSide": (
+                        "The robot must grasp a peg and insert it into a hole from the side (PegInsertionSide).\n"
+                        "This is a multi-stage task: reach the peg, grasp it, align with the hole, then insert.\n"
+                        "Reward components: w_reach (gripper approach to peg tail), "
+                        "w_grasp (binary grasp success), "
+                        "w_pre_insertion (peg-hole yz alignment, gated by grasp), "
+                        "w_insertion (peg head into hole, gated by grasp AND pre-insertion alignment), "
+                        "w_success (success bonus).\n\n"
+                        "日本語補足: ペグを掴んで横方向から穴に挿入するタスク。"
+                        "reach→grasp→alignment→insertionの段階的な報酬構造。"
+                        "回答の末尾に日本語での簡潔な要約も追加してください。"
+                    ),
+                    "PushT": (
+                        "The robot must push a T-shaped block to match the goal position and rotation (PushT).\n"
+                        "This is a 2D pushing task requiring both position and rotation alignment.\n"
+                        "Reward components: w_rotation (cos similarity of tee vs goal z-rotation, squared), "
+                        "w_position (tee-to-goal xy distance, tanh-shaped and squared), "
+                        "w_tcp_guide (encourage TCP to stay near the tee block), "
+                        "w_success (success bonus).\n\n"
+                        "日本語補足: T字ブロックを目標位置・回転に合わせるタスク。"
+                        "位置と回転の両方を合わせる必要がある。"
+                        "回答の末尾に日本語での簡潔な要約も追加してください。"
+                    ),
+                    "AnymalC": (
+                        "A quadruped robot (AnymalC) must walk to a goal position (AnymalC-Reach).\n"
+                        "The robot must maintain balance while locomoting toward the target.\n"
+                        "Reward components: w_reach (robot-to-goal distance, tanh-shaped), "
+                        "w_vel_z_penalty (penalize vertical velocity oscillation), "
+                        "w_ang_vel_penalty (penalize angular velocity in xy), "
+                        "w_contact_penalty (penalize undesired knee/body contacts with ground), "
+                        "w_qpos_penalty (penalize deviation from default standing pose).\n"
+                        "Note: reward has a base of +1.0 per step; fails (falls) give 0.\n\n"
+                        "日本語補足: 四脚ロボットが目標位置まで歩行するタスク。"
+                        "バランスを保ちながら移動する必要がある。"
+                        "回答の末尾に日本語での簡潔な要約も追加してください。"
+                    ),
+                    "UnitreeG1PlaceAppleInBowl": (
+                        "A humanoid robot (UnitreeG1) must pick up an apple and place it into a bowl "
+                        "(UnitreeG1PlaceAppleInBowl).\n"
+                        "Multi-stage: reach apple, grasp it, carry to above the bowl, then release.\n"
+                        "Reward components: w_reach (TCP-to-apple distance), "
+                        "w_grasp (binary grasp success), "
+                        "w_place (apple-to-bowl distance with +0.15m z-offset, gated by grasp), "
+                        "w_above_bowl (binary bonus when apple is within 0.025m of above-bowl target), "
+                        "w_release (encourage opening hand, gated by above_bowl), "
+                        "w_success (success bonus).\n"
+                        "Note: the bowl target has a +0.15m z-offset to encourage bringing the apple "
+                        "above the bowl before releasing.\n\n"
+                        "日本語補足: ヒューマノイドロボットがリンゴを掴んでボウルに入れるタスク。"
+                        "reach→grasp→carry→above_bowl→releaseの段階的な報酬構造。"
+                        "回答の末尾に日本語での簡潔な要約も追加してください。"
+                    ),
                 }
 
                 # Compute per-component reward means from final eval (Eureka-style)
@@ -1031,6 +1082,26 @@ if __name__ == "__main__":
                             continue
                         vals = [bd[key] for bd in bds]
                         reward_components[key] = sum(vals) / len(vals)
+
+                # Get reward function source code for LLM context
+                _reward_method_map = {
+                    "PickCube": "_compute_pick_cube",
+                    "PushCube": "_compute_push_cube",
+                    "OpenCabinetDoor": "_compute_open_cabinet",
+                    "OpenCabinetDrawer": "_compute_open_cabinet",
+                    "UnitreeG1PlaceAppleInBowl": "_compute_unitree_place_apple",
+                    "AnymalC": "_compute_anymalc_reach",
+                    "PegInsertionSide": "_compute_peg_insertion",
+                    "PushT": "_compute_push_t",
+                }
+                try:
+                    method_name = _reward_method_map[task_id]
+                    reward_fn_source = inspect.getsource(
+                        getattr(RewardWrapper, method_name)
+                    )
+                except Exception as e:
+                    print(f"[Warning] Could not get reward_fn_source: {e}")
+                    reward_fn_source = "N/A"
 
                 training_summary = {
                     "current_weights": dict(current_weights),
@@ -1046,6 +1117,7 @@ if __name__ == "__main__":
                     "vlm_comments": [vlm_comment],
                     "num_episodes": int(eval_metrics.get("num_episodes", 0)),
                     "llm_task_description": _llm_task_descs.get(task_id, ""),
+                    "reward_fn_source": reward_fn_source,
                     "learning_curve": result["learning_curve"],
                     "reward_components": reward_components,
                 }

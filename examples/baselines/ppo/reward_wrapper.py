@@ -44,6 +44,7 @@ TASK_DEFAULTS = {
         "w_reach": 1.0,
         "w_grasp": 1.0,
         "w_place": 1.0,
+        "w_above_bowl": 4.0,
         "w_release": 1.0,
         "w_success": 8.0,
     },
@@ -299,18 +300,22 @@ class RewardWrapper(gym.Wrapper):
         )
         place_r = (1 - torch.tanh(5 * obj_to_goal_dist)) * grasp_r
 
-        # release: encourage opening hand when above bowl
+        # above_bowl: bonus when apple is close to above-bowl target
         obj_high_above_bowl = obj_to_goal_dist < 0.025
+        above_bowl_r = obj_high_above_bowl.float()
+
+        # release: encourage opening hand when above bowl
         grasp_release_reward = 1 - torch.tanh(
             base.agent.right_hand_dist_to_open_grasp()
         )
-        release_r = grasp_release_reward * obj_high_above_bowl.float()
+        release_r = grasp_release_reward * above_bowl_r
 
         scale = self._norm_scale()
         reward = scale * (
             w["w_reach"] * reach_r
             + w["w_grasp"] * grasp_r
             + w["w_place"] * place_r
+            + w["w_above_bowl"] * above_bowl_r
             + w["w_release"] * release_r
         )
         reward[info["success"]] = w["w_success"]
@@ -319,6 +324,7 @@ class RewardWrapper(gym.Wrapper):
             "reach": (scale * w["w_reach"] * reach_r).mean().item(),
             "grasp": (scale * w["w_grasp"] * grasp_r).mean().item(),
             "place": (scale * w["w_place"] * place_r).mean().item(),
+            "above_bowl": (scale * w["w_above_bowl"] * above_bowl_r).mean().item(),
             "release": (scale * w["w_release"] * release_r).mean().item(),
             "norm_scale": scale,
         }

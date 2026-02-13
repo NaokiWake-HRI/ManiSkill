@@ -45,7 +45,7 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PegInsertionSide-v1" ]; then
-        TOTAL=4_500_000          # Baseline: 75M
+        TOTAL=9_000_000          # Baseline: 75M
         EVAL_STEPS=100
         NUM_ENVS=512             # Baseline: 2048
         NUM_STEPS=100            # Baseline: 16 (batch: 512*100=51,200  2x)
@@ -53,7 +53,7 @@ do
         GAMMA_ARG="--gamma=0.97"
         GAE_LAMBDA_ARG="--gae_lambda=0.95"
     elif [ "${ENV}" == "OpenCabinetDoor-v1" ] || [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
-        TOTAL=3_000_000          # Baseline: 50M
+        TOTAL=6_000_000          # Baseline: 50M
         EVAL_STEPS=100
         NUM_ENVS=256             # Baseline: 1024
         NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
@@ -61,7 +61,7 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PushT-v1" ]; then
-        TOTAL=3_000_000          # Baseline: 50M
+        TOTAL=6_000_000          # Baseline: 50M
         EVAL_STEPS=100
         NUM_ENVS=512             # Baseline: 4096
         NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
@@ -69,7 +69,7 @@ do
         GAMMA_ARG="--gamma=0.99"
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "UnitreeG1PlaceAppleInBowl-v1" ]; then
-        TOTAL=3_000_000          # Baseline: 50M
+        TOTAL=6_000_000          # Baseline: 50M
         EVAL_STEPS=100
         NUM_ENVS=512             # Baseline: 1024
         NUM_STEPS=100            # Baseline: 32 (batch: 512*100=51,200  2x)
@@ -77,13 +77,21 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "AnymalC-Reach-v1" ]; then
-        TOTAL=3_000_000          # Baseline: 50M
+        TOTAL=6_000_000          # Baseline: 50M
         EVAL_STEPS=200
         NUM_ENVS=512             # Baseline: 4096
         NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
         UPDATE_EPOCHS=8
         GAMMA_ARG="--gamma=0.99"
         GAE_LAMBDA_ARG="--gae_lambda=0.95"
+    elif [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
+        TOTAL=6_000_000          # Baseline: 50M
+        EVAL_STEPS=100
+        NUM_ENVS=256             # Baseline: 1024
+        NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
+        UPDATE_EPOCHS=8
+        GAMMA_ARG=""
+        GAE_LAMBDA_ARG=""
     else
         TOTAL=3_000_000
         EVAL_STEPS=50

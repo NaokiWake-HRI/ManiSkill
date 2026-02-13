@@ -53,7 +53,6 @@ TASK_DEFAULTS = {
         "w_ang_vel_penalty": 0.05,
         "w_contact_penalty": 1.0,
         "w_qpos_penalty": 0.05,
-        "w_success": 3.0,
     },
     "PegInsertionSide": {
         "w_reach": 1.0,
@@ -63,9 +62,9 @@ TASK_DEFAULTS = {
         "w_success": 10.0,
     },
     "PushT": {
-        "w_rotation": 1.0,
-        "w_position": 1.0,
-        "w_tcp_guide": 1.0,
+        "w_rotation": 0.5,
+        "w_position": 0.5,
+        "w_tcp_guide": 0.05,
         "w_success": 3.0,
     },
 }
@@ -170,8 +169,13 @@ class RewardWrapper(gym.Wrapper):
         )
         place_r = (1 - torch.tanh(5 * obj_to_goal_dist)) * grasp_r
 
-        # static: robot static & object placed
-        static_r = info["is_robot_static"].float() * info["is_obj_placed"].float()
+        # static: continuous velocity penalty * object placed
+        qvel = base.agent.robot.get_qvel()
+        if base.robot_uids in ["panda", "widowxai"]:
+            qvel = qvel[..., :-2]
+        elif base.robot_uids == "so100":
+            qvel = qvel[..., :-1]
+        static_r = (1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))) * info["is_obj_placed"].float()
 
         scale = self._norm_scale()
         reward = scale * (
@@ -356,7 +360,6 @@ class RewardWrapper(gym.Wrapper):
             - w["w_qpos_penalty"] * qpos_penalty
         )
         reward[info["fail"]] = 0
-        reward[info["success"]] = w["w_success"]
 
         self._last_breakdown = {
             "reach": (scale * w["w_reach"] * reach_r).mean().item(),

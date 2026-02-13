@@ -195,17 +195,19 @@ class PickCubePandaAllegroEnv(BaseEnv):
     # Dense reward (6-stage, RL_project inspired)
     # ------------------------------------------------------------------
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # Stage 1: Reach the cube
-        tcp_to_obj_dist = torch.linalg.norm(
-            self.cube.pose.p - self.agent.tcp_pose.p, axis=1
-        )
-        reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
+        # Stage 1: Reach - use fingertip distance (not TCP/palm)
+        tip_positions = torch.stack(
+            [link.pose.p for link in self.agent.tip_links], dim=1
+        )  # (n_envs, 4, 3)
+        tip_to_obj = tip_positions - self.cube.pose.p.unsqueeze(1)
+        tip_dists = torch.linalg.norm(tip_to_obj, dim=-1)  # (n_envs, 4)
+        min_tip_dist = tip_dists.min(dim=-1).values
+        reaching_reward = 1 - torch.tanh(5 * min_tip_dist)
 
         # Stage 2: Contact (smooth, opposing-grasp aware)
         contact_r = info["contact_r"]
 
-        # Stage 3: Lift gated by contact (RL_project key insight)
-        # No lift reward without proper finger contact on the cube
+        # Stage 3: Lift gated by contact
         cube_z = self.cube.pose.p[:, 2]
         lift_height = cube_z - self.cube_half_size
         lift_r = torch.clamp(lift_height / 0.05, 0.0, 1.0)
@@ -224,7 +226,13 @@ class PickCubePandaAllegroEnv(BaseEnv):
             1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
         ) * info["is_obj_placed"]
 
-        reward = reaching_reward + contact_r + lift_reward + place_reward + static_reward
+        # Penalty: discourage palm contact with cube
+        palm_forces = self.scene.get_pairwise_contact_forces(
+            self.agent.palm_link, self.cube
+        )
+        palm_penalty = -0.5 * (torch.linalg.norm(palm_forces, dim=-1) > 0.1).float()
+
+        reward = reaching_reward + contact_r + lift_reward + place_reward + static_reward + palm_penalty
         reward[info["success"]] = 6
         return reward
 

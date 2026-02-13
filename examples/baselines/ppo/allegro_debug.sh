@@ -7,7 +7,7 @@
 #   bash allegro_debug.sh
 
 seed=9351
-ENV="PickCubePandaAllegroTouch-v1"
+ENV="PickCubePandaAllegro-v1"
 CONTROL_MODE="pd_joint_delta_pos_coupled"
 
 # --- Parallelism ---

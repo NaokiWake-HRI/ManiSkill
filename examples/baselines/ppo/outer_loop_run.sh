@@ -23,12 +23,12 @@ echo "Outer iterations: ${OUTER_ITERS}"
 echo "Weight seed: ${WSEED}"
 echo ""
 
-for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1"
+for ENV in "PegInsertionSide-v1" "PushT-v1" # "UnitreeG1PlaceAppleInBowl-v1" # "AnymalC-Reach-v1" "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" 
 do
     # Hyperparameters per task.
-    # Outer loop uses longer rollouts (num_steps >= episode length) to compensate
-    # for fewer total timesteps (3M/iter vs 50M baseline). Batch size ratios
-    # between tasks are preserved from baselines.sh.
+    # Outer loop uses longer rollouts and increased parallel environments (1024 vs 2048-4096 baseline).
+    # Total timesteps: 15M/iter for complex tasks vs 50-75M baseline.
+    # Batch size ratios between tasks are preserved from baselines.sh (2x for PegInsertion/PushT).
     #   Baseline reference batch sizes (num_envs * num_steps):
     #     PushCube/PickCube  = 4096*4   = 16,384  (1x)
     #     PegInsertion       = 2048*16  = 32,768  (2x)
@@ -45,10 +45,10 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PegInsertionSide-v1" ]; then
-        TOTAL=9_000_000          # Baseline: 75M
+        TOTAL=15_000_000          # Baseline: 75M
         EVAL_STEPS=100
-        NUM_ENVS=512             # Baseline: 2048
-        NUM_STEPS=100            # Baseline: 16 (batch: 512*100=51,200  2x)
+        NUM_ENVS=1024            # Baseline: 2048
+        NUM_STEPS=64             # Baseline: 16 (batch: 1024*64=65,536  2x)
         UPDATE_EPOCHS=8
         GAMMA_ARG="--gamma=0.97"
         GAE_LAMBDA_ARG="--gae_lambda=0.95"
@@ -61,15 +61,15 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PushT-v1" ]; then
-        TOTAL=6_000_000          # Baseline: 50M
+        TOTAL=15_000_000          # Baseline: 50M
         EVAL_STEPS=100
-        NUM_ENVS=512             # Baseline: 4096
-        NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
+        NUM_ENVS=1024            # Baseline: 4096
+        NUM_STEPS=128            # Baseline: 16 (batch: 1024*128=131,072  2x)
         UPDATE_EPOCHS=8
         GAMMA_ARG="--gamma=0.99"
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "UnitreeG1PlaceAppleInBowl-v1" ]; then
-        TOTAL=6_000_000          # Baseline: 50M
+        TOTAL=12_000_000          # Baseline: 50M
         EVAL_STEPS=100
         NUM_ENVS=512             # Baseline: 1024
         NUM_STEPS=100            # Baseline: 32 (batch: 512*100=51,200  2x)

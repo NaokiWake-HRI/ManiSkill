@@ -8,7 +8,7 @@
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_run.sh
 
-seed=9351
+seeds=(9351 4796 1788) #9351
 OUTER_ITERS=5
 WSEED=42
 
@@ -21,10 +21,17 @@ fi
 echo "=== PPO Outer Loop ==="
 echo "Outer iterations: ${OUTER_ITERS}"
 echo "Weight seed: ${WSEED}"
+echo "Seeds: ${seeds[@]}"
 echo ""
 
-for ENV in "PegInsertionSide-v1" "PushT-v1" # "UnitreeG1PlaceAppleInBowl-v1" # "AnymalC-Reach-v1" "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" 
+for seed in ${seeds[@]}
 do
+  echo "========================================="
+  echo "=== Running with seed: ${seed} ==="
+  echo "========================================="
+
+  for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1"
+  do
     # Hyperparameters per task.
     # Outer loop uses longer rollouts and increased parallel environments (1024 vs 2048-4096 baseline).
     # Total timesteps: 15M/iter for complex tasks vs 50-75M baseline.
@@ -45,7 +52,7 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PegInsertionSide-v1" ]; then
-        TOTAL=15_000_000          # Baseline: 75M
+        TOTAL=24_000_000          # Baseline: 75M
         EVAL_STEPS=100
         NUM_ENVS=1024            # Baseline: 2048
         NUM_STEPS=64             # Baseline: 16 (batch: 1024*64=65,536  2x)
@@ -61,7 +68,7 @@ do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
     elif [ "${ENV}" == "PushT-v1" ]; then
-        TOTAL=15_000_000          # Baseline: 50M
+        TOTAL=24_000_000          # Baseline: 50M
         EVAL_STEPS=100
         NUM_ENVS=1024            # Baseline: 4096
         NUM_STEPS=128            # Baseline: 16 (batch: 1024*128=131,072  2x)
@@ -121,7 +128,14 @@ do
       --track \
       --exp-name="ppo-outer-loop-${ENV}-${seed}"
     echo ""
+  done
+
+  echo "=== Completed seed ${seed} ==="
+  echo ""
 done
 
-echo "=== Outer loop experiments complete ==="
+echo "========================================="
+echo "=== All outer loop experiments complete ==="
+echo "Seeds run: ${seeds[@]}"
 echo "Check wandb for results (group: PPO-OuterLoop)"
+echo "========================================="

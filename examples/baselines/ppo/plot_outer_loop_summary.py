@@ -6,9 +6,12 @@ For each task (latest run):
   Right: outer_iter/success_once vs iteration number (1-indexed: 1, 2, 3, ..., N).
 
 Usage:
-    python plot_outer_loop_summary.py
+    python plot_outer_loop_summary.py                        # latest run per task (any seed)
+    python plot_outer_loop_summary.py --seed 1788             # latest run per task for seed 1788
+    python plot_outer_loop_summary.py --seeds 1788 4796 9351  # aggregate across 3 seeds (mean + individual points)
 """
 
+import argparse
 import json
 import re
 from pathlib import Path
@@ -40,10 +43,32 @@ def _extract_timestamp(name: str) -> str:
     return m.group(1) if m else "00000000_000000"
 
 
-def latest_run(task: str) -> Path:
+def _extract_seed(name: str) -> str | None:
+    """Extract seed from run directory name like '...-{seed}-{task}-{timestamp}'."""
+    m = re.search(r"-(\d+)-\S+-\d{8}_\d{6}$", name)
+    return m.group(1) if m else None
+
+
+def latest_run(task: str, seed: str | None = None) -> Path:
     task_dir = OUTER_LOOP_DIR / task
-    runs = sorted(task_dir.iterdir(), key=lambda p: _extract_timestamp(p.name))
+    runs = list(task_dir.iterdir())
+    if seed is not None:
+        runs = [r for r in runs if _extract_seed(r.name) == seed]
+        if not runs:
+            raise FileNotFoundError(f"No runs found for seed {seed}")
+    runs.sort(key=lambda p: _extract_timestamp(p.name))
     return runs[-1]
+
+
+def all_latest_runs(task: str, seeds: list[str]) -> list[Path]:
+    """Get latest run for each seed."""
+    runs = []
+    for seed in seeds:
+        try:
+            runs.append(latest_run(task, seed=seed))
+        except FileNotFoundError:
+            print(f"  WARNING: No run found for seed {seed}, skipping")
+    return runs
 
 
 def load_tb_scalar(run_dir: str, tag: str):
@@ -87,6 +112,137 @@ def rolling_mean(values, window=50):
 def extract_iteration(steps, values, start, end):
     mask = (steps > start) & (steps < end)
     return steps[mask] - start, values[mask]
+
+
+def plot_task_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name: str):
+    """Plot both panels for a single task, aggregating across multiple seeds."""
+    if not run_dirs:
+        ax_left.text(0.5, 0.5, "No data", ha="center", va="center",
+                     transform=ax_left.transAxes)
+        ax_right.text(0.5, 0.5, "No data", ha="center", va="center",
+                      transform=ax_right.transAxes)
+        return
+
+    metric = "train/success_once"
+    n_seeds = len(run_dirs)
+
+    # --- Left panel: averaged per-iteration training curves ---
+    # Collect data from all seeds
+    all_iter_starts = []
+    all_steps_values = []
+    for run_dir in run_dirs:
+        run_str = str(run_dir)
+        iter_starts = detect_iter_boundaries(run_str)
+        steps, values = load_tb_scalar(run_str, metric)
+        if iter_starts and steps is not None:
+            all_iter_starts.append(iter_starts)
+            all_steps_values.append((steps, values))
+
+    if not all_iter_starts:
+        ax_left.text(0.5, 0.5, "No data", ha="center", va="center",
+                     transform=ax_left.transAxes)
+    else:
+        # Use the first seed's iteration boundaries as reference
+        iter_starts = all_iter_starts[0]
+        n_iters = len(iter_starts)
+        iter_ends = iter_starts[1:] + [np.inf]
+
+        plot_indices = list(range(n_iters))[::-1]  # Show all iterations (reversed order)
+
+        for i in plot_indices:
+            start, end = iter_starts[i], iter_ends[i]
+
+            # Collect curves from all seeds for this iteration
+            seed_curves = []
+            for steps, values in all_steps_values:
+                ix, iv = extract_iteration(steps, values, start, end)
+                if len(ix) > 0 and len(iv) > 1:
+                    smoothed = rolling_mean(iv, window=50)
+                    seed_curves.append((ix, smoothed))
+
+            if not seed_curves:
+                continue
+
+            # Compute mean curve (interpolate to common x-axis)
+            # Use the first seed's x-axis as reference
+            ref_x = seed_curves[0][0]
+            interp_curves = []
+            for ix, iv in seed_curves:
+                # Interpolate to reference x-axis
+                interp_y = np.interp(ref_x, ix, iv, left=np.nan, right=np.nan)
+                interp_curves.append(interp_y)
+
+            mean_curve = np.nanmean(interp_curves, axis=0)
+
+            # Color: gray for Iter 1, red→blue gradient for Iter 2+
+            if i == 0:
+                color = (0.5, 0.5, 0.5)  # Gray for baseline
+                alpha_smooth = 0.7
+            else:
+                # Gradient from red (Iter 2) to blue (last iter)
+                progress = (i - 1) / max(n_iters - 2, 1) if n_iters > 1 else 0
+                color = plt.cm.coolwarm(progress)
+                alpha_smooth = 0.3 + 0.6 * progress  # 0.3 → 0.9
+
+            label = f"Iter {i+1}"
+            ax_left.plot(ref_x, mean_curve, color=color, alpha=alpha_smooth,
+                         linewidth=1.8, label=label)
+
+        ax_left.set_xlabel("Step (within iteration)")
+        ax_left.set_ylabel("success_once")
+        ax_left.set_xlim(0, None)
+        ax_left.set_ylim(-0.05, 1.05)
+        leg = ax_left.legend(loc="lower right")
+        for line in leg.get_lines():
+            line.set_linewidth(4.0)
+        ax_left.grid(True, alpha=0.3)
+
+    ax_left.set_title(f"{task_name} (n={n_seeds})", fontweight="bold")
+
+    # --- Right panel: outer_iter/success_once vs iteration (all seeds + mean) ---
+    all_iters = []
+    all_success = []
+
+    for run_dir in run_dirs:
+        history_path = run_dir / "outer_loop_history.json"
+        if history_path.exists():
+            with open(history_path) as f:
+                history = json.load(f)
+            iters = [e["outer_iter"] + 1 for e in history]  # 1-indexed
+            success = [e["success_once"] for e in history]
+            all_iters.append(iters)
+            all_success.append(success)
+        else:
+            run_str = str(run_dir)
+            outer_steps, outer_values = load_tb_scalar(run_str, "outer_iter/success_once")
+            if outer_steps is not None and len(outer_steps) > 0:
+                iters = np.arange(1, len(outer_values) + 1)  # 1-indexed
+                all_iters.append(iters.tolist())
+                all_success.append(outer_values.tolist())
+
+    if all_iters:
+        # Plot individual seeds as scatter points
+        for iters, success in zip(all_iters, all_success):
+            ax_right.plot(iters, success, 'o', alpha=0.5, markersize=6,
+                         color='gray', zorder=1)
+
+        # Compute and plot mean
+        # Assume all seeds have same iteration count
+        iters_ref = all_iters[0]
+        success_array = np.array(all_success)  # shape: (n_seeds, n_iters)
+        mean_success = np.mean(success_array, axis=0)
+
+        ax_right.plot(iters_ref, mean_success, 'o-', color='black',
+                     linewidth=2.5, markersize=8, label=f'Mean (n={n_seeds})',
+                     zorder=2)
+        ax_right.set_xticks(iters_ref)
+        ax_right.legend(loc='best')
+
+    ax_right.set_xlabel("Outer iteration")
+    ax_right.set_ylabel("success_once")
+    ax_right.set_ylim(-0.05, 1.05)
+    ax_right.grid(True, alpha=0.3)
+    ax_right.set_title(f"{task_name} (eval)", fontweight="bold")
 
 
 def plot_task(ax_left, ax_right, run_dir: Path, task_name: str):
@@ -182,6 +338,27 @@ def plot_task(ax_left, ax_right, run_dir: Path, task_name: str):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Outer-loop summary plot")
+    parser.add_argument("--seed", type=str, default=None,
+                        help="Filter runs by seed (e.g. 1788)")
+    parser.add_argument("--seeds", nargs="+", type=str, default=None,
+                        help="Aggregate across multiple seeds (e.g. 1788 4796 9351)")
+    args = parser.parse_args()
+
+    # Determine mode: aggregate or single seed
+    if args.seeds:
+        mode = "aggregate"
+        seeds = args.seeds
+        print(f"Aggregating across {len(seeds)} seeds: {seeds}")
+    elif args.seed:
+        mode = "single"
+        seeds = None
+        print(f"Plotting single seed: {args.seed}")
+    else:
+        mode = "latest"
+        seeds = None
+        print("Plotting latest run per task (any seed)")
+
     n_tasks = len(TASKS)
     fig, axes = plt.subplots(n_tasks, 2, figsize=(14, 3.2 * n_tasks))
     if n_tasks == 1:
@@ -190,9 +367,17 @@ def main():
     for i, task in enumerate(TASKS):
         print(f"Processing {task}...")
         try:
-            run_dir = latest_run(task)
-            print(f"  Latest run: {run_dir.name}")
-            plot_task(axes[i, 0], axes[i, 1], run_dir, task)
+            if mode == "aggregate":
+                run_dirs = all_latest_runs(task, seeds)
+                if run_dirs:
+                    print(f"  Found {len(run_dirs)} runs")
+                    plot_task_aggregated(axes[i, 0], axes[i, 1], run_dirs, task)
+                else:
+                    raise FileNotFoundError("No runs found for specified seeds")
+            else:
+                run_dir = latest_run(task, seed=args.seed if mode == "single" else None)
+                print(f"  Latest run: {run_dir.name}")
+                plot_task(axes[i, 0], axes[i, 1], run_dir, task)
         except Exception as e:
             print(f"  ERROR: {e}")
             axes[i, 0].text(0.5, 0.5, f"Error: {e}", ha="center",
@@ -201,11 +386,22 @@ def main():
             axes[i, 0].set_title(task, fontweight="bold")
             axes[i, 1].set_title(task, fontweight="bold")
 
-    fig.suptitle("Outer-Loop Results (latest run per task)",
+    # Title and filename
+    if mode == "aggregate":
+        title_suffix = f" (n={len(seeds)} seeds)"
+        file_suffix = f"_agg_n{len(seeds)}"
+    elif mode == "single":
+        title_suffix = f" (seed {args.seed})"
+        file_suffix = f"_seed{args.seed}"
+    else:
+        title_suffix = ""
+        file_suffix = ""
+
+    fig.suptitle(f"Outer-Loop Results (latest run per task{title_suffix})",
                  fontsize=15, fontweight="bold", y=1.0)
     plt.tight_layout()
 
-    out_path = OUTER_LOOP_DIR / "outer_loop_summary.png"
+    out_path = OUTER_LOOP_DIR / f"outer_loop_summary{file_suffix}.png"
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     print(f"\nSaved to {out_path.resolve()}")
     plt.close()

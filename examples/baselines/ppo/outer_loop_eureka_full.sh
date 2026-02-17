@@ -1,14 +1,21 @@
 #!/bin/bash
-# PPO Outer Loop: VLM/LLM-guided Reward Weight Optimization
+# PPO Outer Loop: Eureka Full Replacement Mode (LLM generates complete reward functions)
 #
-# Starts from random weights, runs full PPO training per iteration,
-# then uses VLM/LLM to suggest improved weights for the next iteration.
-# Iteration 1 (random weights) serves as the baseline.
+# This script implements the complete Eureka algorithm from the paper:
+# - Generates K=4 reward function candidates per iteration
+# - Trains each candidate and evaluates fitness (success_rate)
+# - Selects best candidate and performs Reward Reflection
+# - LLM rewrites entire reward function (not just weights)
+#
+# Comparison:
+#   - outer_loop_vlm_params.sh: VLM + LLM (video analysis + weight optimization)
+#   - outer_loop_eureka.sh: LLM only (weight optimization, Eureka-style)
+#   - outer_loop_eureka_full.sh: LLM only (full reward function replacement, complete Eureka)
 #
 # Usage:
-#   export OPENAI_API_KEY=sk-... && bash outer_loop_run.sh
+#   export OPENAI_API_KEY=sk-... && bash outer_loop_eureka_full.sh
 
-seeds=(9351 4796 1788) #9351
+seeds=(9351 4796 1788)
 OUTER_ITERS=5
 WSEED=42
 
@@ -18,7 +25,7 @@ if [ -z "${OPENAI_API_KEY}" ]; then
     exit 1
 fi
 
-echo "=== PPO Outer Loop ==="
+echo "=== PPO Outer Loop: Eureka Full Replacement Mode (LLM generates complete reward functions) ==="
 echo "Outer iterations: ${OUTER_ITERS}"
 echo "Weight seed: ${WSEED}"
 echo "Seeds: ${seeds[@]}"
@@ -30,9 +37,9 @@ do
   echo "=== Running with seed: ${seed} ==="
   echo "========================================="
 
-  for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1"
+  for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
   do
-    # Hyperparameters per task.
+    # Hyperparameters per task (same as outer_loop_vlm_params.sh)
     # Outer loop uses longer rollouts and increased parallel environments (1024 vs 2048-4096 baseline).
     # Total timesteps: 15M/iter for complex tasks vs 50-75M baseline.
     # Batch size ratios between tasks are preserved from baselines.sh (2x for PegInsertion/PushT).
@@ -91,14 +98,6 @@ do
         UPDATE_EPOCHS=8
         GAMMA_ARG="--gamma=0.99"
         GAE_LAMBDA_ARG="--gae_lambda=0.95"
-    elif [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
-        TOTAL=6_000_000          # Baseline: 50M
-        EVAL_STEPS=100
-        NUM_ENVS=256             # Baseline: 1024
-        NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
-        UPDATE_EPOCHS=8
-        GAMMA_ARG=""
-        GAE_LAMBDA_ARG=""
     else
         TOTAL=3_000_000
         EVAL_STEPS=50
@@ -110,7 +109,7 @@ do
     fi
 
     echo "=== ${ENV} ==="
-    python ppo_outer_loop.py \
+    python ppo_outer_loop_full.py \
       --env_id="${ENV}" \
       --seed=${seed} \
       --num_envs=${NUM_ENVS} \
@@ -124,9 +123,9 @@ do
       --weight_seed=${WSEED} \
       ${GAMMA_ARG} \
       ${GAE_LAMBDA_ARG} \
-      --vlm_reward_plot \
+      --eureka_mode \
       --track \
-      --exp-name="ppo-outer-loop-${ENV}-${seed}"
+      --exp-name="ppo-eureka-full-${ENV}-${seed}"
     echo ""
   done
 
@@ -135,7 +134,7 @@ do
 done
 
 echo "========================================="
-echo "=== All outer loop experiments complete ==="
+echo "=== All Eureka full replacement experiments complete ==="
 echo "Seeds run: ${seeds[@]}"
-echo "Check wandb for results (group: PPO-OuterLoop)"
+echo "Check wandb for results (group: PPO-OuterLoop, tags: eureka-full)"
 echo "========================================="

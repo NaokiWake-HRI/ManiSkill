@@ -1,26 +1,36 @@
 """
-PPO Outer Loop: VLM/LLM-guided Reward Weight Optimization.
+PPO Outer Loop: Eureka Full Implementation (LLM-generated Reward Functions).
 
-Unlike ppo_iterative.py which changes weights mid-training (inner loop),
-this script runs full PPO training with fixed weights, then uses VLM/LLM
-to suggest new weights, and restarts training from scratch.
+This script implements the complete Eureka algorithm from the paper:
+- Generate K reward function candidates per iteration
+- Train and evaluate each candidate
+- Select the best candidate based on fitness (success_rate)
+- Use Reward Reflection to improve next iteration
 
-Iteration 1 (random weights) serves as the baseline.
-Iterations 2+ show VLM/LLM-guided improvement.
+Unlike ppo_outer_loop.py (params-only), this script allows LLM to generate
+entire reward functions, not just adjust weights.
 
-Modes:
-    1. VLM + LLM mode (default): Uses video analysis + reward optimization
-    2. Eureka mode (--eureka_mode): Pure LLM-only, uses learning curve data
+Algorithm (Eureka Paper, Algorithm 1):
+    for N outer iterations:
+        1. Generate K reward function candidates (LLM)
+        2. Train each candidate (PPO)
+        3. Evaluate fitness (success_rate)
+        4. Select best candidate
+        5. (Optional) VLM analysis of best candidate
+        6. Reward Reflection: analyze results, provide feedback to LLM
+        7. Update prompt for next iteration
 
 Usage:
-    # With VLM/LLM (default):
-    export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py --env_id PushCube-v1
+    # Full Eureka mode (with VLM):
+    export OPENAI_API_KEY=sk-... && python ppo_outer_loop_full.py \
+        --env_id PushCube-v1 --num_reward_candidates=4 --num_outer_iters=5
 
-    # Eureka mode (LLM-only, no VLM):
-    export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py --env_id PushCube-v1 --eureka_mode
+    # Eureka without VLM (LLM-only):
+    export OPENAI_API_KEY=sk-... && python ppo_outer_loop_full.py \
+        --env_id PushCube-v1 --eureka_mode --num_reward_candidates=4
 
-    # Without VLM/LLM (debug):
-    python ppo_outer_loop.py --env_id PushCube-v1 --skip_vlm_llm --num_outer_iters=2 --total_timesteps_per_iter=50000
+    # Debug mode (no LLM):
+    python ppo_outer_loop_full.py --env_id PushCube-v1 --skip_vlm_llm --num_outer_iters=1
 """
 
 import base64
@@ -53,7 +63,7 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-from reward_wrapper import RewardWrapper, TASK_DEFAULTS, _resolve_task_id
+from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
 
 
 @dataclass
@@ -142,8 +152,12 @@ class Args:
     """skip VLM/LLM calls (for testing)"""
     eureka_mode: bool = False
     """pure Eureka mode: use LLM only without VLM (learning curve based optimization)"""
-    enable_function_code: bool = False
+    enable_function_code: bool = True
     """allow LLM to generate custom reward code (Eureka-style). When False, params-only mode."""
+    num_reward_candidates: int = 4
+    """number of reward function candidates to generate per iteration (K in Eureka paper)"""
+    enable_reward_reflection: bool = True
+    """enable Reward Reflection: analyze learning curves and provide feedback to LLM"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -406,14 +420,19 @@ def generate_random_weights(
 
 def run_ppo_training(
     args: Args,
-    weights: Dict[str, float],
+    weights: Optional[Dict[str, float]],
     outer_iter: int,
     run_dir: str,
     logger: Optional["Logger"],
     device: torch.device,
     global_step_offset: int,
+    custom_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run a single PPO training from scratch with fixed weights.
+    """Run a single PPO training from scratch with fixed weights or custom reward function.
+
+    Args:
+        custom_code: If provided, replaces reward computation with custom function (Eureka mode).
+                     If None, uses YAML-based rewards with weights.
 
     Returns:
         Dict with eval metrics, per-step reward data, and video path.
@@ -428,8 +447,15 @@ def run_ppo_training(
     args.num_iterations = args.total_timesteps_per_iter // args.batch_size
 
     print(f"\n[Outer Iter {outer_iter+1}] Starting PPO training")
-    print(f"  Weights: {weights}")
+    if custom_code is not None:
+        print(f"  Mode: Eureka full replacement (custom function)")
+    else:
+        print(f"  Mode: Weight-based (weights={weights})")
     print(f"  num_iterations={args.num_iterations}, batch_size={args.batch_size}")
+
+    # Create output directory (for model saving, videos, etc.)
+    from pathlib import Path
+    Path(f"runs/{run_dir}").mkdir(parents=True, exist_ok=True)
 
     # --- Environment setup ---
     env_kwargs = dict(
@@ -458,11 +484,19 @@ def run_ppo_training(
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
 
-    # RewardWrapper with fixed weights
-    reward_wrapper_train = RewardWrapper(envs, env_id=args.env_id, weights=weights)
-    reward_wrapper_eval = RewardWrapper(eval_envs, env_id=args.env_id, weights=weights)
+    # RewardWrapperDynamic with fixed weights (supports custom functions)
+    reward_wrapper_train = RewardWrapperDynamic(envs, env_id=args.env_id, weights=weights)
+    reward_wrapper_eval = RewardWrapperDynamic(eval_envs, env_id=args.env_id, weights=weights)
     envs = reward_wrapper_train
     eval_envs = reward_wrapper_eval
+
+    # Set custom reward function if provided (Eureka full replacement mode)
+    # Must be called BEFORE ManiSkillVectorEnv wrapping
+    # ManiSkill uses GPU batch environments, not separate processes, so one call applies to all
+    if custom_code is not None:
+        print(f"  Setting custom reward function (Eureka mode)")
+        reward_wrapper_train.set_custom_function(custom_fn=None, code=custom_code)
+        reward_wrapper_eval.set_custom_function(custom_fn=None, code=custom_code)
 
     # Video recording for eval
     eval_output_dir = f"runs/{run_dir}/videos/iter_{outer_iter+1:02d}"
@@ -757,7 +791,7 @@ if __name__ == "__main__":
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.exp_name}-{args.env_id}-{timestamp}"
-    experiment_type = "eureka" if args.eureka_mode else "outer-loop"
+    experiment_type = "eureka_full" if args.eureka_mode else "outer-loop_full"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
 
     # Seeding
@@ -788,7 +822,7 @@ if __name__ == "__main__":
         # Set tags based on mode
         tags = ["ppo", "outer-loop"]
         if args.eureka_mode:
-            tags.extend(["eureka", "llm-only"])
+            tags.extend(["eureka-full", "llm-only"])
         else:
             tags.extend(["vlm-llm"])
         wandb.init(
@@ -873,206 +907,143 @@ if __name__ == "__main__":
     print(f"Initial weights: {current_weights}")
     print(f"{'='*60}\n")
 
-    # --- Outer Loop ---
+    # --- Outer Loop (Eureka Full Replacement Mode) ---
     outer_loop_history = []
     global_step_offset = 0
+    training_summary = {}  # Carries Reflection context across iterations
 
     for outer_iter in range(args.num_outer_iters):
         print(f"\n{'='*60}")
         print(f"OUTER ITERATION {outer_iter+1}/{args.num_outer_iters}")
-        print(f"Weights: {current_weights}")
         print(f"{'='*60}")
 
-        # Log weights at start of iteration (use global_step_offset for monotonic wandb step)
-        if logger is not None:
-            for wk, wv in current_weights.items():
-                logger.add_scalar(f"outer_iter/weights/{wk}", wv, global_step_offset)
+        # Prepare debug directory (used for LLM/VLM logs and candidate comparison)
+        debug_dir = Path(f"runs/{run_dir}/debug_html")
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-        # Run full PPO training with fixed weights
-        result = run_ppo_training(
-            args=args,
-            weights=current_weights,
-            outer_iter=outer_iter,
-            run_dir=run_dir,
-            logger=logger,
-            device=device,
-            global_step_offset=global_step_offset,
-        )
-        global_step_offset = result["final_global_step"]
+        # Special handling for Iteration 0: no Reflection, no VLM
+        if outer_iter == 0:
+            print("  [Iteration 0] Initial iteration: no Reflection, no VLM")
+            training_summary.pop("reflection_history", None)
 
-        eval_metrics = result["eval_metrics"]
-        success_at_end = eval_metrics.get("success_at_end", 0.0)
-        success_once = eval_metrics.get("success_once", 0.0)
-        avg_return = eval_metrics.get("return", 0.0)
+        # ========== STEP 1: Generate K reward function candidates ==========
+        candidates = []
+        if llm is not None and args.enable_function_code:
+            print(f"\n[Eureka] Generating {args.num_reward_candidates} reward function candidates...")
 
-        print(f"\n[Outer Iter {outer_iter+1}] Results:")
-        print(f"  Success at end: {success_at_end:.4f}")
-        print(f"  Success once: {success_once:.4f}")
-        print(f"  Avg return: {avg_return:.4f}")
+            # Build task description for LLM
+            task_id = _resolve_task_id(args.env_id)
+            _llm_task_descs = {
+                "PushCube": (
+                    "The robot arm must push a cube to the goal position (PushCube).\n"
+                    "Reward components: w_reach (TCP approach to push position behind cube), "
+                    "w_push (cube movement toward goal, gated by reach), "
+                    "w_z_keep (keep cube on table surface), w_success (success bonus).\n\n"
+                    "日本語補足: ロボットアームがキューブを目標位置まで押すタスク。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "PickCube": (
+                    f"The robot must pick up a cube and place it at the goal ({args.env_id}).\n"
+                    "Reward components: w_reach (TCP approach to cube), w_grasp (grasp success), "
+                    "w_place (cube toward goal, gated by grasp), "
+                    "w_static (robot static with object placed), w_success (success bonus).\n\n"
+                    "日本語補足: ロボットがキューブを掴んで目標位置に運ぶタスク。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "OpenCabinetDoor": (
+                    "The robot must open a cabinet door (OpenCabinetDoor).\n"
+                    "Reward components: w_reach (TCP to handle), w_open (door opening progress), "
+                    "w_static (maintain open state), w_success (success bonus).\n\n"
+                    "日本語補足: キャビネットのドアを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "OpenCabinetDrawer": (
+                    "The robot must open a cabinet drawer (OpenCabinetDrawer).\n"
+                    "Reward components: w_reach (TCP to handle), w_open (drawer opening progress), "
+                    "w_static (maintain open state), w_success (success bonus).\n\n"
+                    "日本語補足: キャビネットの引き出しを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "PegInsertionSide": (
+                    "The robot must grasp a peg and insert it into a hole from the side (PegInsertionSide).\n"
+                    "This is a multi-stage task: reach the peg, grasp it, align with the hole, then insert.\n"
+                    "Reward components: w_reach (gripper approach to peg tail), "
+                    "w_grasp (binary grasp success), "
+                    "w_pre_insertion (peg-hole yz alignment, gated by grasp), "
+                    "w_insertion (peg head into hole, gated by grasp AND pre-insertion alignment), "
+                    "w_success (success bonus).\n\n"
+                    "日本語補足: ペグを掴んで横方向から穴に挿入するタスク。"
+                    "reach→grasp→alignment→insertionの段階的な報酬構造。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "PushT": (
+                    "The robot must push a T-shaped block to match the goal position and rotation (PushT).\n"
+                    "This is a 2D pushing task requiring both position and rotation alignment.\n"
+                    "Reward components: w_rotation (cos similarity of tee vs goal z-rotation, squared), "
+                    "w_position (tee-to-goal xy distance, tanh-shaped and squared), "
+                    "w_tcp_guide (encourage TCP to stay near the tee block), "
+                    "w_success (success bonus).\n\n"
+                    "日本語補足: T字ブロックを目標位置・回転に合わせるタスク。"
+                    "位置と回転の両方を合わせる必要がある。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "AnymalC": (
+                    "A quadruped robot (AnymalC) must walk to a goal position (AnymalC-Reach).\n"
+                    "The robot must maintain balance while locomoting toward the target.\n"
+                    "Reward components: w_reach (robot-to-goal distance, tanh-shaped), "
+                    "w_vel_z_penalty (penalize vertical velocity oscillation), "
+                    "w_ang_vel_penalty (penalize angular velocity in xy), "
+                    "w_contact_penalty (penalize undesired knee/body contacts with ground), "
+                    "w_qpos_penalty (penalize deviation from default standing pose).\n"
+                    "Note: reward has a base of +1.0 per step; fails (falls) give 0.\n\n"
+                    "日本語補足: 四脚ロボットが目標位置まで歩行するタスク。"
+                    "バランスを保ちながら移動する必要がある。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+                "UnitreeG1PlaceAppleInBowl": (
+                    "A humanoid robot (UnitreeG1) must pick up an apple and place it into a bowl "
+                    "(UnitreeG1PlaceAppleInBowl).\n"
+                    "Multi-stage: reach apple, grasp it, carry to above the bowl, then release.\n"
+                    "Reward components: w_reach (TCP-to-apple distance), "
+                    "w_grasp (binary grasp success), "
+                    "w_place (apple-to-bowl distance with +0.15m z-offset, gated by grasp), "
+                    "w_above_bowl (binary bonus when apple is within 0.025m of above-bowl target), "
+                    "w_release (encourage opening hand, gated by above_bowl), "
+                    "w_success (success bonus).\n"
+                    "Note: the bowl target has a +0.15m z-offset to encourage bringing the apple "
+                    "above the bowl before releasing.\n\n"
+                    "日本語補足: ヒューマノイドロボットがリンゴを掴んでボウルに入れるタスク。"
+                    "reach→grasp→carry→above_bowl→releaseの段階的な報酬構造。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
+            }
 
-        # Log outer iteration metrics (use global_step_offset so wandb step is monotonic)
-        if logger is not None:
-            logger.add_scalar("outer_iter/success_at_end", success_at_end, global_step_offset)
-            logger.add_scalar("outer_iter/success_once", success_once, global_step_offset)
-            logger.add_scalar("outer_iter/avg_return", avg_return, global_step_offset)
-            logger.add_scalar("outer_iter/iteration", outer_iter, global_step_offset)
+            # Get reward function source code for LLM context
+            # Iteration 0: Use minimal sparse reward example to avoid bias
+            # Iteration 1+: Use best candidate from previous iteration
+            if outer_iter == 0:
+                # Sparse reward baseline: only success bonus
+                # LLM must design dense reward shaping from scratch
+                reward_fn_source = '''def compute_reward_sparse_example(info, base):
+    """
+    Sparse reward baseline: only provides reward at goal achievement.
 
-        # --- VLM/LLM analysis ---
-        vlm_comment = None
-        new_weights_suggestion = None
+    Your task: Design dense reward shaping to guide learning efficiently.
+    Consider:
+    - Distance-based rewards (reach, approach, proximity)
+    - Multi-stage rewards (reach → manipulate → succeed)
+    - Normalization (torch.exp, torch.tanh) with temperature parameters
+    - Gating (reward stages only when prerequisites are met)
+    """
+    import torch
 
-        # VLM analysis (skip in Eureka mode)
-        if vlm is not None:
-            print(f"\n[VLM] Analyzing iteration {outer_iter+1}...")
+    # Sparse reward: only at success
+    reward = torch.zeros(info["success"].shape[0], device=base.device, dtype=torch.float32)
+    reward[info["success"]] = 1.0
 
-            # Extract frames from latest eval video
-            video_dir = Path(result["eval_video_dir"])
-            video_files = sorted(video_dir.glob("*.mp4"))
-
-            if video_files:
-                latest_video = video_files[-1]
-                frames = extract_frames_from_video(
-                    latest_video,
-                    max_frames=args.vlm_max_frames,
-                    num_total_envs=args.num_eval_envs,
-                    num_show_envs=args.vlm_num_envs,
-                )
-                if frames:
-                    episode_info = {
-                        "return": avg_return,
-                        "success_at_end": success_at_end,
-                        "success_once": success_once,
-                        "length": args.num_eval_steps,
-                    }
-
-                    vlm_score, vlm_comment, _ = vlm.evaluate(frames, episode_info)
-                    print(f"[VLM] Analysis:\n{vlm_comment}")
-
-                    # Save VLM debug HTML
-                    debug_dir = Path(f"runs/{run_dir}/debug_html")
-                    vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
-                    save_vlm_debug_html(
-                        frames=frames,
-                        prompt=build_vlm_prompt(args.env_id),
-                        episode_info=episode_info,
-                        vlm_score=vlm_score,
-                        vlm_comment=vlm_comment,
-                        save_path=vlm_html_path,
-                        max_frames=args.vlm_max_frames,
-                    )
-
-                    # Append per-step reward plot
-                    if args.vlm_reward_plot and result["step_rewards"]:
-                        step_rewards_tensor = torch.stack(result["step_rewards"])
-                        plot_html = generate_reward_plot_html(
-                            step_rewards_tensor, args.num_eval_envs,
-                            breakdowns=result["reward_breakdowns"],
-                        )
-                        append_html_to_file(vlm_html_path, plot_html)
-                else:
-                    print("[warn] No frames extracted from video")
+    return reward
+'''
             else:
-                print("[warn] No eval videos found")
-
-        # LLM reward tuning (works with or without VLM)
-        if llm is not None:
-            if vlm_comment is not None or args.eureka_mode:
-                # Build task description for LLM (appears in prompt via llm_task_description)
-                task_id = _resolve_task_id(args.env_id)
-                _llm_task_descs = {
-                    "PushCube": (
-                        "The robot arm must push a cube to the goal position (PushCube).\n"
-                        "Reward components: w_reach (TCP approach to push position behind cube), "
-                        "w_push (cube movement toward goal, gated by reach), "
-                        "w_z_keep (keep cube on table surface), w_success (success bonus).\n\n"
-                        "日本語補足: ロボットアームがキューブを目標位置まで押すタスク。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PickCube": (
-                        f"The robot must pick up a cube and place it at the goal ({args.env_id}).\n"
-                        "Reward components: w_reach (TCP approach to cube), w_grasp (grasp success), "
-                        "w_place (cube toward goal, gated by grasp), "
-                        "w_static (robot static with object placed), w_success (success bonus).\n\n"
-                        "日本語補足: ロボットがキューブを掴んで目標位置に運ぶタスク。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "OpenCabinetDoor": (
-                        "The robot must open a cabinet door (OpenCabinetDoor).\n"
-                        "Reward components: w_reach (TCP to handle), w_open (door opening progress), "
-                        "w_static (maintain open state), w_success (success bonus).\n\n"
-                        "日本語補足: キャビネットのドアを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "OpenCabinetDrawer": (
-                        "The robot must open a cabinet drawer (OpenCabinetDrawer).\n"
-                        "Reward components: w_reach (TCP to handle), w_open (drawer opening progress), "
-                        "w_static (maintain open state), w_success (success bonus).\n\n"
-                        "日本語補足: キャビネットの引き出しを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PegInsertionSide": (
-                        "The robot must grasp a peg and insert it into a hole from the side (PegInsertionSide).\n"
-                        "This is a multi-stage task: reach the peg, grasp it, align with the hole, then insert.\n"
-                        "Reward components: w_reach (gripper approach to peg tail), "
-                        "w_grasp (binary grasp success), "
-                        "w_pre_insertion (peg-hole yz alignment, gated by grasp), "
-                        "w_insertion (peg head into hole, gated by grasp AND pre-insertion alignment), "
-                        "w_success (success bonus).\n\n"
-                        "日本語補足: ペグを掴んで横方向から穴に挿入するタスク。"
-                        "reach→grasp→alignment→insertionの段階的な報酬構造。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PushT": (
-                        "The robot must push a T-shaped block to match the goal position and rotation (PushT).\n"
-                        "This is a 2D pushing task requiring both position and rotation alignment.\n"
-                        "Reward components: w_rotation (cos similarity of tee vs goal z-rotation, squared), "
-                        "w_position (tee-to-goal xy distance, tanh-shaped and squared), "
-                        "w_tcp_guide (encourage TCP to stay near the tee block), "
-                        "w_success (success bonus).\n\n"
-                        "日本語補足: T字ブロックを目標位置・回転に合わせるタスク。"
-                        "位置と回転の両方を合わせる必要がある。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "AnymalC": (
-                        "A quadruped robot (AnymalC) must walk to a goal position (AnymalC-Reach).\n"
-                        "The robot must maintain balance while locomoting toward the target.\n"
-                        "Reward components: w_reach (robot-to-goal distance, tanh-shaped), "
-                        "w_vel_z_penalty (penalize vertical velocity oscillation), "
-                        "w_ang_vel_penalty (penalize angular velocity in xy), "
-                        "w_contact_penalty (penalize undesired knee/body contacts with ground), "
-                        "w_qpos_penalty (penalize deviation from default standing pose).\n"
-                        "Note: reward has a base of +1.0 per step; fails (falls) give 0.\n\n"
-                        "日本語補足: 四脚ロボットが目標位置まで歩行するタスク。"
-                        "バランスを保ちながら移動する必要がある。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "UnitreeG1PlaceAppleInBowl": (
-                        "A humanoid robot (UnitreeG1) must pick up an apple and place it into a bowl "
-                        "(UnitreeG1PlaceAppleInBowl).\n"
-                        "Multi-stage: reach apple, grasp it, carry to above the bowl, then release.\n"
-                        "Reward components: w_reach (TCP-to-apple distance), "
-                        "w_grasp (binary grasp success), "
-                        "w_place (apple-to-bowl distance with +0.15m z-offset, gated by grasp), "
-                        "w_above_bowl (binary bonus when apple is within 0.025m of above-bowl target), "
-                        "w_release (encourage opening hand, gated by above_bowl), "
-                        "w_success (success bonus).\n"
-                        "Note: the bowl target has a +0.15m z-offset to encourage bringing the apple "
-                        "above the bowl before releasing.\n\n"
-                        "日本語補足: ヒューマノイドロボットがリンゴを掴んでボウルに入れるタスク。"
-                        "reach→grasp→carry→above_bowl→releaseの段階的な報酬構造。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                }
-
-                # Compute per-component reward means from final eval (Eureka-style)
-                reward_components = {}
-                if result.get("reward_breakdowns"):
-                    bds = result["reward_breakdowns"]
-                    for key in bds[0]:
-                        if key == "norm_scale":
-                            continue
-                        vals = [bd[key] for bd in bds]
-                        reward_components[key] = sum(vals) / len(vals)
-
-                # Get reward function source code for LLM context
+                # Use previous iteration's best candidate as reference
+                # (will be set in training_summary later)
                 _reward_method_map = {
                     "PickCube": "_compute_pick_cube",
                     "PushCube": "_compute_push_cube",
@@ -1086,124 +1057,471 @@ if __name__ == "__main__":
                 try:
                     method_name = _reward_method_map[task_id]
                     reward_fn_source = inspect.getsource(
-                        getattr(RewardWrapper, method_name)
+                        getattr(RewardWrapperDynamic, method_name)
                     )
                 except Exception as e:
                     print(f"[Warning] Could not get reward_fn_source: {e}")
                     reward_fn_source = "N/A"
 
+            # State access documentation for LLM (Eureka full replacement mode)
+            _state_access_docs = {
+                "PushCube": """
+Available state attributes (base = env.unwrapped):
+- base.obj.pose.p: Cube position, torch.Tensor (batch_size, 3)
+- base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.goal_region.pose.p: Goal position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "PickCube": """
+Available state attributes (base = env.unwrapped):
+- base.cube.pose.p: Object position, torch.Tensor (batch_size, 3)
+- base.agent.tcp_pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.goal_site.pose.p: Goal position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["is_grasped"]: torch.Tensor (batch_size,) bool
+- info["is_obj_placed"]: torch.Tensor (batch_size,) bool
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "OpenCabinetDoor": """
+Available state attributes (base = env.unwrapped):
+- base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.handle_link.pose.p: Door handle link position, torch.Tensor (batch_size, 3)
+- base.handle_link.joint.qpos: Door joint position (angle), torch.Tensor (batch_size, 1)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["handle_link_pos"]: torch.Tensor (batch_size, 3) handle center position (computed in evaluate())
+- info["open_enough"]: torch.Tensor (batch_size,) bool (door opened beyond threshold)
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "OpenCabinetDrawer": """
+Available state attributes (base = env.unwrapped):
+- base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.handle_link.pose.p: Drawer handle link position, torch.Tensor (batch_size, 3)
+- base.handle_link.joint.qpos: Drawer joint position (distance), torch.Tensor (batch_size, 1)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["handle_link_pos"]: torch.Tensor (batch_size, 3) handle center position (computed in evaluate())
+- info["open_enough"]: torch.Tensor (batch_size,) bool (drawer opened beyond threshold)
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "PegInsertionSide": """
+Available state attributes (base = env.unwrapped):
+- base.peg.pose.p: Peg position, torch.Tensor (batch_size, 3)
+- base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.box_hole_pose.p: Hole position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool (peg fully inserted)
+- info["peg_head_pos_at_hole"]: torch.Tensor (batch_size, 3) computed peg head position
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "PushT": """
+Available state attributes (base = env.unwrapped):
+- base.tee.pose.p: T-block position, torch.Tensor (batch_size, 3)
+- base.tee.pose.q: T-block rotation (quaternion), torch.Tensor (batch_size, 4)
+- base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
+- base.goal_tee.pose.p: Goal T-block position, torch.Tensor (batch_size, 3)
+- base.goal_z_rot: Goal z-axis rotation (Euler angle), torch.Tensor (batch_size,)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "AnymalC": """
+Available state attributes (base = env.unwrapped):
+- base.agent.robot.pose.p: Robot position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+- base.goal.pose.p: Goal sphere position, torch.Tensor (batch_size, 3)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool (reached goal without falling)
+- info["fail"]: torch.Tensor (batch_size,) bool (robot fell)
+- info["robot_to_goal_dist"]: torch.Tensor (batch_size,) float (xy distance to goal)
+- info["reached_goal"]: torch.Tensor (batch_size,) bool (dist < 0.35m)
+- info["is_fallen"]: torch.Tensor (batch_size,) bool
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "UnitreeG1PlaceAppleInBowl": """
+Available state attributes (base = env.unwrapped):
+- base.apple.pose.p: Apple position, torch.Tensor (batch_size, 3)
+- base.agent.right_tcp.pose.p: Right hand end effector position, torch.Tensor (batch_size, 3)
+- base.bowl.pose.p: Bowl position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+- base.agent.right_hand_dist_to_open_grasp(): Distance to open grasp, torch.Tensor (batch_size,)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool (apple in bowl AND hand outside)
+- info["is_grasped"]: torch.Tensor (batch_size,) bool
+- info["hand_outside_bowl"]: torch.Tensor (batch_size,) bool (hand z > bowl z + 0.125m)
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+            }
+
+            # Base training_summary for candidate generation
+            if outer_iter == 0:
+                # Initial iteration: minimal context
                 training_summary = {
-                    "current_weights": dict(current_weights),
-                    "initial_weights": initial_weights,
+                    "current_iteration": outer_iter,
+                    "total_iterations": args.num_outer_iters,
+                    "llm_task_description": _llm_task_descs.get(task_id, ""),
+                    "reward_fn_source": reward_fn_source,
+                    "state_access_docs": _state_access_docs.get(task_id, ""),
+                    "eureka_full_replacement": True,
+                    "num_reward_candidates": args.num_reward_candidates,
+                }
+            else:
+                # Iteration 1+: Include statistics from previous iteration
+                prev_iter = outer_loop_history[-1]
+                prev_best = prev_iter["best_candidate"]
+
+                training_summary = {
                     "current_iteration": outer_iter,
                     "total_iterations": args.num_outer_iters,
                     "total_timesteps": global_step_offset,
-                    "avg_return": avg_return,
-                    "success_rate": success_at_end,
-                    "success_at_end": success_at_end,
-                    "success_once": success_once,
-                    "vlm_comments": [vlm_comment],
-                    "num_episodes": int(eval_metrics.get("num_episodes", 0)),
                     "llm_task_description": _llm_task_descs.get(task_id, ""),
-                    "reward_fn_source": reward_fn_source,
-                    "learning_curve": result["learning_curve"],
-                    "reward_components": reward_components,
+                    "reward_fn_source": prev_best["code"],  # Use previous best as reference
+                    "state_access_docs": _state_access_docs.get(task_id, ""),
+                    "eureka_full_replacement": True,
+                    "num_reward_candidates": args.num_reward_candidates,
+                    # Statistics from previous iteration
+                    "avg_return": prev_best["eval_metrics"].get("return", 0.0),
+                    "success_rate": prev_best["fitness"],
+                    "success_at_end": prev_best["fitness"],
+                    "success_once": prev_best["eval_metrics"].get("success_once", 0.0),
+                    "learning_curve": prev_best["learning_curve"],
+                    "num_episodes": int(prev_best["eval_metrics"].get("num_episodes", 0)),
                 }
 
-                # Add past iteration history for LLM context
-                if outer_loop_history:
-                    # Performance trend: how results changed over iterations
+                # Add Reward Reflection from previous iteration (if available)
+                if "reflection_history" in prev_iter:
+                    training_summary["reflection_history"] = prev_iter["reflection_history"]
+
+                # Add performance trend across iterations
+                if len(outer_loop_history) > 0:
                     training_summary["performance_trend"] = [
                         {
                             "iteration": h["outer_iter"],
-                            "weights": h["weights"],
-                            "avg_return": h["avg_return"],
-                            "success_rate": h["success_at_end"],
-                            "success_at_end": h["success_at_end"],
-                            "success_once": h["success_once"],
-                            "learning_curve": h.get("learning_curve", []),
-                        }
-                        for h in outer_loop_history
-                    ]
-                    # Weight change history: what was changed and why
-                    training_summary["history_summary"] = [
-                        {
-                            "iteration": h["outer_iter"],
-                            "changes": h.get("rationale", "N/A"),
-                            "result": {
-                                "avg_return": h["avg_return"],
-                                "success_rate": h["success_at_end"],
-                                "success_at_end": h["success_at_end"],
-                                "success_once": h["success_once"],
-                            },
-                            "rationale": h.get("rationale", "N/A"),
-                            "vlm_comment": h.get("vlm_comment", "N/A"),
+                            "fitness": h["best_candidate"]["fitness"],
+                            "avg_return": h["best_candidate"]["eval_metrics"].get("return", 0.0),
+                            "success_rate": h["best_candidate"]["fitness"],
+                            "success_at_end": h["best_candidate"]["fitness"],
+                            "success_once": h["best_candidate"]["eval_metrics"].get("success_once", 0.0),
+                            "learning_curve": h["best_candidate"]["learning_curve"],
                         }
                         for h in outer_loop_history
                     ]
 
-                suggestions = llm.suggest_parameters(training_summary)
+            # Generate K candidates
+            for k in range(args.num_reward_candidates):
+                print(f"  Candidate {k+1}/{args.num_reward_candidates} generation...")
 
-                # Save LLM debug HTML
+                # Seed fixing for Iteration 0 (reproducibility)
+                llm_seed = args.weight_seed + k if outer_iter == 0 else None
+
+                # Request LLM to generate reward function code
+                suggestions = llm.suggest_parameters(training_summary, seed=llm_seed)
+
+                # Save LLM debug HTML for this candidate
                 query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
                 llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
                 llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
-                debug_dir = Path(f"runs/{run_dir}/debug_html")
                 save_llm_debug_html(
                     iteration=outer_iter,
                     prompt=llm_prompt,
                     response_text=llm_response,
                     suggestions=suggestions,
                     summary_for_llm=training_summary,
-                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_llm.html",
+                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{k+1}_llm.html",
                 )
 
-                if suggestions and suggestions.get("type") == "params":
-                    new_params = suggestions.get("params", {})
+                if suggestions and suggestions.get("type") == "function_code":
+                    custom_code = suggestions["custom_code"]
                     rationale = suggestions.get("rationale", "No rationale")
-                    if new_params:
-                        print(f"[LLM] Rationale: {rationale}")
-                        print(f"[LLM] Suggested weights: {new_params}")
-                        new_weights_suggestion = {
-                            "params": new_params,
-                            "rationale": rationale,
-                        }
-                    else:
-                        print("[LLM] No weight changes suggested")
-                else:
-                    print(f"[LLM] Unexpected suggestion type: {suggestions}")
 
-        # Record history
+                    # Compile validation
+                    test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
+
+                    # Retry once if compilation fails (only for first few candidates)
+                    if test_fn is None and k < args.num_reward_candidates - 1:
+                        print(f"    Compilation error, retrying once...")
+                        error_summary = {
+                            **training_summary,
+                            "previous_code_error": {
+                                "code": custom_code,
+                                "error": compile_error,
+                                "instruction": (
+                                    "前回のコードでコンパイルエラーが発生しました。\n"
+                                    "エラーを修正した新しいコードを生成してください。\n\n"
+                                    "よくあるエラー:\n"
+                                    "1. 関数名が 'compute_reward' でない\n"
+                                    "2. インデントエラー\n"
+                                    "3. torch/npのインポート忘れ\n"
+                                    "4. 戻り値がtorch.Tensorでない\n"
+                                    "5. batch_size次元の処理ミス"
+                                )
+                            }
+                        }
+                        suggestions = llm.suggest_parameters(error_summary)
+
+                        # Save retry debug HTML
+                        query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                        llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                        llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                        save_llm_debug_html(
+                            iteration=outer_iter,
+                            prompt=llm_prompt,
+                            response_text=llm_response,
+                            suggestions=suggestions,
+                            summary_for_llm=error_summary,
+                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{k+1}_retry_llm.html",
+                        )
+
+                        if suggestions and suggestions.get("type") == "function_code":
+                            custom_code = suggestions["custom_code"]
+                            rationale = suggestions.get("rationale", "No rationale (retry)")
+                            test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
+
+                    if test_fn is not None:
+                        candidates.append({
+                            "code": custom_code,
+                            "rationale": rationale,
+                            "id": k
+                        })
+                        print(f"    ✓ Candidate {k+1} compiled successfully")
+                    else:
+                        print(f"    ✗ Candidate {k+1} skipped (compilation failed): {compile_error}")
+                else:
+                    print(f"    ✗ Candidate {k+1} skipped (LLM returned wrong type: {suggestions.get('type', 'N/A')})")
+
+            if len(candidates) == 0:
+                print("\n[ERROR] No valid candidates generated. Terminating experiment.")
+                sys.exit(1)
+
+            print(f"\n  Valid candidates: {len(candidates)}/{args.num_reward_candidates}")
+
+        else:
+            # Fallback: use default weights (params-only mode)
+            print("[INFO] LLM disabled or function_code=False, using default weights")
+            candidates = [{
+                "code": None,
+                "rationale": "Default weights (no custom function)",
+                "id": 0
+            }]
+
+        # ========== STEP 2: Train and evaluate each candidate ==========
+        candidate_results = []
+        for cand in candidates:
+            print(f"\n{'='*50}")
+            print(f"[Candidate {cand['id']+1}] Training PPO")
+            print(f"{'='*50}")
+            print(f"Rationale: {cand['rationale']}")
+
+            # Run PPO training with custom function
+            cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+            result = run_ppo_training(
+                args=args,
+                weights=None,  # Custom function mode, weights not used
+                outer_iter=outer_iter,
+                run_dir=cand_run_dir,
+                logger=logger,
+                device=device,
+                global_step_offset=global_step_offset,
+                custom_code=cand["code"],  # Pass custom code to run_ppo_training
+            )
+
+            # Update global_step_offset for next candidate to avoid log collision
+            global_step_offset = result["final_global_step"]
+
+            # Fitness evaluation (success_rate at end)
+            eval_metrics = result["eval_metrics"]
+            fitness = eval_metrics.get("success_at_end", 0.0)
+
+            # Collect reward statistics
+            step_rewards = result.get("step_rewards", [])
+            if step_rewards:
+                step_rewards_tensor = torch.stack(step_rewards)
+                reward_stats = {
+                    "mean": step_rewards_tensor.mean().item(),
+                    "std": step_rewards_tensor.std().item(),
+                    "min": step_rewards_tensor.min().item(),
+                    "max": step_rewards_tensor.max().item(),
+                }
+            else:
+                reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+            candidate_results.append({
+                "candidate_id": cand["id"],
+                "code": cand["code"],
+                "rationale": cand["rationale"],
+                "fitness": fitness,
+                "eval_metrics": eval_metrics,
+                "learning_curve": result["learning_curve"],
+                "reward_statistics": reward_stats,
+                "eval_video_dir": result["eval_video_dir"],
+            })
+
+            print(f"\n[Candidate {cand['id']+1}] Results:")
+            print(f"  Fitness (success_at_end): {fitness:.4f}")
+            print(f"  Success once: {eval_metrics.get('success_once', 0.0):.4f}")
+            print(f"  Avg return: {eval_metrics.get('return', 0.0):.4f}")
+            print(f"  Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+
+        # ========== STEP 3: Select best candidate ==========
+        best = max(candidate_results, key=lambda x: x["fitness"])
+        print(f"\n{'='*60}")
+        print(f"[BEST] Candidate {best['candidate_id']+1} selected (fitness={best['fitness']:.4f})")
+        print(f"{'='*60}")
+
+        # Save candidate comparison summary
+        comparison_html = f"""<h2>Iteration {outer_iter+1} - Candidate Comparison</h2>
+<table border="1" style="border-collapse: collapse; width: 100%;">
+<tr><th>Candidate</th><th>Fitness</th><th>Success@End</th><th>Success Once</th><th>Avg Return</th><th>Reward Stats</th><th>Rationale</th></tr>
+"""
+        for cand in sorted(candidate_results, key=lambda x: x["fitness"], reverse=True):
+            cid = cand["candidate_id"] + 1
+            fit = cand["fitness"]
+            s_end = cand["eval_metrics"].get("success_at_end", 0.0)
+            s_once = cand["eval_metrics"].get("success_once", 0.0)
+            avg_ret = cand["eval_metrics"].get("return", 0.0)
+            r_stats = cand["reward_statistics"]
+            rationale = cand["rationale"]
+            best_mark = "⭐ BEST" if cand["candidate_id"] == best["candidate_id"] else ""
+            comparison_html += f"""<tr>
+<td>{cid} {best_mark}</td>
+<td>{fit:.4f}</td>
+<td>{s_end:.4f}</td>
+<td>{s_once:.4f}</td>
+<td>{avg_ret:.2f}</td>
+<td>mean={r_stats['mean']:.3f}, std={r_stats['std']:.3f}</td>
+<td>{rationale}</td>
+</tr>
+"""
+        comparison_html += "</table>"
+
+        comparison_path = debug_dir / f"iter_{outer_iter+1:02d}_candidates_comparison.html"
+        with open(comparison_path, "w") as f:
+            f.write(f"<html><body>{comparison_html}</body></html>")
+        print(f"  Saved candidate comparison: {comparison_path}")
+
+        # Log best candidate metrics (global_step_offset already updated in training loop)
+        if logger is not None:
+            logger.add_scalar("outer_iter/best_fitness", best["fitness"], global_step_offset)
+            logger.add_scalar("outer_iter/best_success_at_end", best["eval_metrics"].get("success_at_end", 0.0), global_step_offset)
+            logger.add_scalar("outer_iter/best_avg_return", best["eval_metrics"].get("return", 0.0), global_step_offset)
+            logger.add_scalar("outer_iter/iteration", outer_iter, global_step_offset)
+
+        # ========== STEP 4: VLM analysis (Iteration 1+ only) ==========
+        vlm_comment = None
+        if vlm is not None and outer_iter > 0:
+            print(f"\n[VLM] Analyzing best candidate's video (iteration {outer_iter+1})...")
+
+            video_dir = Path(best["eval_video_dir"])
+            video_files = sorted(video_dir.glob("*.mp4"))
+
+            if video_files:
+                latest_video = video_files[-1]
+                frames = extract_frames_from_video(
+                    latest_video,
+                    max_frames=args.vlm_max_frames,
+                    num_total_envs=args.num_eval_envs,
+                    num_show_envs=args.vlm_num_envs,
+                )
+                if frames:
+                    episode_info = {
+                        "return": best["eval_metrics"].get("return", 0.0),
+                        "success_at_end": best["fitness"],
+                        "success_once": best["eval_metrics"].get("success_once", 0.0),
+                        "length": args.num_eval_steps,
+                    }
+
+                    vlm_score, vlm_comment, _ = vlm.evaluate(frames, episode_info)
+                    print(f"[VLM] Analysis:\n{vlm_comment}")
+                    best["vlm_comment"] = vlm_comment
+                    best["vlm_score"] = vlm_score
+
+                    # Save VLM debug HTML
+                    debug_dir = Path(f"runs/{run_dir}/debug_html")
+                    vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
+                    save_vlm_debug_html(
+                        frames=frames,
+                        prompt=build_vlm_prompt(args.env_id),
+                        episode_info=episode_info,
+                        vlm_score=vlm_score,
+                        vlm_comment=vlm_comment,
+                        save_path=vlm_html_path,
+                        max_frames=args.vlm_max_frames,
+                    )
+                else:
+                    print("[warn] No frames extracted from video")
+            else:
+                print("[warn] No eval videos found")
+
+        # ========== STEP 5: Reward Reflection ==========
+        reflection_summary = None
+        if args.enable_reward_reflection:
+            print(f"\n[Reflection] Preparing feedback for next iteration...")
+            reflection_summary = {
+                "best_candidate": best,
+                "all_candidates": candidate_results,
+                "reward_statistics": best["reward_statistics"],
+                "vlm_feedback": best.get("vlm_comment", "N/A"),
+            }
+            print(f"  Reflection data prepared (best fitness={best['fitness']:.4f})")
+
+        # ========== STEP 6: Record history ==========
         iter_record = {
             "outer_iter": outer_iter,
-            "weights": dict(current_weights),
-            "success_at_end": success_at_end,
-            "success_once": success_once,
-            "avg_return": avg_return,
-            "eval_metrics": eval_metrics,
-            "vlm_comment": vlm_comment,
-            "learning_curve": result["learning_curve"],
+            "best_candidate": best,
+            "all_candidates": candidate_results,
+            "num_valid_candidates": len(candidates),
         }
-
-        # Apply new weights for next iteration
-        if new_weights_suggestion is not None:
-            old_weights = dict(current_weights)
-            for k, v in new_weights_suggestion["params"].items():
-                if k in current_weights:
-                    current_weights[k] = v
-            iter_record["new_weights"] = dict(current_weights)
-            iter_record["rationale"] = new_weights_suggestion["rationale"]
-            print(f"\n[Outer Iter {outer_iter+1}] Weight update:")
-            print(f"  Old: {old_weights}")
-            print(f"  New: {current_weights}")
-        else:
-            iter_record["new_weights"] = dict(current_weights)
-            iter_record["rationale"] = "No change"
-            outer_loop_history.append(iter_record)
-            print(f"\n[Outer Iter {outer_iter+1}] LLM suggested no weight change. "
-                  f"Stopping early (no benefit to re-training with identical weights).")
-            break
-
+        # Save reflection for next iteration
+        if reflection_summary is not None:
+            iter_record["reflection_history"] = reflection_summary
         outer_loop_history.append(iter_record)
 
     # --- Save final results ---
@@ -1212,21 +1530,34 @@ if __name__ == "__main__":
         json.dump(outer_loop_history, f, indent=2, default=str)
     print(f"\nOuter loop history saved to {history_path}")
 
-    final_weights_path = f"runs/{run_dir}/final_weights.json"
-    with open(final_weights_path, "w") as f:
-        json.dump(current_weights, f, indent=2)
-    print(f"Final weights saved to {final_weights_path}")
+    # Save best candidate from final iteration
+    if outer_loop_history:
+        final_best = outer_loop_history[-1]["best_candidate"]
+        final_best_path = f"runs/{run_dir}/final_best_candidate.json"
+        with open(final_best_path, "w") as f:
+            json.dump({
+                "candidate_id": final_best["candidate_id"],
+                "rationale": final_best["rationale"],
+                "fitness": final_best["fitness"],
+                "code": final_best["code"],
+            }, f, indent=2)
+        print(f"Final best candidate saved to {final_best_path}")
 
     # Print summary
     print(f"\n{'='*60}")
-    print("OUTER LOOP SUMMARY")
+    print("OUTER LOOP SUMMARY (Eureka Full Replacement)")
     print(f"{'='*60}")
     for record in outer_loop_history:
         i = record["outer_iter"]
-        s_end = record["success_at_end"]
-        s_once = record["success_once"]
-        ar = record["avg_return"]
-        print(f"  Iter {i+1}: success_end={s_end:.4f}, success_once={s_once:.4f}, return={ar:.4f}, weights={record['weights']}")
+        best = record["best_candidate"]
+        s_end = best["eval_metrics"].get("success_at_end", 0.0)
+        s_once = best["eval_metrics"].get("success_once", 0.0)
+        ar = best["eval_metrics"].get("return", 0.0)
+        fitness = best["fitness"]
+        num_cands = record["num_valid_candidates"]
+        print(f"  Iter {i+1}: fitness={fitness:.4f}, success_end={s_end:.4f}, "
+              f"success_once={s_once:.4f}, return={ar:.4f}, "
+              f"candidates={num_cands}, best_id={best['candidate_id']+1}")
     print(f"{'='*60}")
 
     logger.close()

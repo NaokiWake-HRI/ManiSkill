@@ -12,7 +12,7 @@
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_eureka.sh
 
-seeds=(4796 1788) # 9351
+seeds=(9351 4796 1788)
 OUTER_ITERS=5
 WSEED=42
 
@@ -34,7 +34,7 @@ do
   echo "=== Running with seed: ${seed} ==="
   echo "========================================="
 
-  for ENV in "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" # "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
+  for ENV in "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1" "PushCube-v1" "PickCube-v1" "OpenCabinetDoor-v1" "OpenCabinetDrawer-v1" # 
   do
     # Hyperparameters per task (same as outer_loop_vlm_params.sh)
     # Outer loop uses longer rollouts and increased parallel environments (1024 vs 2048-4096 baseline).

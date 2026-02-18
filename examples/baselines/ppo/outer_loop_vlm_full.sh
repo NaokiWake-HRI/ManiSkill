@@ -123,7 +123,8 @@ do
       --num_outer_iters=${OUTER_ITERS} \
       --total_timesteps_per_iter=${TOTAL} \
       --weight_seed=${WSEED} \
-      --num_reward_candidates=1 \
+      --num_reward_candidates=4 \
+      --enable_reward_reflection \
       ${GAMMA_ARG} \
       ${GAE_LAMBDA_ARG} \
       --track \

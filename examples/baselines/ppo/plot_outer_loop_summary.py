@@ -9,6 +9,7 @@ Usage:
     python plot_outer_loop_summary.py                        # latest run per task (any seed)
     python plot_outer_loop_summary.py --seed 1788             # latest run per task for seed 1788
     python plot_outer_loop_summary.py --seeds 1788 4796 9351  # aggregate across 3 seeds (mean + individual points)
+    python plot_outer_loop_summary.py --seed 9351 --iters 1 3 5  # show only iterations 1, 3, 5
 """
 
 import argparse
@@ -114,7 +115,8 @@ def extract_iteration(steps, values, start, end):
     return steps[mask] - start, values[mask]
 
 
-def plot_task_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name: str):
+def plot_task_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name: str,
+                         iter_filter: list[int] | None = None):
     """Plot both panels for a single task, aggregating across multiple seeds."""
     if not run_dirs:
         ax_left.text(0.5, 0.5, "No data", ha="center", va="center",
@@ -147,7 +149,10 @@ def plot_task_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name: str
         n_iters = len(iter_starts)
         iter_ends = iter_starts[1:] + [np.inf]
 
-        plot_indices = list(range(n_iters))[::-1]  # Show all iterations (reversed order)
+        if iter_filter is not None:
+            plot_indices = [i for i in range(n_iters) if (i + 1) in iter_filter][::-1]
+        else:
+            plot_indices = list(range(n_iters))[::-1]  # Show all iterations (reversed order)
 
         for i in plot_indices:
             start, end = iter_starts[i], iter_ends[i]
@@ -245,7 +250,8 @@ def plot_task_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name: str
     ax_right.set_title(f"{task_name} (eval)", fontweight="bold")
 
 
-def plot_task(ax_left, ax_right, run_dir: Path, task_name: str):
+def plot_task(ax_left, ax_right, run_dir: Path, task_name: str,
+              iter_filter: list[int] | None = None):
     """Plot both panels for a single task."""
     run_str = str(run_dir)
     metric = "train/success_once"
@@ -266,9 +272,10 @@ def plot_task(ax_left, ax_right, run_dir: Path, task_name: str):
                      transform=ax_left.transAxes)
     else:
         n_iters = len(iter_starts)
-        # Only plot first and last iterations (reversed: last then first)
-        plot_indices = [0] if n_iters == 1 else [n_iters - 1, 0]
-        plot_indices = list(range(n_iters))[::-1]  # Show all iterations (reversed order)
+        if iter_filter is not None:
+            plot_indices = [i for i in range(n_iters) if (i + 1) in iter_filter][::-1]
+        else:
+            plot_indices = list(range(n_iters))[::-1]  # Show all iterations (reversed order)
 
         for i in plot_indices:
             start, end = iter_starts[i], iter_ends[i]
@@ -343,7 +350,13 @@ def main():
                         help="Filter runs by seed (e.g. 1788)")
     parser.add_argument("--seeds", nargs="+", type=str, default=None,
                         help="Aggregate across multiple seeds (e.g. 1788 4796 9351)")
+    parser.add_argument("--iters", nargs="+", type=int, default=None,
+                        help="Show only specific iterations (1-indexed, e.g. --iters 1 3 5)")
     args = parser.parse_args()
+
+    iter_filter = args.iters
+    if iter_filter:
+        print(f"Filtering to iterations: {iter_filter}")
 
     # Determine mode: aggregate or single seed
     if args.seeds:
@@ -371,13 +384,15 @@ def main():
                 run_dirs = all_latest_runs(task, seeds)
                 if run_dirs:
                     print(f"  Found {len(run_dirs)} runs")
-                    plot_task_aggregated(axes[i, 0], axes[i, 1], run_dirs, task)
+                    plot_task_aggregated(axes[i, 0], axes[i, 1], run_dirs, task,
+                                        iter_filter=iter_filter)
                 else:
                     raise FileNotFoundError("No runs found for specified seeds")
             else:
                 run_dir = latest_run(task, seed=args.seed if mode == "single" else None)
                 print(f"  Latest run: {run_dir.name}")
-                plot_task(axes[i, 0], axes[i, 1], run_dir, task)
+                plot_task(axes[i, 0], axes[i, 1], run_dir, task,
+                         iter_filter=iter_filter)
         except Exception as e:
             print(f"  ERROR: {e}")
             axes[i, 0].text(0.5, 0.5, f"Error: {e}", ha="center",

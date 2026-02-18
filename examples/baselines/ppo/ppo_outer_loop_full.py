@@ -928,8 +928,22 @@ if __name__ == "__main__":
 
         # ========== STEP 1: Generate K reward function candidates ==========
         candidates = []
+
+        # Elite carry-over: Iteration 1+ reserves 1 slot for previous best
+        if outer_iter > 0:
+            prev_best = outer_loop_history[-1]["best_candidate"]
+            candidates.append({
+                "code": prev_best["code"],
+                "rationale": f"Elite carry-over from Iteration {outer_iter} (fitness={prev_best['fitness']:.4f})",
+                "id": 0,
+                "is_elite": True,
+            })
+            print(f"  Elite candidate added (prev best fitness={prev_best['fitness']:.4f})")
+
+        llm_candidate_count = args.num_reward_candidates - len(candidates)
+
         if llm is not None and args.enable_function_code:
-            print(f"\n[Eureka] Generating {args.num_reward_candidates} reward function candidates...")
+            print(f"\n[Eureka] Generating {llm_candidate_count} LLM candidates (total slots: {args.num_reward_candidates})...")
 
             # Build task description for LLM
             task_id = _resolve_task_id(args.env_id)
@@ -1255,9 +1269,10 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                         for h in outer_loop_history
                     ]
 
-            # Generate K candidates
-            for k in range(args.num_reward_candidates):
-                print(f"  Candidate {k+1}/{args.num_reward_candidates} generation...")
+            # Generate LLM candidates (remaining slots after elite)
+            for k in range(llm_candidate_count):
+                cand_id = len(candidates)
+                print(f"  LLM Candidate {cand_id+1}/{args.num_reward_candidates} generation...")
 
                 # Seed fixing for Iteration 0 (reproducibility)
                 llm_seed = args.weight_seed + k if outer_iter == 0 else None
@@ -1275,7 +1290,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     response_text=llm_response,
                     suggestions=suggestions,
                     summary_for_llm=training_summary,
-                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{k+1}_llm.html",
+                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}_llm.html",
                 )
 
                 if suggestions and suggestions.get("type") == "function_code":
@@ -1286,7 +1301,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
 
                     # Retry once if compilation fails (only for first few candidates)
-                    if test_fn is None and k < args.num_reward_candidates - 1:
+                    if test_fn is None and k < llm_candidate_count - 1:
                         print(f"    Compilation error, retrying once...")
                         error_summary = {
                             **training_summary,
@@ -1317,7 +1332,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                             response_text=llm_response,
                             suggestions=suggestions,
                             summary_for_llm=error_summary,
-                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{k+1}_retry_llm.html",
+                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}_retry_llm.html",
                         )
 
                         if suggestions and suggestions.get("type") == "function_code":
@@ -1329,19 +1344,22 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                         candidates.append({
                             "code": custom_code,
                             "rationale": rationale,
-                            "id": k
+                            "id": cand_id,
+                            "is_elite": False,
                         })
-                        print(f"    ✓ Candidate {k+1} compiled successfully")
+                        print(f"    ✓ Candidate {cand_id+1} compiled successfully")
                     else:
-                        print(f"    ✗ Candidate {k+1} skipped (compilation failed): {compile_error}")
+                        print(f"    ✗ Candidate {cand_id+1} skipped (compilation failed): {compile_error}")
                 else:
-                    print(f"    ✗ Candidate {k+1} skipped (LLM returned wrong type: {suggestions.get('type', 'N/A')})")
+                    print(f"    ✗ Candidate {cand_id+1} skipped (LLM returned wrong type: {suggestions.get('type', 'N/A')})")
 
             if len(candidates) == 0:
                 print("\n[ERROR] No valid candidates generated. Terminating experiment.")
                 sys.exit(1)
 
-            print(f"\n  Valid candidates: {len(candidates)}/{args.num_reward_candidates}")
+            elite_count = sum(1 for c in candidates if c.get("is_elite", False))
+            llm_count = len(candidates) - elite_count
+            print(f"\n  Valid candidates: {len(candidates)}/{args.num_reward_candidates} (elite={elite_count}, llm={llm_count})")
 
         else:
             # Fallback: use default weights (params-only mode)
@@ -1349,7 +1367,8 @@ def compute_reward(info: dict, base) -> torch.Tensor:
             candidates = [{
                 "code": None,
                 "rationale": "Default weights (no custom function)",
-                "id": 0
+                "id": 0,
+                "is_elite": False,
             }]
 
         # ========== STEP 2: Train and evaluate each candidate ==========
@@ -1397,6 +1416,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                 "candidate_id": cand["id"],
                 "code": cand["code"],
                 "rationale": cand["rationale"],
+                "is_elite": cand.get("is_elite", False),
                 "fitness": fitness,
                 "eval_metrics": eval_metrics,
                 "learning_curve": result["learning_curve"],

@@ -41,6 +41,7 @@ import os
 import random as py_random
 import sys
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -911,6 +912,7 @@ if __name__ == "__main__":
     outer_loop_history = []
     global_step_offset = 0
     training_summary = {}  # Carries Reflection context across iterations
+    last_good_code = None  # Track last successful reward code across iterations
 
     for outer_iter in range(args.num_outer_iters):
         print(f"\n{'='*60}")
@@ -932,13 +934,16 @@ if __name__ == "__main__":
         # Elite carry-over: Iteration 1+ reserves 1 slot for previous best
         if outer_iter > 0:
             prev_best = outer_loop_history[-1]["best_candidate"]
-            candidates.append({
-                "code": prev_best["code"],
-                "rationale": f"Elite carry-over from Iteration {outer_iter} (fitness={prev_best['fitness']:.4f})",
-                "id": 0,
-                "is_elite": True,
-            })
-            print(f"  Elite candidate added (prev best fitness={prev_best['fitness']:.4f})")
+            if prev_best.get("code") is not None:
+                candidates.append({
+                    "code": prev_best["code"],
+                    "rationale": f"Elite carry-over from Iteration {outer_iter} (fitness={prev_best['fitness']:.4f})",
+                    "id": 0,
+                    "is_elite": True,
+                })
+                print(f"  Elite candidate added (prev best fitness={prev_best['fitness']:.4f})")
+            else:
+                print(f"  Skipping elite carry-over (previous iteration had no valid candidates)")
 
         llm_candidate_count = args.num_reward_candidates - len(candidates)
 
@@ -1237,7 +1242,8 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     "total_iterations": args.num_outer_iters,
                     "total_timesteps": global_step_offset,
                     "llm_task_description": _llm_task_descs.get(task_id, ""),
-                    "reward_fn_source": prev_best["code"],  # Use previous best as reference
+                    # Use prev best code → last known good → fallback method source
+                    "reward_fn_source": prev_best.get("code") or last_good_code or reward_fn_source,
                     "state_access_docs": _state_access_docs.get(task_id, ""),
                     "eureka_full_replacement": True,
                     "num_reward_candidates": args.num_reward_candidates,
@@ -1270,42 +1276,63 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     ]
 
             # Generate LLM candidates (remaining slots after elite)
+            MAX_COMPILE_RETRIES = 5
+            elite_count = sum(1 for c in candidates if c.get("is_elite", False))
+
             for k in range(llm_candidate_count):
-                cand_id = len(candidates)
+                cand_id = elite_count + k  # Fixed ID per slot (not len(candidates))
                 print(f"  LLM Candidate {cand_id+1}/{args.num_reward_candidates} generation...")
 
-                # Seed fixing for Iteration 0 (reproducibility)
-                llm_seed = args.weight_seed + k if outer_iter == 0 else None
+                compiled = False
+                error_context = None
 
-                # Request LLM to generate reward function code
-                suggestions = llm.suggest_parameters(training_summary, seed=llm_seed)
+                for compile_attempt in range(MAX_COMPILE_RETRIES):
+                    if compile_attempt > 0:
+                        print(f"    Compile retry {compile_attempt}/{MAX_COMPILE_RETRIES-1}...")
 
-                # Save LLM debug HTML for this candidate
-                query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
-                llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
-                save_llm_debug_html(
-                    iteration=outer_iter,
-                    prompt=llm_prompt,
-                    response_text=llm_response,
-                    suggestions=suggestions,
-                    summary_for_llm=training_summary,
-                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}_llm.html",
-                )
+                    # Build summary (with error context if retrying)
+                    gen_summary = training_summary
+                    if error_context is not None:
+                        gen_summary = {**training_summary, "previous_code_error": error_context}
 
-                if suggestions and suggestions.get("type") == "function_code":
-                    custom_code = suggestions["custom_code"]
-                    rationale = suggestions.get("rationale", "No rationale")
+                    # Seed fixing for Iteration 0, first attempt only (reproducibility)
+                    llm_seed = args.weight_seed + k if outer_iter == 0 and compile_attempt == 0 else None
 
-                    # Compile validation
-                    test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
+                    suggestions = llm.suggest_parameters(gen_summary, seed=llm_seed)
 
-                    # Retry once if compilation fails (only for first few candidates)
-                    if test_fn is None and k < llm_candidate_count - 1:
-                        print(f"    Compilation error, retrying once...")
-                        error_summary = {
-                            **training_summary,
-                            "previous_code_error": {
+                    # Save LLM debug HTML (unique per attempt)
+                    query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                    llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                    llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                    suffix = f"_attempt{compile_attempt}" if compile_attempt > 0 else ""
+                    save_llm_debug_html(
+                        iteration=outer_iter,
+                        prompt=llm_prompt,
+                        response_text=llm_response,
+                        suggestions=suggestions,
+                        summary_for_llm=gen_summary,
+                        save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}{suffix}_llm.html",
+                    )
+
+                    if suggestions and suggestions.get("type") == "function_code":
+                        custom_code = suggestions["custom_code"]
+                        rationale = suggestions.get("rationale", "No rationale")
+
+                        test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
+
+                        if test_fn is not None:
+                            candidates.append({
+                                "code": custom_code,
+                                "rationale": rationale,
+                                "id": cand_id,
+                                "is_elite": False,
+                            })
+                            print(f"    ✓ Candidate {cand_id+1} compiled (attempt {compile_attempt+1})")
+                            compiled = True
+                            break
+                        else:
+                            print(f"    ✗ Compile failed (attempt {compile_attempt+1}): {compile_error[:200]}")
+                            error_context = {
                                 "code": custom_code,
                                 "error": compile_error,
                                 "instruction": (
@@ -1319,119 +1346,206 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                                     "5. batch_size次元の処理ミス"
                                 )
                             }
-                        }
-                        suggestions = llm.suggest_parameters(error_summary)
-
-                        # Save retry debug HTML
-                        query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                        llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
-                        llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
-                        save_llm_debug_html(
-                            iteration=outer_iter,
-                            prompt=llm_prompt,
-                            response_text=llm_response,
-                            suggestions=suggestions,
-                            summary_for_llm=error_summary,
-                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}_retry_llm.html",
-                        )
-
-                        if suggestions and suggestions.get("type") == "function_code":
-                            custom_code = suggestions["custom_code"]
-                            rationale = suggestions.get("rationale", "No rationale (retry)")
-                            test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
-
-                    if test_fn is not None:
-                        candidates.append({
-                            "code": custom_code,
-                            "rationale": rationale,
-                            "id": cand_id,
-                            "is_elite": False,
-                        })
-                        print(f"    ✓ Candidate {cand_id+1} compiled successfully")
                     else:
-                        print(f"    ✗ Candidate {cand_id+1} skipped (compilation failed): {compile_error}")
-                else:
-                    print(f"    ✗ Candidate {cand_id+1} skipped (LLM returned wrong type: {suggestions.get('type', 'N/A')})")
+                        sug_type = suggestions.get("type", "N/A") if suggestions else "None"
+                        print(f"    ✗ Wrong response type (attempt {compile_attempt+1}): {sug_type}")
+                        error_context = {
+                            "code": "N/A",
+                            "error": f"LLM did not return function_code type (got: {sug_type})",
+                            "instruction": (
+                                "function_code形式で報酬関数を返してください。\n"
+                                "type: 'function_code', custom_code: 'def compute_reward(info, base): ...'"
+                            )
+                        }
+
+                if not compiled:
+                    print(f"    ✗ Candidate slot {cand_id+1} exhausted {MAX_COMPILE_RETRIES} attempts")
 
             if len(candidates) == 0:
                 print("\n[ERROR] No valid candidates generated. Terminating experiment.")
                 sys.exit(1)
 
-            elite_count = sum(1 for c in candidates if c.get("is_elite", False))
-            llm_count = len(candidates) - elite_count
-            print(f"\n  Valid candidates: {len(candidates)}/{args.num_reward_candidates} (elite={elite_count}, llm={llm_count})")
+            final_elite_count = sum(1 for c in candidates if c.get("is_elite", False))
+            llm_count = len(candidates) - final_elite_count
+            print(f"\n  Valid candidates: {len(candidates)}/{args.num_reward_candidates} (elite={final_elite_count}, llm={llm_count})")
 
         else:
             # Fallback: use default weights (params-only mode)
-            print("[INFO] LLM disabled or function_code=False, using default weights")
-            candidates = [{
-                "code": None,
-                "rationale": "Default weights (no custom function)",
-                "id": 0,
-                "is_elite": False,
-            }]
+            # Preserve elite candidates if already added
+            if not candidates:
+                print("[INFO] LLM disabled or function_code=False, using default weights")
+                candidates.append({
+                    "code": None,
+                    "rationale": "Default weights (no custom function)",
+                    "id": 0,
+                    "is_elite": False,
+                })
+            else:
+                print(f"[INFO] LLM disabled, proceeding with {len(candidates)} elite candidate(s)")
 
         # ========== STEP 2: Train and evaluate each candidate ==========
         candidate_results = []
+        MAX_RUNTIME_RETRIES = 2
+
         for cand in candidates:
             print(f"\n{'='*50}")
             print(f"[Candidate {cand['id']+1}] Training PPO")
             print(f"{'='*50}")
-            print(f"Rationale: {cand['rationale']}")
 
-            # Run PPO training with custom function
-            cand_run_dir = f"{run_dir}/cand_{cand['id']}"
-            result = run_ppo_training(
-                args=args,
-                weights=None,  # Custom function mode, weights not used
-                outer_iter=outer_iter,
-                run_dir=cand_run_dir,
-                logger=logger,
-                device=device,
-                global_step_offset=global_step_offset,
-                custom_code=cand["code"],  # Pass custom code to run_ppo_training
-            )
+            current_code = cand["code"]
+            current_rationale = cand["rationale"]
+            training_succeeded = False
 
-            # Update global_step_offset for next candidate to avoid log collision
-            global_step_offset = result["final_global_step"]
+            for attempt in range(MAX_RUNTIME_RETRIES + 1):
+                if attempt > 0:
+                    print(f"\n  [Runtime Retry {attempt}/{MAX_RUNTIME_RETRIES}] Retrying with LLM-fixed code")
 
-            # Fitness evaluation (success_rate at end)
-            eval_metrics = result["eval_metrics"]
-            fitness = eval_metrics.get("success_at_end", 0.0)
+                print(f"Rationale: {current_rationale}")
 
-            # Collect reward statistics
-            step_rewards = result.get("step_rewards", [])
-            if step_rewards:
-                step_rewards_tensor = torch.stack(step_rewards)
-                reward_stats = {
-                    "mean": step_rewards_tensor.mean().item(),
-                    "std": step_rewards_tensor.std().item(),
-                    "min": step_rewards_tensor.min().item(),
-                    "max": step_rewards_tensor.max().item(),
-                }
-            else:
-                reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+                try:
+                    cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+                    if attempt > 0:
+                        cand_run_dir = f"{run_dir}/cand_{cand['id']}_retry{attempt}"
 
-            candidate_results.append({
-                "candidate_id": cand["id"],
-                "code": cand["code"],
-                "rationale": cand["rationale"],
-                "is_elite": cand.get("is_elite", False),
-                "fitness": fitness,
-                "eval_metrics": eval_metrics,
-                "learning_curve": result["learning_curve"],
-                "reward_statistics": reward_stats,
-                "eval_video_dir": result["eval_video_dir"],
-            })
+                    result = run_ppo_training(
+                        args=args,
+                        weights=None,
+                        outer_iter=outer_iter,
+                        run_dir=cand_run_dir,
+                        logger=logger,
+                        device=device,
+                        global_step_offset=global_step_offset,
+                        custom_code=current_code,
+                    )
 
-            print(f"\n[Candidate {cand['id']+1}] Results:")
-            print(f"  Fitness (success_at_end): {fitness:.4f}")
-            print(f"  Success once: {eval_metrics.get('success_once', 0.0):.4f}")
-            print(f"  Avg return: {eval_metrics.get('return', 0.0):.4f}")
-            print(f"  Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+                    # Training succeeded
+                    global_step_offset = result["final_global_step"]
+
+                    eval_metrics = result["eval_metrics"]
+                    fitness = eval_metrics.get("success_at_end", 0.0)
+
+                    step_rewards = result.get("step_rewards", [])
+                    if step_rewards:
+                        step_rewards_tensor = torch.stack(step_rewards)
+                        reward_stats = {
+                            "mean": step_rewards_tensor.mean().item(),
+                            "std": step_rewards_tensor.std().item(),
+                            "min": step_rewards_tensor.min().item(),
+                            "max": step_rewards_tensor.max().item(),
+                        }
+                    else:
+                        reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+                    candidate_results.append({
+                        "candidate_id": cand["id"],
+                        "code": current_code,
+                        "rationale": current_rationale,
+                        "is_elite": cand.get("is_elite", False),
+                        "fitness": fitness,
+                        "eval_metrics": eval_metrics,
+                        "learning_curve": result["learning_curve"],
+                        "reward_statistics": reward_stats,
+                        "eval_video_dir": result["eval_video_dir"],
+                    })
+
+                    print(f"\n[Candidate {cand['id']+1}] Results:")
+                    print(f"  Fitness (success_at_end): {fitness:.4f}")
+                    print(f"  Success once: {eval_metrics.get('success_once', 0.0):.4f}")
+                    print(f"  Avg return: {eval_metrics.get('return', 0.0):.4f}")
+                    print(f"  Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+
+                    training_succeeded = True
+                    break
+
+                except Exception as e:
+                    error_tb = traceback.format_exc()
+                    print(f"\n[Candidate {cand['id']+1}] Runtime error (attempt {attempt+1}/{MAX_RUNTIME_RETRIES+1}):")
+                    print(f"  {type(e).__name__}: {e}")
+                    print(f"  Traceback (last 15 lines):")
+                    for line in error_tb.strip().split('\n')[-15:]:
+                        print(f"    {line}")
+
+                    # Free GPU resources from failed training
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    if attempt < MAX_RUNTIME_RETRIES and llm is not None:
+                        print(f"  Requesting LLM to fix the runtime error...")
+                        fix_summary = {
+                            **training_summary,
+                            "previous_code_error": {
+                                "code": current_code,
+                                "error": f"{type(e).__name__}: {e}\n\n{error_tb}",
+                                "instruction": (
+                                    "前回のコードでランタイムエラーが発生しました。\n"
+                                    "エラーを修正した新しいコードを生成してください。\n\n"
+                                    "よくあるランタイムエラー:\n"
+                                    "1. base.device が存在しない → base.obj.pose.p.device を使う\n"
+                                    "2. テンソルのshape不一致（(B,3)に対してスカラー操作等）\n"
+                                    "3. 存在しない属性へのアクセス（State Access Docsを参照）\n"
+                                    "4. torch演算のdevice不一致（CPU/CUDA混在）\n"
+                                    "5. info dictのキーが存在しない\n"
+                                    "6. hasattr/setattr on batched env objects\n"
+                                    "7. 型アノテーションで __import__ を使用 → 'torch.Tensor' を使う\n\n"
+                                    "修正後のコードをfunction_code形式で返してください。"
+                                )
+                            }
+                        }
+                        suggestions = llm.suggest_parameters(fix_summary)
+
+                        # Save retry debug HTML
+                        if save_llm_debug_html is not None:
+                            query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                            llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                            llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                            save_llm_debug_html(
+                                iteration=outer_iter,
+                                prompt=llm_prompt,
+                                response_text=llm_response,
+                                suggestions=suggestions,
+                                summary_for_llm=fix_summary,
+                                save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand['id']}_runtime_retry{attempt}_llm.html",
+                            )
+
+                        if suggestions and suggestions.get("type") == "function_code":
+                            new_code = suggestions["custom_code"]
+                            test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(new_code)
+                            if test_fn is not None:
+                                current_code = new_code
+                                current_rationale = suggestions.get("rationale", f"Runtime error fix (attempt {attempt+1})")
+                                print(f"  ✓ LLM generated fixed code, retrying training...")
+                                continue
+                            else:
+                                print(f"  ✗ LLM fix failed compilation: {compile_error}")
+                        else:
+                            sug_type = suggestions.get("type", "N/A") if suggestions else "N/A"
+                            print(f"  ✗ LLM returned wrong type: {sug_type}")
+
+                    # No more retries or LLM fix failed
+                    print(f"  ✗ Candidate {cand['id']+1} skipped (runtime error)")
+                    break
+
+            if not training_succeeded:
+                print(f"[Candidate {cand['id']+1}] FAILED after {attempt+1} attempt(s)")
 
         # ========== STEP 3: Select best candidate ==========
+        if len(candidate_results) == 0:
+            print(f"\n[ERROR] All candidates failed for iteration {outer_iter+1}. Skipping to next iteration.")
+            # Record empty iteration
+            outer_loop_history.append({
+                "outer_iter": outer_iter,
+                "best_candidate": {"candidate_id": -1, "fitness": 0.0, "eval_metrics": {}, "code": None,
+                                   "rationale": "All candidates failed", "learning_curve": []},
+                "all_candidates": [],
+                "num_valid_candidates": 0,
+            })
+            continue
+
         best = max(candidate_results, key=lambda x: x["fitness"])
+        if best.get("code") is not None:
+            last_good_code = best["code"]
         print(f"\n{'='*60}")
         print(f"[BEST] Candidate {best['candidate_id']+1} selected (fitness={best['fitness']:.4f})")
         print(f"{'='*60}")

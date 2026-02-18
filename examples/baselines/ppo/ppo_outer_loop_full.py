@@ -1230,7 +1230,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     "reward_fn_source": reward_fn_source,
                     "state_access_docs": _state_access_docs.get(task_id, ""),
                     "eureka_full_replacement": True,
-                    "num_reward_candidates": args.num_reward_candidates,
+                    "num_reward_candidates": 1,  # Each LLM call produces exactly 1 candidate
                 }
             else:
                 # Iteration 1+: Include statistics from previous iteration
@@ -1246,7 +1246,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     "reward_fn_source": prev_best.get("code") or last_good_code or reward_fn_source,
                     "state_access_docs": _state_access_docs.get(task_id, ""),
                     "eureka_full_replacement": True,
-                    "num_reward_candidates": args.num_reward_candidates,
+                    "num_reward_candidates": 1,  # Each LLM call produces exactly 1 candidate
                     # Statistics from previous iteration
                     "avg_return": prev_best["eval_metrics"].get("return", 0.0),
                     "success_rate": prev_best["fitness"],

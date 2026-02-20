@@ -137,6 +137,8 @@ class Args:
     """path to JSON file with initial weights (if None, generate random)"""
     weight_seed: int = 42
     """seed for random weight generation"""
+    resume_dir: Optional[str] = None
+    """path to a previous run directory to resume from (e.g., runs/outer-loop_full/PushCube-v1/...). Creates a new branched directory; original is not modified."""
 
     # VLM/LLM arguments
     vlm_model: str = "gpt-5.2"
@@ -1125,6 +1127,73 @@ if __name__ == "__main__":
     experiment_type = "eureka_full" if args.eureka_mode else "outer-loop_full"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
 
+    # --- Resume from previous run (creates a new branched directory) ---
+    _resumed_history = None
+    _resume_start_iter = 0
+    _resume_global_step_offset = 0
+    if args.resume_dir is not None:
+        # Resolve the source directory (accept both "runs/..." and bare paths)
+        _src_dir = Path(args.resume_dir)
+        if not _src_dir.exists():
+            _src_dir = Path("runs") / args.resume_dir
+        if not _src_dir.exists():
+            raise FileNotFoundError(f"Resume directory not found: {args.resume_dir}")
+
+        _hist_path = _src_dir / "outer_loop_history.json"
+        if not _hist_path.exists():
+            raise FileNotFoundError(f"No outer_loop_history.json in {_src_dir}")
+
+        with open(_hist_path) as f:
+            _resumed_history = json.load(f)
+        _resume_start_iter = len(_resumed_history)
+        _resume_global_step_offset = _resume_start_iter * args.total_timesteps_per_iter
+
+        # Branch: new directory name derived from original + resume timestamp
+        _orig_name = _src_dir.name
+        run_name = f"{_orig_name}_resume{_resume_start_iter}_{timestamp}"
+        run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
+
+        # Copy debug_html from source so VLM/LLM history files are accessible
+        import shutil
+        _src_debug = _src_dir / "debug_html"
+        _dst_debug = Path(f"runs/{run_dir}/debug_html")
+        _dst_debug.mkdir(parents=True, exist_ok=True)
+        if _src_debug.exists():
+            for _f in _src_debug.iterdir():
+                shutil.copy2(_f, _dst_debug / _f.name)
+
+        # Copy TensorBoard events from each cand_* directory (for plot_outer_loop_full_summary.py)
+        # Only copies event files (small), NOT checkpoints or videos (large).
+        for _cand_dir in sorted(_src_dir.glob("cand_*")):
+            if _cand_dir.is_dir():
+                _dst_cand = Path(f"runs/{run_dir}") / _cand_dir.name
+                _dst_cand.mkdir(parents=True, exist_ok=True)
+                for _ev in _cand_dir.glob("events.out.tfevents.*"):
+                    shutil.copy2(_ev, _dst_cand / _ev.name)
+
+        # Copy root-level TensorBoard events
+        _dst_run = Path(f"runs/{run_dir}")
+        _dst_run.mkdir(parents=True, exist_ok=True)
+        for _ev in _src_dir.glob("events.out.tfevents.*"):
+            shutil.copy2(_ev, _dst_run / _ev.name)
+
+        # Copy summary image if exists
+        _src_img = _src_dir / "outer_loop_full_summary.png"
+        if _src_img.exists():
+            shutil.copy2(_src_img, _dst_run / "outer_loop_full_summary.png")
+
+        # Adjust num_outer_iters to be total (start_iter + additional)
+        # User specifies --num_outer_iters as ADDITIONAL iterations to run
+        args.num_outer_iters = _resume_start_iter + args.num_outer_iters
+
+        print(f"\n{'='*60}")
+        print(f"RESUMING from: {_src_dir}")
+        print(f"  Previous iterations: {_resume_start_iter}")
+        print(f"  Additional iterations: {args.num_outer_iters - _resume_start_iter}")
+        print(f"  Total iterations: {args.num_outer_iters}")
+        print(f"  Branched to: runs/{run_dir}")
+        print(f"{'='*60}\n")
+
     # Seeding
     py_random.seed(args.seed)
     np.random.seed(args.seed)
@@ -1245,7 +1314,17 @@ if __name__ == "__main__":
     training_summary = {}  # Carries Reflection context across iterations
     last_good_code = None  # Track last successful reward code across iterations
 
-    for outer_iter in range(args.num_outer_iters):
+    # Restore state from previous run if resuming
+    if _resumed_history is not None:
+        outer_loop_history = list(_resumed_history)
+        global_step_offset = _resume_global_step_offset
+        # Restore last_good_code from the best candidate of the last iteration
+        if outer_loop_history:
+            _prev_best = outer_loop_history[-1]["best_candidate"]
+            last_good_code = _prev_best.get("code")
+        print(f"[Resume] Restored {len(outer_loop_history)} iterations, global_step_offset={global_step_offset}")
+
+    for outer_iter in range(_resume_start_iter, args.num_outer_iters):
         print(f"\n{'='*60}")
         print(f"OUTER ITERATION {outer_iter+1}/{args.num_outer_iters}")
         print(f"{'='*60}")

@@ -20,7 +20,7 @@
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_vlm_full.sh
 
 seeds=(9351) # 4796 1788
-OUTER_ITERS=5
+OUTER_ITERS=10
 WSEED=42
 GPUS="0,1,0,1"
 LOG_DIR="logs/vlm_full_$(date +%Y%m%d_%H%M%S)"
@@ -44,7 +44,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "OpenCabinetDoor-v1" # "PickCube-v1" # "PushCube-v1" # "OpenCabinetDrawer-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
+    for ENV in "OpenCabinetDrawer-v1" # "OpenCabinetDoor-v1" # "PickCube-v1" # "PushCube-v1" # "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
@@ -79,7 +79,7 @@ for seed in "${seeds[@]}"; do
             GAMMA_ARG="--gamma=0.97"
             GAE_LAMBDA_ARG="--gae_lambda=0.95"
         elif [ "${ENV}" == "OpenCabinetDoor-v1" ] || [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
-            TOTAL=6_000_000          # Baseline: 50M
+            TOTAL=12_000_000          # Baseline: 50M
             EVAL_STEPS=100
             NUM_ENVS=256             # Baseline: 1024
             NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)

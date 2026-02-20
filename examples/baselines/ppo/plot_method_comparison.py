@@ -27,6 +27,8 @@ TASKS = [
     "PickCube-v1",
     "OpenCabinetDoor-v1",
     "OpenCabinetDrawer-v1",
+    "UnitreeG1PlaceAppleInBowl-v1",
+    "AnymalC-Reach-v1",
 ]
 
 

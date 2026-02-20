@@ -50,7 +50,7 @@ FINGERS_CLOSED = np.array([0.3, 1.0, 1.0, 1.0])
 
 # Thumb open / closed
 THUMB_OPEN = np.array([0.83, 0.0, 0.0, 0.0])
-THUMB_CLOSED = np.array([0.83, 0.7, 0.7, 1.2])
+THUMB_CLOSED = np.array([1.3, 0.7, 0.7, 1.2])  # joint12: max 1.396 (more pronation)
 
 LERP_RATE = 0.1  # interpolation speed per frame
 

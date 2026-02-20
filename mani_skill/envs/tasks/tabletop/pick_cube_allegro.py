@@ -37,7 +37,7 @@ class PickCubePandaAllegroEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda_allegro", "panda_allegro_touch"]
     agent: Union[PandaAllegro, PandaAllegroTouch]
     goal_thresh = 0.025
-    cube_half_size = 0.02
+    cube_half_size = 0.03
     cube_spawn_half_size = 0.1
     cube_spawn_center = (0, 0)
     max_goal_height = 0.3

@@ -12,6 +12,8 @@
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_eureka.sh
 
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
 seeds=(9351 4796 1788)
 OUTER_ITERS=5
 WSEED=42
@@ -121,6 +123,7 @@ do
       ${GAMMA_ARG} \
       ${GAE_LAMBDA_ARG} \
       --eureka_mode \
+      --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
       --track \
       --exp-name="ppo-eureka-${ENV}-${seed}"
     echo ""

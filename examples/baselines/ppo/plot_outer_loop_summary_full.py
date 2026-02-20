@@ -13,6 +13,7 @@ Usage:
     python plot_outer_loop_summary_full.py --mode eureka_full        # only eureka_full runs
     python plot_outer_loop_summary_full.py --mode outer-loop_full    # only outer-loop_full runs
     python plot_outer_loop_summary_full.py --seed 9351 --iters 1 3 5 # show only iterations 1, 3, 5
+    python plot_outer_loop_summary_full.py --seed 9351 --include-incomplete
 """
 
 import argparse
@@ -59,7 +60,16 @@ def _extract_seed(name: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _find_task_runs(task: str, mode: str | None = None) -> list[Path]:
+def _is_complete_run(run: Path) -> bool:
+    """A completed run must have both history and final best candidate."""
+    return (run / "outer_loop_history.json").exists() and (run / "final_best_candidate.json").exists()
+
+
+def _find_task_runs(
+    task: str,
+    mode: str | None = None,
+    include_incomplete: bool = False,
+) -> list[Path]:
     """Find all run directories for a task across full dirs."""
     dirs = []
     search_dirs = {mode: FULL_DIRS[mode]} if mode and mode in FULL_DIRS else FULL_DIRS
@@ -67,29 +77,50 @@ def _find_task_runs(task: str, mode: str | None = None) -> list[Path]:
         task_dir = dir_path / task
         if task_dir.is_dir():
             for run in task_dir.iterdir():
-                if run.is_dir() and (run / "outer_loop_history.json").exists():
-                    dirs.append(run)
+                if not run.is_dir() or not (run / "outer_loop_history.json").exists():
+                    continue
+                if not include_incomplete and not _is_complete_run(run):
+                    continue
+                dirs.append(run)
     return dirs
 
 
-def latest_run(task: str, seed: str | None = None, mode: str | None = None) -> Path:
-    runs = _find_task_runs(task, mode)
+def latest_run(
+    task: str,
+    seed: str | None = None,
+    mode: str | None = None,
+    include_incomplete: bool = False,
+) -> Path:
+    runs = _find_task_runs(task, mode, include_incomplete=include_incomplete)
     if seed is not None:
         runs = [r for r in runs if _extract_seed(r.name) == seed]
     if not runs:
         raise FileNotFoundError(
-            f"No runs found for {task}" + (f" (seed={seed})" if seed else "")
+            f"No {'(complete) ' if not include_incomplete else ''}runs found for {task}"
+            + (f" (seed={seed})" if seed else "")
         )
     runs.sort(key=lambda p: _extract_timestamp(p.name))
     return runs[-1]
 
 
-def all_latest_runs(task: str, seeds: list[str], mode: str | None = None) -> list[Path]:
+def all_latest_runs(
+    task: str,
+    seeds: list[str],
+    mode: str | None = None,
+    include_incomplete: bool = False,
+) -> list[Path]:
     """Get latest run for each seed."""
     runs = []
     for seed in seeds:
         try:
-            runs.append(latest_run(task, seed=seed, mode=mode))
+            runs.append(
+                latest_run(
+                    task,
+                    seed=seed,
+                    mode=mode,
+                    include_incomplete=include_incomplete,
+                )
+            )
         except FileNotFoundError:
             print(f"  WARNING: No run found for seed {seed}, skipping")
     return runs
@@ -350,6 +381,11 @@ def main():
                         help="Only show runs from this directory (default: both)")
     parser.add_argument("--iters", nargs="+", type=int, default=None,
                         help="Show only specific iterations (1-indexed, e.g. --iters 1 3 5)")
+    parser.add_argument(
+        "--include-incomplete",
+        action="store_true",
+        help="Include runs missing final_best_candidate.json (possibly in-progress/incomplete)",
+    )
     args = parser.parse_args()
 
     iter_filter = args.iters
@@ -370,16 +406,36 @@ def main():
         seeds = None
         print("Plotting latest run per task (any seed)")
 
-    n_tasks = len(TASKS)
+    # Filter to tasks that have data
+    available_tasks = []
+    for task in TASKS:
+        runs = _find_task_runs(task, args.mode, include_incomplete=args.include_incomplete)
+        if args.seeds:
+            runs = [r for r in runs if _extract_seed(r.name) in args.seeds]
+        elif args.seed:
+            runs = [r for r in runs if _extract_seed(r.name) == args.seed]
+        if runs:
+            available_tasks.append(task)
+
+    if not available_tasks:
+        print("No runs found. Check run directories and try --include-incomplete if runs are still in progress.")
+        return
+
+    n_tasks = len(available_tasks)
     fig, axes = plt.subplots(n_tasks, 2, figsize=(14, 3.2 * n_tasks))
     if n_tasks == 1:
         axes = axes[np.newaxis, :]
 
-    for i, task in enumerate(TASKS):
+    for i, task in enumerate(available_tasks):
         print(f"Processing {task}...")
         try:
             if plot_mode == "aggregate":
-                run_dirs = all_latest_runs(task, seeds, mode=args.mode)
+                run_dirs = all_latest_runs(
+                    task,
+                    seeds,
+                    mode=args.mode,
+                    include_incomplete=args.include_incomplete,
+                )
                 if run_dirs:
                     print(f"  Found {len(run_dirs)} runs")
                     plot_task_aggregated(axes[i, 0], axes[i, 1], run_dirs, task,
@@ -391,6 +447,7 @@ def main():
                     task,
                     seed=args.seed if plot_mode == "single" else None,
                     mode=args.mode,
+                    include_incomplete=args.include_incomplete,
                 )
                 print(f"  Latest run: {run_dir.name}")
                 plot_task(axes[i, 0], axes[i, 1], run_dir, task,

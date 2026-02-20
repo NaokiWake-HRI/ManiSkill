@@ -107,6 +107,7 @@ class RewardWrapperDynamic(gym.Wrapper):
         env,
         env_id: str,
         weights: Optional[Dict[str, float]] = None,
+        raise_on_custom_fn_error: bool = False,
     ):
         super().__init__(env)
         self.task_id = _resolve_task_id(env_id)
@@ -137,6 +138,10 @@ class RewardWrapperDynamic(gym.Wrapper):
         self._custom_code: Optional[str] = None
         self._custom_fn_error_count = 0
         self._fallback_active = False
+        # When True, raise on custom function error instead of falling back
+        # to YAML reward. Use True for Eureka mode so the outer loop can
+        # detect the failure and retry with LLM-fixed code.
+        self._raise_on_custom_fn_error = raise_on_custom_fn_error
 
     def _component_weight_sum(self) -> float:
         """Sum of non-success weights (used for normalization)."""
@@ -188,11 +193,26 @@ class RewardWrapperDynamic(gym.Wrapper):
                 print(f"[RewardWrapperDynamic] Error in custom function: {e}")
                 traceback.print_exc()
 
+            if self._raise_on_custom_fn_error:
+                raise RuntimeError(
+                    f"Custom reward function failed (error #{self._custom_fn_error_count}): {e}"
+                ) from e
+
             if self._custom_fn_error_count == 1:
                 self._fallback_active = True
                 print("[RewardWrapperDynamic] Activating YAML fallback")
 
             return self._compute_fn(info)
+
+    @property
+    def is_fallback_active(self) -> bool:
+        """True if custom function failed and YAML fallback is in use."""
+        return self._fallback_active
+
+    @property
+    def custom_fn_error_count(self) -> int:
+        """Number of runtime errors encountered in the custom function."""
+        return self._custom_fn_error_count
 
     def get_weights(self) -> Dict[str, float]:
         return dict(self.weights)
@@ -272,7 +292,7 @@ class RewardWrapperDynamic(gym.Wrapper):
             return None, error_msg
 
         # Search for function (common names)
-        for fn_name in ["compute_reward", "reward_fn", "reward", "custom_reward"]:
+        for fn_name in ["compute_reward", "reward_fn", "reward", "custom_reward", "custom_term"]:
             if fn_name in namespace and callable(namespace[fn_name]):
                 return namespace[fn_name], None
 

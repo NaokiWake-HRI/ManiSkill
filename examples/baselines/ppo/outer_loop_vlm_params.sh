@@ -8,6 +8,8 @@
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_vlm_params.sh
 
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
 seeds=(9351 4796 1788) #9351
 OUTER_ITERS=5
 WSEED=42
@@ -125,6 +127,7 @@ do
       ${GAMMA_ARG} \
       ${GAE_LAMBDA_ARG} \
       --vlm_reward_plot \
+      --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
       --track \
       --exp-name="ppo-outer-loop-${ENV}-${seed}"
     echo ""

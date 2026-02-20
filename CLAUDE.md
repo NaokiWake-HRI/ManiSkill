@@ -1,9 +1,9 @@
 # ManiSkill Project
 
 ## Python Environment
-- Use the project-local venv: `/home/nwake/codes/ManiSkill/.venv/bin/python`
-- Activate with: `source /home/nwake/codes/ManiSkill/.venv/bin/activate`
-- Bash でスクリプト実行時は常に `.venv` の python を使うこと: `/home/nwake/codes/ManiSkill/.venv/bin/python <script>`
+- Use the project-local venv: `/home/robotics/naoki_workspace/codes/ManiSkill/.venv/bin/python`
+- Activate with: `source /home/robotics/naoki_workspace/codes/ManiSkill/.venv/bin/activate`
+- Bash でスクリプト実行時は常に `.venv` の python を使うこと: `/home/robotics/naoki_workspace/codes/ManiSkill/.venv/bin/python <script>`
 
 ## Outer-Loop (VLM/LLM-guided Reward Weight Optimization)
 

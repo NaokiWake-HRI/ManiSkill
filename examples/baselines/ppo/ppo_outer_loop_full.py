@@ -38,6 +38,8 @@ import inspect
 import io
 import json
 import os
+import pickle
+import subprocess
 import random as py_random
 import sys
 import time
@@ -159,6 +161,10 @@ class Args:
     """number of reward function candidates to generate per iteration (K in Eureka paper)"""
     enable_reward_reflection: bool = True
     """enable Reward Reflection: analyze learning curves and provide feedback to LLM"""
+
+    # Parallel K-candidate training
+    gpus: Optional[str] = None
+    """comma-separated GPU IDs for parallel K-candidate training (e.g., '0,1'). If None, sequential on current device."""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -391,6 +397,320 @@ def append_html_to_file(file_path: Path, html_snippet: str):
 
 
 # ============================================================================
+# Parallel K-candidate worker mode
+# ============================================================================
+
+def _run_worker_mode(task_path: str):
+    """Internal subprocess worker: train a single candidate on the assigned GPU.
+
+    Called via: python ppo_outer_loop_full.py _worker <task_path>
+    CUDA_VISIBLE_DEVICES is set by the parent process before spawning.
+    """
+    with open(task_path, "rb") as f:
+        task = pickle.load(f)
+
+    args = task["args"]
+    cand = task["cand"]
+    outer_iter = task["outer_iter"]
+    cand_run_dir = task["run_dir"]
+    global_step_offset = task["global_step_offset"]
+    result_path = task["result_path"]
+
+    device = torch.device("cuda")
+
+    # Create per-candidate tensorboard logger
+    writer = SummaryWriter(f"runs/{cand_run_dir}")
+    worker_logger = Logger(log_wandb=False, tensorboard=writer)
+
+    try:
+        result = run_ppo_training(
+            args=args,
+            weights=None,
+            outer_iter=outer_iter,
+            run_dir=cand_run_dir,
+            logger=worker_logger,
+            device=device,
+            global_step_offset=global_step_offset,
+            custom_code=cand["code"],
+        )
+
+        # Convert step_rewards tensors to serializable reward_stats
+        step_rewards = result.get("step_rewards", [])
+        if step_rewards:
+            stacked = torch.stack(step_rewards).cpu()
+            reward_stats = {
+                "mean": stacked.mean().item(),
+                "std": stacked.std().item(),
+                "min": stacked.min().item(),
+                "max": stacked.max().item(),
+            }
+        else:
+            reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+
+        output = {
+            "success": True,
+            "candidate_id": cand["id"],
+            "code": cand["code"],
+            "rationale": cand["rationale"],
+            "is_elite": cand.get("is_elite", False),
+            "eval_metrics": result["eval_metrics"],
+            "learning_curve": result["learning_curve"],
+            "reward_stats": reward_stats,
+            "eval_video_dir": result["eval_video_dir"],
+            "final_global_step": result["final_global_step"],
+        }
+
+    except Exception as e:
+        error_tb = traceback.format_exc()
+        print(f"[Worker] Candidate {cand['id']+1} FAILED: {type(e).__name__}: {e}")
+        print(error_tb)
+        output = {
+            "success": False,
+            "candidate_id": cand["id"],
+            "code": cand["code"],
+            "rationale": cand["rationale"],
+            "is_elite": cand.get("is_elite", False),
+            "error": f"{type(e).__name__}: {e}",
+            "traceback": error_tb,
+        }
+
+    worker_logger.close()
+
+    with open(result_path, "w") as f:
+        json.dump(output, f, indent=2, default=str)
+    print(f"[Worker] Result written to {result_path}")
+
+
+def _train_candidates_parallel(
+    args: "Args",
+    candidates: List[Dict],
+    outer_iter: int,
+    run_dir: str,
+    global_step_offset: int,
+    gpu_list: List[int],
+    llm: Any,
+    training_summary: Dict,
+    save_llm_debug_html: Any,
+    debug_dir: Path,
+) -> List[Dict[str, Any]]:
+    """Train K candidates in parallel across GPUs using subprocesses.
+
+    Candidates are batched by len(gpu_list). Failed candidates are retried
+    sequentially with LLM error-fixing (same as sequential mode).
+
+    Returns list of candidate_results (same format as sequential mode).
+    """
+    MAX_RUNTIME_RETRIES = 2
+    candidate_results = []
+    failed_candidates = []  # (cand, error, traceback)
+
+    # --- Phase 1: Parallel training ---
+    for batch_start in range(0, len(candidates), len(gpu_list)):
+        batch = candidates[batch_start:batch_start + len(gpu_list)]
+        procs = []
+
+        print(f"\n  [Parallel] Batch: candidates {[c['id']+1 for c in batch]} "
+              f"on GPUs {gpu_list[:len(batch)]}")
+
+        for i, cand in enumerate(batch):
+            gpu_id = gpu_list[i]
+            cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+
+            Path(f"runs/{cand_run_dir}").mkdir(parents=True, exist_ok=True)
+
+            task_path = f"runs/{run_dir}/_cand_{cand['id']}_task.pkl"
+            result_path = f"runs/{run_dir}/_cand_{cand['id']}_result.json"
+
+            task = {
+                "args": args,
+                "cand": cand,
+                "outer_iter": outer_iter,
+                "run_dir": cand_run_dir,
+                "global_step_offset": global_step_offset,
+                "result_path": result_path,
+            }
+            with open(task_path, "wb") as f:
+                pickle.dump(task, f)
+
+            env = os.environ.copy()
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+            log_path = f"runs/{run_dir}/_cand_{cand['id']}_stdout.log"
+            log_file = open(log_path, "w")
+
+            cmd = [sys.executable, "-u", os.path.abspath(__file__), "_worker", task_path]
+            proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+            procs.append((proc, cand, result_path, log_file, log_path))
+            print(f"    Candidate {cand['id']+1} -> GPU {gpu_id} (PID: {proc.pid})")
+
+        # Wait for all processes in this batch
+        for proc, cand, result_path, log_file, log_path in procs:
+            proc.wait()
+            log_file.close()
+
+            if proc.returncode == 0 and Path(result_path).exists():
+                with open(result_path) as f:
+                    result = json.load(f)
+
+                if result.get("success", False):
+                    fitness = result["eval_metrics"].get("success_at_end", 0.0)
+                    candidate_results.append({
+                        "candidate_id": result["candidate_id"],
+                        "code": result["code"],
+                        "rationale": result["rationale"],
+                        "is_elite": result["is_elite"],
+                        "fitness": fitness,
+                        "fitness_success_at_end": fitness,
+                        "fitness_success_once": result["eval_metrics"].get("success_once", 0.0),
+                        "fitness_return": result["eval_metrics"].get("return", float("-inf")),
+                        "eval_metrics": result["eval_metrics"],
+                        "learning_curve": result["learning_curve"],
+                        "reward_statistics": result["reward_stats"],
+                        "eval_video_dir": result["eval_video_dir"],
+                    })
+                    print(f"    Candidate {cand['id']+1} OK (fitness={fitness:.4f})")
+                else:
+                    # Runtime error captured by worker
+                    print(f"    Candidate {cand['id']+1} FAILED (runtime error)")
+                    failed_candidates.append((
+                        cand,
+                        result.get("error", "Unknown error"),
+                        result.get("traceback", ""),
+                    ))
+            else:
+                # Process-level failure
+                print(f"    Candidate {cand['id']+1} FAILED (exit code: {proc.returncode})")
+                print(f"    See log: {log_path}")
+                failed_candidates.append((cand, f"Process exited with code {proc.returncode}", ""))
+
+    # --- Phase 2: Sequential LLM retry for failed candidates ---
+    if failed_candidates and llm is not None:
+        print(f"\n  [Retry] {len(failed_candidates)} failed candidate(s), attempting LLM fix...")
+
+        for cand, error_msg, error_tb in failed_candidates:
+            current_code = cand["code"]
+            current_rationale = cand["rationale"]
+
+            for attempt in range(MAX_RUNTIME_RETRIES):
+                print(f"\n  [Retry {attempt+1}/{MAX_RUNTIME_RETRIES}] Candidate {cand['id']+1}")
+
+                fix_summary = {
+                    **training_summary,
+                    "previous_code_error": {
+                        "code": current_code,
+                        "error": f"{error_msg}\n\n{error_tb}",
+                        "instruction": (
+                            "前回のコードでランタイムエラーが発生しました。\n"
+                            "エラーを修正した新しいコードを生成してください。\n\n"
+                            "よくあるランタイムエラー:\n"
+                            "1. base.device が存在しない → base.obj.pose.p.device を使う\n"
+                            "2. テンソルのshape不一致（(B,3)に対してスカラー操作等）\n"
+                            "3. 存在しない属性へのアクセス（State Access Docsを参照）\n"
+                            "4. torch演算のdevice不一致（CPU/CUDA混在）\n"
+                            "5. info dictのキーが存在しない\n"
+                            "6. hasattr/setattr on batched env objects\n"
+                            "7. 型アノテーションで __import__ を使用 → 'torch.Tensor' を使う\n\n"
+                            "修正後のコードをfunction_code形式で返してください。"
+                        )
+                    }
+                }
+
+                try:
+                    suggestions = llm.suggest_parameters(fix_summary)
+                except (ValueError, SyntaxError) as e:
+                    print(f"    LLM suggest_parameters failed: {e}")
+                    continue
+
+                # Save retry debug HTML
+                if save_llm_debug_html is not None:
+                    query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                    llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                    llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                    save_llm_debug_html(
+                        iteration=outer_iter,
+                        prompt=llm_prompt,
+                        response_text=llm_response,
+                        suggestions=suggestions,
+                        summary_for_llm=fix_summary,
+                        save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand['id']}_parallel_retry{attempt}_llm.html",
+                    )
+
+                if suggestions and suggestions.get("type") == "function_code":
+                    new_code = suggestions["custom_code"]
+                    test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(new_code)
+                    if test_fn is not None:
+                        current_code = new_code
+                        current_rationale = suggestions.get("rationale", f"LLM fix (retry {attempt+1})")
+                        print(f"    LLM fix compiled, re-training on GPU {gpu_list[0]}...")
+
+                        # Re-train via subprocess on first GPU
+                        retry_cand = {**cand, "code": current_code, "rationale": current_rationale}
+                        retry_run_dir = f"{run_dir}/cand_{cand['id']}_retry{attempt+1}"
+                        Path(f"runs/{retry_run_dir}").mkdir(parents=True, exist_ok=True)
+
+                        retry_task_path = f"runs/{run_dir}/_cand_{cand['id']}_retry{attempt+1}_task.pkl"
+                        retry_result_path = f"runs/{run_dir}/_cand_{cand['id']}_retry{attempt+1}_result.json"
+                        retry_task = {
+                            "args": args,
+                            "cand": retry_cand,
+                            "outer_iter": outer_iter,
+                            "run_dir": retry_run_dir,
+                            "global_step_offset": global_step_offset,
+                            "result_path": retry_result_path,
+                        }
+                        with open(retry_task_path, "wb") as f:
+                            pickle.dump(retry_task, f)
+
+                        retry_env = os.environ.copy()
+                        retry_env["CUDA_VISIBLE_DEVICES"] = str(gpu_list[0])
+                        retry_log_path = f"runs/{run_dir}/_cand_{cand['id']}_retry{attempt+1}_stdout.log"
+                        retry_log_file = open(retry_log_path, "w")
+
+                        retry_cmd = [sys.executable, "-u", os.path.abspath(__file__), "_worker", retry_task_path]
+                        retry_proc = subprocess.Popen(retry_cmd, env=retry_env, stdout=retry_log_file, stderr=subprocess.STDOUT)
+                        retry_proc.wait()
+                        retry_log_file.close()
+
+                        if retry_proc.returncode == 0 and Path(retry_result_path).exists():
+                            with open(retry_result_path) as f:
+                                retry_result = json.load(f)
+
+                            if retry_result.get("success", False):
+                                fitness = retry_result["eval_metrics"].get("success_at_end", 0.0)
+                                candidate_results.append({
+                                    "candidate_id": retry_result["candidate_id"],
+                                    "code": retry_result["code"],
+                                    "rationale": retry_result["rationale"],
+                                    "is_elite": retry_result["is_elite"],
+                                    "fitness": fitness,
+                                    "fitness_success_at_end": fitness,
+                                    "fitness_success_once": retry_result["eval_metrics"].get("success_once", 0.0),
+                                    "fitness_return": retry_result["eval_metrics"].get("return", float("-inf")),
+                                    "eval_metrics": retry_result["eval_metrics"],
+                                    "learning_curve": retry_result["learning_curve"],
+                                    "reward_statistics": retry_result["reward_stats"],
+                                    "eval_video_dir": retry_result["eval_video_dir"],
+                                })
+                                print(f"    Retry OK (fitness={fitness:.4f})")
+                                break  # Success, stop retrying this candidate
+                            else:
+                                error_msg = retry_result.get("error", "Unknown error")
+                                error_tb = retry_result.get("traceback", "")
+                                print(f"    Retry failed: {error_msg[:200]}")
+                        else:
+                            print(f"    Retry process failed (exit code: {retry_proc.returncode})")
+                            error_msg = f"Retry process exited with code {retry_proc.returncode}"
+                            error_tb = ""
+                    else:
+                        print(f"    LLM fix failed compilation: {compile_error[:200]}")
+                else:
+                    sug_type = suggestions.get("type", "N/A") if suggestions else "N/A"
+                    print(f"    LLM returned wrong type: {sug_type}")
+
+    return candidate_results
+
+
+# ============================================================================
 # Random weight generation
 # ============================================================================
 
@@ -486,8 +806,11 @@ def run_ppo_training(
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
 
     # RewardWrapperDynamic with fixed weights (supports custom functions)
-    reward_wrapper_train = RewardWrapperDynamic(envs, env_id=args.env_id, weights=weights)
-    reward_wrapper_eval = RewardWrapperDynamic(eval_envs, env_id=args.env_id, weights=weights)
+    # In Eureka mode (custom_code provided), raise on runtime errors so the
+    # outer loop's retry mechanism can detect and fix broken reward functions.
+    raise_on_err = custom_code is not None
+    reward_wrapper_train = RewardWrapperDynamic(envs, env_id=args.env_id, weights=weights, raise_on_custom_fn_error=raise_on_err)
+    reward_wrapper_eval = RewardWrapperDynamic(eval_envs, env_id=args.env_id, weights=weights, raise_on_custom_fn_error=raise_on_err)
     envs = reward_wrapper_train
     eval_envs = reward_wrapper_eval
 
@@ -786,6 +1109,13 @@ def run_ppo_training(
 # ============================================================================
 
 if __name__ == "__main__":
+    # Internal worker mode for parallel K-candidate training.
+    # Invoked as: python ppo_outer_loop_full.py _worker <task_pickle_path>
+    # CUDA_VISIBLE_DEVICES is set by the parent process.
+    if len(sys.argv) >= 3 and sys.argv[1] == "_worker":
+        _run_worker_mode(sys.argv[2])
+        sys.exit(0)
+
     args = tyro.cli(Args)
 
     if args.exp_name is None:
@@ -896,8 +1226,9 @@ if __name__ == "__main__":
                 model=args.llm_model,
                 enable_function_code=args.enable_function_code,
                 max_param_change=2.0,
+                temperature=1.0,  # High temperature for diverse reward function candidates
             )
-            print(f"[VLM/LLM] Initialized LLM: {args.llm_model}")
+            print(f"[VLM/LLM] Initialized LLM: {args.llm_model} (temperature=1.0)")
         else:
             print("[warn] OPENAI_API_KEY not set, skipping VLM/LLM")
     else:
@@ -1094,6 +1425,14 @@ Available state attributes (base = env.unwrapped):
 info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool
 
+Success condition (from environment):
+- Cube XY distance to goal < 0.1m (goal_radius=0.1) AND cube Z < 0.025m (on table).
+- Key constants: cube_half_size=0.02m, goal_radius=0.1m.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances (not just XY) for reach/approach components.
+
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
     # Return: torch.Tensor, shape (batch_size,)
@@ -1110,6 +1449,15 @@ info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool
 - info["is_grasped"]: torch.Tensor (batch_size,) bool
 - info["is_obj_placed"]: torch.Tensor (batch_size,) bool
+
+Success condition (from environment):
+- Cube within 0.025m (3D Euclidean) of goal AND robot is static (joint velocities <= 0.2 rad/s).
+- Key constants: cube_half_size=0.02m, goal_thresh=0.025m.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reach/approach components.
+- Use info["is_grasped"] to gate place rewards (only reward placing when grasped).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -1128,6 +1476,14 @@ info dict keys:
 - info["handle_link_pos"]: torch.Tensor (batch_size, 3) handle center position (computed in evaluate())
 - info["open_enough"]: torch.Tensor (batch_size,) bool (door opened beyond threshold)
 
+Success condition (from environment):
+- Door joint opened >= 75% of max range (min_open_frac=0.75) AND door is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reaching the handle.
+- Reward door opening progress (joint position increase) after reaching the handle.
+
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
     # Return: torch.Tensor, shape (batch_size,)
@@ -1145,6 +1501,14 @@ info dict keys:
 - info["handle_link_pos"]: torch.Tensor (batch_size, 3) handle center position (computed in evaluate())
 - info["open_enough"]: torch.Tensor (batch_size,) bool (drawer opened beyond threshold)
 
+Success condition (from environment):
+- Drawer joint opened >= 75% of max range (min_open_frac=0.75) AND drawer is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reaching the handle.
+- Reward drawer opening progress (joint position increase) after reaching the handle.
+
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
     # Return: torch.Tensor, shape (batch_size,)
@@ -1161,6 +1525,15 @@ info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool (peg fully inserted)
 - info["peg_head_pos_at_hole"]: torch.Tensor (batch_size, 3) computed peg head position
 
+Success condition (from environment):
+- Peg head inserted >= 15mm into hole (X-axis in hole frame) AND peg head Y,Z within hole radius.
+- Key constants: peg radius 0.015-0.025m (randomized), hole clearance 0.003m, peg half-length 0.085-0.125m.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reach and alignment components.
+- Multi-stage: reach peg -> grasp -> align with hole -> insert.
+
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
     # Return: torch.Tensor, shape (batch_size,)
@@ -1176,6 +1549,15 @@ Available state attributes (base = env.unwrapped):
 
 info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool
+
+Success condition (from environment):
+- T-block overlaps >= 90% of goal T region area (2D intersection). Requires BOTH position AND rotation alignment.
+- intersection_thresh = 0.90.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reach/approach components.
+- Reward both position proximity and rotation alignment toward goal.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -1195,6 +1577,15 @@ info dict keys:
 - info["reached_goal"]: torch.Tensor (batch_size,) bool (dist < 0.35m)
 - info["is_fallen"]: torch.Tensor (batch_size,) bool
 
+Success condition (from environment):
+- Robot XY distance to goal < 0.35m AND robot has NOT fallen.
+- Goal is typically 2.0-3.0m away from the start position.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Penalize falling (info["is_fallen"]).
+- Reward progress toward goal (reducing XY distance).
+
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
     # Return: torch.Tensor, shape (batch_size,)
@@ -1212,6 +1603,15 @@ info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool (apple in bowl AND hand outside)
 - info["is_grasped"]: torch.Tensor (batch_size,) bool
 - info["hand_outside_bowl"]: torch.Tensor (batch_size,) bool (hand z > bowl z + 0.125m)
+
+Success condition (from environment):
+- Apple within 0.05m (3D Euclidean) of bowl position AND right hand Z > bowl Z + 0.125m (hand retracted above bowl).
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- ALWAYS use full 3D Euclidean distances for reach/approach components.
+- Use info["is_grasped"] to gate place rewards.
+- After placing, reward hand retraction (moving hand above bowl).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -1298,7 +1698,36 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     # Seed fixing for Iteration 0, first attempt only (reproducibility)
                     llm_seed = args.weight_seed + k if outer_iter == 0 and compile_attempt == 0 else None
 
-                    suggestions = llm.suggest_parameters(gen_summary, seed=llm_seed)
+                    try:
+                        suggestions = llm.suggest_parameters(gen_summary, seed=llm_seed)
+                    except (ValueError, SyntaxError) as e:
+                        # suggest_parameters internally validates/compiles code and may raise
+                        # on syntax errors. Catch here so the retry loop can handle it.
+                        print(f"    ✗ suggest_parameters failed (attempt {compile_attempt+1}): {e}")
+                        # Save debug HTML even on failure
+                        query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                        llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                        llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                        suffix = f"_attempt{compile_attempt}" if compile_attempt > 0 else ""
+                        save_llm_debug_html(
+                            iteration=outer_iter,
+                            prompt=llm_prompt,
+                            response_text=llm_response,
+                            suggestions=None,
+                            summary_for_llm=gen_summary,
+                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}{suffix}_llm.html",
+                        )
+                        error_context = {
+                            "code": "N/A",
+                            "error": str(e),
+                            "instruction": (
+                                "前回のコードでエラーが発生しました。\n"
+                                "エラーを修正した新しいコードを生成してください。\n"
+                                "Pythonとして正しい構文の完全な関数を返してください。\n\n"
+                                f"エラー内容: {e}"
+                            )
+                        }
+                        continue
 
                     # Save LLM debug HTML (unique per attempt)
                     query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
@@ -1384,151 +1813,177 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                 print(f"[INFO] LLM disabled, proceeding with {len(candidates)} elite candidate(s)")
 
         # ========== STEP 2: Train and evaluate each candidate ==========
-        candidate_results = []
-        MAX_RUNTIME_RETRIES = 2
+        gpu_list = [int(g) for g in args.gpus.split(",")] if args.gpus else []
 
-        for cand in candidates:
-            print(f"\n{'='*50}")
-            print(f"[Candidate {cand['id']+1}] Training PPO")
-            print(f"{'='*50}")
+        if len(gpu_list) > 1:
+            # --- Parallel K-candidate training across GPUs ---
+            print(f"\n[Parallel Mode] Training {len(candidates)} candidates across {len(gpu_list)} GPUs: {gpu_list}")
+            candidate_results = _train_candidates_parallel(
+                args=args,
+                candidates=candidates,
+                outer_iter=outer_iter,
+                run_dir=run_dir,
+                global_step_offset=global_step_offset,
+                gpu_list=gpu_list,
+                llm=llm,
+                training_summary=training_summary,
+                save_llm_debug_html=save_llm_debug_html,
+                debug_dir=debug_dir,
+            )
+            # Advance global_step_offset by one training run worth of steps
+            global_step_offset += args.total_timesteps_per_iter
+        else:
+            # --- Sequential K-candidate training (original code path) ---
+            candidate_results = []
+            MAX_RUNTIME_RETRIES = 2
 
-            current_code = cand["code"]
-            current_rationale = cand["rationale"]
-            training_succeeded = False
+            for cand in candidates:
+                print(f"\n{'='*50}")
+                print(f"[Candidate {cand['id']+1}] Training PPO")
+                print(f"{'='*50}")
 
-            for attempt in range(MAX_RUNTIME_RETRIES + 1):
-                if attempt > 0:
-                    print(f"\n  [Runtime Retry {attempt}/{MAX_RUNTIME_RETRIES}] Retrying with LLM-fixed code")
+                current_code = cand["code"]
+                current_rationale = cand["rationale"]
+                training_succeeded = False
 
-                print(f"Rationale: {current_rationale}")
-
-                try:
-                    cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+                for attempt in range(MAX_RUNTIME_RETRIES + 1):
                     if attempt > 0:
-                        cand_run_dir = f"{run_dir}/cand_{cand['id']}_retry{attempt}"
+                        print(f"\n  [Runtime Retry {attempt}/{MAX_RUNTIME_RETRIES}] Retrying with LLM-fixed code")
 
-                    result = run_ppo_training(
-                        args=args,
-                        weights=None,
-                        outer_iter=outer_iter,
-                        run_dir=cand_run_dir,
-                        logger=logger,
-                        device=device,
-                        global_step_offset=global_step_offset,
-                        custom_code=current_code,
-                    )
+                    print(f"Rationale: {current_rationale}")
 
-                    # Training succeeded
-                    global_step_offset = result["final_global_step"]
+                    try:
+                        cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+                        if attempt > 0:
+                            cand_run_dir = f"{run_dir}/cand_{cand['id']}_retry{attempt}"
 
-                    eval_metrics = result["eval_metrics"]
-                    fitness = eval_metrics.get("success_at_end", 0.0)
+                        result = run_ppo_training(
+                            args=args,
+                            weights=None,
+                            outer_iter=outer_iter,
+                            run_dir=cand_run_dir,
+                            logger=logger,
+                            device=device,
+                            global_step_offset=global_step_offset,
+                            custom_code=current_code,
+                        )
 
-                    step_rewards = result.get("step_rewards", [])
-                    if step_rewards:
-                        step_rewards_tensor = torch.stack(step_rewards)
-                        reward_stats = {
-                            "mean": step_rewards_tensor.mean().item(),
-                            "std": step_rewards_tensor.std().item(),
-                            "min": step_rewards_tensor.min().item(),
-                            "max": step_rewards_tensor.max().item(),
-                        }
-                    else:
-                        reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+                        # Training succeeded
+                        global_step_offset = result["final_global_step"]
 
-                    candidate_results.append({
-                        "candidate_id": cand["id"],
-                        "code": current_code,
-                        "rationale": current_rationale,
-                        "is_elite": cand.get("is_elite", False),
-                        "fitness": fitness,
-                        "eval_metrics": eval_metrics,
-                        "learning_curve": result["learning_curve"],
-                        "reward_statistics": reward_stats,
-                        "eval_video_dir": result["eval_video_dir"],
-                    })
+                        eval_metrics = result["eval_metrics"]
+                        fitness = eval_metrics.get("success_at_end", 0.0)
+                        fitness_success_once = eval_metrics.get("success_once", 0.0)
+                        fitness_return = eval_metrics.get("return", float("-inf"))
 
-                    print(f"\n[Candidate {cand['id']+1}] Results:")
-                    print(f"  Fitness (success_at_end): {fitness:.4f}")
-                    print(f"  Success once: {eval_metrics.get('success_once', 0.0):.4f}")
-                    print(f"  Avg return: {eval_metrics.get('return', 0.0):.4f}")
-                    print(f"  Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
-
-                    training_succeeded = True
-                    break
-
-                except Exception as e:
-                    error_tb = traceback.format_exc()
-                    print(f"\n[Candidate {cand['id']+1}] Runtime error (attempt {attempt+1}/{MAX_RUNTIME_RETRIES+1}):")
-                    print(f"  {type(e).__name__}: {e}")
-                    print(f"  Traceback (last 15 lines):")
-                    for line in error_tb.strip().split('\n')[-15:]:
-                        print(f"    {line}")
-
-                    # Free GPU resources from failed training
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-
-                    if attempt < MAX_RUNTIME_RETRIES and llm is not None:
-                        print(f"  Requesting LLM to fix the runtime error...")
-                        fix_summary = {
-                            **training_summary,
-                            "previous_code_error": {
-                                "code": current_code,
-                                "error": f"{type(e).__name__}: {e}\n\n{error_tb}",
-                                "instruction": (
-                                    "前回のコードでランタイムエラーが発生しました。\n"
-                                    "エラーを修正した新しいコードを生成してください。\n\n"
-                                    "よくあるランタイムエラー:\n"
-                                    "1. base.device が存在しない → base.obj.pose.p.device を使う\n"
-                                    "2. テンソルのshape不一致（(B,3)に対してスカラー操作等）\n"
-                                    "3. 存在しない属性へのアクセス（State Access Docsを参照）\n"
-                                    "4. torch演算のdevice不一致（CPU/CUDA混在）\n"
-                                    "5. info dictのキーが存在しない\n"
-                                    "6. hasattr/setattr on batched env objects\n"
-                                    "7. 型アノテーションで __import__ を使用 → 'torch.Tensor' を使う\n\n"
-                                    "修正後のコードをfunction_code形式で返してください。"
-                                )
+                        step_rewards = result.get("step_rewards", [])
+                        if step_rewards:
+                            step_rewards_tensor = torch.stack(step_rewards)
+                            reward_stats = {
+                                "mean": step_rewards_tensor.mean().item(),
+                                "std": step_rewards_tensor.std().item(),
+                                "min": step_rewards_tensor.min().item(),
+                                "max": step_rewards_tensor.max().item(),
                             }
-                        }
-                        suggestions = llm.suggest_parameters(fix_summary)
-
-                        # Save retry debug HTML
-                        if save_llm_debug_html is not None:
-                            query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                            llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
-                            llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
-                            save_llm_debug_html(
-                                iteration=outer_iter,
-                                prompt=llm_prompt,
-                                response_text=llm_response,
-                                suggestions=suggestions,
-                                summary_for_llm=fix_summary,
-                                save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand['id']}_runtime_retry{attempt}_llm.html",
-                            )
-
-                        if suggestions and suggestions.get("type") == "function_code":
-                            new_code = suggestions["custom_code"]
-                            test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(new_code)
-                            if test_fn is not None:
-                                current_code = new_code
-                                current_rationale = suggestions.get("rationale", f"Runtime error fix (attempt {attempt+1})")
-                                print(f"  ✓ LLM generated fixed code, retrying training...")
-                                continue
-                            else:
-                                print(f"  ✗ LLM fix failed compilation: {compile_error}")
                         else:
-                            sug_type = suggestions.get("type", "N/A") if suggestions else "N/A"
-                            print(f"  ✗ LLM returned wrong type: {sug_type}")
+                            reward_stats = {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
-                    # No more retries or LLM fix failed
-                    print(f"  ✗ Candidate {cand['id']+1} skipped (runtime error)")
-                    break
+                        candidate_results.append({
+                            "candidate_id": cand["id"],
+                            "code": current_code,
+                            "rationale": current_rationale,
+                            "is_elite": cand.get("is_elite", False),
+                            "fitness": fitness,
+                            "fitness_success_at_end": fitness,
+                            "fitness_success_once": fitness_success_once,
+                            "fitness_return": fitness_return,
+                            "eval_metrics": eval_metrics,
+                            "learning_curve": result["learning_curve"],
+                            "reward_statistics": reward_stats,
+                            "eval_video_dir": result["eval_video_dir"],
+                        })
 
-            if not training_succeeded:
-                print(f"[Candidate {cand['id']+1}] FAILED after {attempt+1} attempt(s)")
+                        print(f"\n[Candidate {cand['id']+1}] Results:")
+                        print(f"  Fitness (success_at_end): {fitness:.4f}")
+                        print(f"  Success once: {eval_metrics.get('success_once', 0.0):.4f}")
+                        print(f"  Avg return: {eval_metrics.get('return', 0.0):.4f}")
+                        print(f"  Reward stats: mean={reward_stats['mean']:.4f}, std={reward_stats['std']:.4f}")
+
+                        training_succeeded = True
+                        break
+
+                    except Exception as e:
+                        error_tb = traceback.format_exc()
+                        print(f"\n[Candidate {cand['id']+1}] Runtime error (attempt {attempt+1}/{MAX_RUNTIME_RETRIES+1}):")
+                        print(f"  {type(e).__name__}: {e}")
+                        print(f"  Traceback (last 15 lines):")
+                        for line in error_tb.strip().split('\n')[-15:]:
+                            print(f"    {line}")
+
+                        # Free GPU resources from failed training
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        if attempt < MAX_RUNTIME_RETRIES and llm is not None:
+                            print(f"  Requesting LLM to fix the runtime error...")
+                            fix_summary = {
+                                **training_summary,
+                                "previous_code_error": {
+                                    "code": current_code,
+                                    "error": f"{type(e).__name__}: {e}\n\n{error_tb}",
+                                    "instruction": (
+                                        "前回のコードでランタイムエラーが発生しました。\n"
+                                        "エラーを修正した新しいコードを生成してください。\n\n"
+                                        "よくあるランタイムエラー:\n"
+                                        "1. base.device が存在しない → base.obj.pose.p.device を使う\n"
+                                        "2. テンソルのshape不一致（(B,3)に対してスカラー操作等）\n"
+                                        "3. 存在しない属性へのアクセス（State Access Docsを参照）\n"
+                                        "4. torch演算のdevice不一致（CPU/CUDA混在）\n"
+                                        "5. info dictのキーが存在しない\n"
+                                        "6. hasattr/setattr on batched env objects\n"
+                                        "7. 型アノテーションで __import__ を使用 → 'torch.Tensor' を使う\n\n"
+                                        "修正後のコードをfunction_code形式で返してください。"
+                                    )
+                                }
+                            }
+                            suggestions = llm.suggest_parameters(fix_summary)
+
+                            # Save retry debug HTML
+                            if save_llm_debug_html is not None:
+                                query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                                llm_prompt = query_info.get("prompt", "(no prompt)") if query_info else "(no query info)"
+                                llm_response = query_info.get("response_text", "(no response)") if query_info else "(no query info)"
+                                save_llm_debug_html(
+                                    iteration=outer_iter,
+                                    prompt=llm_prompt,
+                                    response_text=llm_response,
+                                    suggestions=suggestions,
+                                    summary_for_llm=fix_summary,
+                                    save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand['id']}_runtime_retry{attempt}_llm.html",
+                                )
+
+                            if suggestions and suggestions.get("type") == "function_code":
+                                new_code = suggestions["custom_code"]
+                                test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(new_code)
+                                if test_fn is not None:
+                                    current_code = new_code
+                                    current_rationale = suggestions.get("rationale", f"Runtime error fix (attempt {attempt+1})")
+                                    print(f"  ✓ LLM generated fixed code, retrying training...")
+                                    continue
+                                else:
+                                    print(f"  ✗ LLM fix failed compilation: {compile_error}")
+                            else:
+                                sug_type = suggestions.get("type", "N/A") if suggestions else "N/A"
+                                print(f"  ✗ LLM returned wrong type: {sug_type}")
+
+                        # No more retries or LLM fix failed
+                        print(f"  ✗ Candidate {cand['id']+1} skipped (runtime error)")
+                        break
+
+                if not training_succeeded:
+                    print(f"[Candidate {cand['id']+1}] FAILED after {attempt+1} attempt(s)")
 
         # ========== STEP 3: Select best candidate ==========
         if len(candidate_results) == 0:
@@ -1541,13 +1996,34 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                 "all_candidates": [],
                 "num_valid_candidates": 0,
             })
+            # Incremental save even on failure
+            history_path = f"runs/{run_dir}/outer_loop_history.json"
+            with open(history_path, "w") as f:
+                json.dump(outer_loop_history, f, indent=2, default=str)
             continue
 
-        best = max(candidate_results, key=lambda x: x["fitness"])
+        # Primary fitness is success_at_end (paper-style), but this often ties at 0.0
+        # in early experiments. Break ties with success_once, then avg return.
+        best = max(
+            candidate_results,
+            key=lambda x: (
+                x.get("fitness_success_at_end", x["fitness"]),
+                x.get("fitness_success_once", x["eval_metrics"].get("success_once", 0.0)),
+                x.get("fitness_return", x["eval_metrics"].get("return", float("-inf"))),
+            ),
+        )
+        fitness_end_values = [c.get("fitness_success_at_end", c["fitness"]) for c in candidate_results]
+        if len(fitness_end_values) > 1 and max(fitness_end_values) == min(fitness_end_values):
+            print("  [Selection] success_at_end tied across candidates; tie-break used: success_once -> return")
         if best.get("code") is not None:
             last_good_code = best["code"]
         print(f"\n{'='*60}")
-        print(f"[BEST] Candidate {best['candidate_id']+1} selected (fitness={best['fitness']:.4f})")
+        print(
+            f"[BEST] Candidate {best['candidate_id']+1} selected "
+            f"(fitness_end={best.get('fitness_success_at_end', best['fitness']):.4f}, "
+            f"success_once={best.get('fitness_success_once', best['eval_metrics'].get('success_once', 0.0)):.4f}, "
+            f"return={best.get('fitness_return', best['eval_metrics'].get('return', 0.0)):.2f})"
+        )
         print(f"{'='*60}")
 
         # Save candidate comparison summary
@@ -1555,7 +2031,15 @@ def compute_reward(info: dict, base) -> torch.Tensor:
 <table border="1" style="border-collapse: collapse; width: 100%;">
 <tr><th>Candidate</th><th>Fitness</th><th>Success@End</th><th>Success Once</th><th>Avg Return</th><th>Reward Stats</th><th>Rationale</th></tr>
 """
-        for cand in sorted(candidate_results, key=lambda x: x["fitness"], reverse=True):
+        for cand in sorted(
+            candidate_results,
+            key=lambda x: (
+                x.get("fitness_success_at_end", x["fitness"]),
+                x.get("fitness_success_once", x["eval_metrics"].get("success_once", 0.0)),
+                x.get("fitness_return", x["eval_metrics"].get("return", float("-inf"))),
+            ),
+            reverse=True,
+        ):
             cid = cand["candidate_id"] + 1
             fit = cand["fitness"]
             s_end = cand["eval_metrics"].get("success_at_end", 0.0)
@@ -1658,10 +2142,13 @@ def compute_reward(info: dict, base) -> torch.Tensor:
             iter_record["reflection_history"] = reflection_summary
         outer_loop_history.append(iter_record)
 
+        # Incremental save after each iteration (enables mid-run visualization)
+        history_path = f"runs/{run_dir}/outer_loop_history.json"
+        with open(history_path, "w") as f:
+            json.dump(outer_loop_history, f, indent=2, default=str)
+
     # --- Save final results ---
     history_path = f"runs/{run_dir}/outer_loop_history.json"
-    with open(history_path, "w") as f:
-        json.dump(outer_loop_history, f, indent=2, default=str)
     print(f"\nOuter loop history saved to {history_path}")
 
     # Save best candidate from final iteration

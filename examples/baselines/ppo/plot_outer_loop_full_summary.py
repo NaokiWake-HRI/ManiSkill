@@ -37,17 +37,26 @@ def rolling_mean(values, window=50):
     return out
 
 
+_tb_cache: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+
+
 def load_tb_scalar(tb_dir: str, tag: str):
-    """Load a scalar from tensorboard events."""
+    """Load a scalar from tensorboard events (cached per directory)."""
     try:
-        ea = EventAccumulator(tb_dir, size_guidance={"scalars": 0})
-        ea.Reload()
-        if tag not in ea.Tags().get("scalars", []):
+        if tb_dir not in _tb_cache:
+            ea = EventAccumulator(tb_dir, size_guidance={"scalars": 0})
+            ea.Reload()
+            _tb_cache[tb_dir] = {}
+            for t in ea.Tags().get("scalars", []):
+                events = ea.Scalars(t)
+                _tb_cache[tb_dir][t] = (
+                    np.array([e.step for e in events]),
+                    np.array([e.value for e in events]),
+                )
+        cached = _tb_cache[tb_dir]
+        if tag not in cached:
             return None, None
-        events = ea.Scalars(tag)
-        steps = np.array([e.step for e in events])
-        values = np.array([e.value for e in events])
-        return steps, values
+        return cached[tag]
     except Exception:
         return None, None
 

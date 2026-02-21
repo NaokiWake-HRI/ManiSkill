@@ -6,7 +6,7 @@ import sapien
 import torch
 
 import mani_skill.envs.utils.randomization as randomization
-from mani_skill.agents.robots import PandaAllegro, PandaAllegroTouch
+from mani_skill.agents.robots import PandaAllegro, PandaAllegroTouch, PandaAllegroTouchLab
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import sapien_utils
@@ -261,3 +261,164 @@ class PickCubePandaAllegroTouchEnv(PickCubePandaAllegroEnv):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, robot_uids="panda_allegro_touch", **kwargs)
+
+
+@register_env("PickCubePandaAllegro-v2", max_episode_steps=100)
+class PickCubePandaAllegroV2Env(BaseEnv):
+    """PickCube with Panda + Allegro + TouchLab tactile sensors (4 fingertip patches).
+
+    Uses pd_ee_delta_pose control mode (6D arm EE delta + 16D hand absolute = 22D).
+    For RL, wrap with CoupledAllegroActionWrapper to get 8D action space
+    (6 arm EE + 2 hand scalars: finger group + thumb).
+
+    Success criteria: same as PickCube-v1 (cube at goal + robot static).
+    Reward: reach + grasp + place + static + success bonus.
+    """
+
+    SUPPORTED_ROBOTS = ["panda_allegro_touchlab"]
+    agent: PandaAllegroTouchLab
+    goal_thresh = 0.025
+    cube_half_size = [0.02, 0.04, 0.02]
+    cube_spawn_half_size = 0.1
+    cube_spawn_center = (0, 0)
+    max_goal_height = 0.3
+
+    def __init__(self, *args, robot_uids="panda_allegro_touchlab",
+                 robot_init_qpos_noise=0.02, **kwargs):
+        self.robot_init_qpos_noise = robot_init_qpos_noise
+        if "control_mode" not in kwargs:
+            kwargs["control_mode"] = "pd_ee_delta_pose"
+        super().__init__(*args, robot_uids=robot_uids, **kwargs)
+
+    @property
+    def _default_sim_config(self):
+        return SimConfig(
+            gpu_memory_config=GPUMemoryConfig(
+                max_rigid_contact_count=self.num_envs * max(1024, self.num_envs) * 16,
+                max_rigid_patch_count=self.num_envs * max(1024, self.num_envs) * 4,
+                found_lost_pairs_capacity=2**26,
+            )
+        )
+
+    @property
+    def _default_sensor_configs(self):
+        pose = sapien_utils.look_at(eye=[0.3, 0, 0.6], target=[-0.1, 0, 0.1])
+        return [CameraConfig("base_camera", pose, 128, 128, np.pi / 2, 0.01, 100)]
+
+    @property
+    def _default_human_render_camera_configs(self):
+        pose = sapien_utils.look_at(eye=[0.6, 0.7, 0.6], target=[0.0, 0.0, 0.35])
+        return CameraConfig("render_camera", pose, 512, 512, 1, 0.01, 100)
+
+    def _load_agent(self, options: dict):
+        super()._load_agent(options, sapien.Pose(p=[-0.615, 0, 0]))
+
+    def _load_scene(self, options: dict):
+        self.table_scene = TableSceneBuilder(
+            self, robot_init_qpos_noise=self.robot_init_qpos_noise
+        )
+        self.table_scene.build()
+        self.cube = actors.build_box(
+            self.scene,
+            half_sizes=self.cube_half_size,
+            color=[1, 0, 0, 1],
+            name="cube",
+            initial_pose=sapien.Pose(p=[0, 0, self.cube_half_size[2]]),
+        )
+        self.goal_site = actors.build_sphere(
+            self.scene,
+            radius=self.goal_thresh,
+            color=[0, 1, 0, 1],
+            name="goal_site",
+            body_type="kinematic",
+            add_collision=False,
+            initial_pose=sapien.Pose(),
+        )
+        self._hidden_objects.append(self.goal_site)
+
+    def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
+        with torch.device(self.device):
+            b = len(env_idx)
+            self.table_scene.initialize(env_idx)
+
+            # Randomize cube position (no rotation)
+            xyz = torch.zeros((b, 3))
+            xyz[:, :2] = (
+                torch.rand((b, 2)) * self.cube_spawn_half_size * 2
+                - self.cube_spawn_half_size
+            )
+            xyz[:, 0] += self.cube_spawn_center[0]
+            xyz[:, 1] += self.cube_spawn_center[1]
+            xyz[:, 2] = self.cube_half_size[2]
+            self.cube.set_pose(Pose.create_from_pq(xyz))
+
+            # Randomize goal position
+            goal_xyz = torch.zeros((b, 3))
+            goal_xyz[:, :2] = (
+                torch.rand((b, 2)) * self.cube_spawn_half_size * 2
+                - self.cube_spawn_half_size
+            )
+            goal_xyz[:, 0] += self.cube_spawn_center[0]
+            goal_xyz[:, 1] += self.cube_spawn_center[1]
+            goal_xyz[:, 2] = torch.rand((b)) * self.max_goal_height + xyz[:, 2]
+            self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
+
+    def _get_obs_extra(self, info: dict):
+        obs = dict(
+            is_grasped=info["is_grasped"],
+            tcp_pose=self.agent.tcp_pose.raw_pose,
+            goal_pos=self.goal_site.pose.p,
+        )
+        if "state" in self.obs_mode:
+            obs.update(
+                obj_pose=self.cube.pose.raw_pose,
+                tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp_pose.p,
+                obj_to_goal_pos=self.goal_site.pose.p - self.cube.pose.p,
+            )
+        return obs
+
+    def evaluate(self):
+        is_obj_placed = (
+            torch.linalg.norm(self.goal_site.pose.p - self.cube.pose.p, axis=1)
+            <= self.goal_thresh
+        )
+        is_grasped = self.agent.is_grasping(self.cube)
+        is_robot_static = self.agent.is_static(0.2)
+        return {
+            "success": is_obj_placed & is_robot_static,
+            "is_obj_placed": is_obj_placed,
+            "is_robot_static": is_robot_static,
+            "is_grasped": is_grasped,
+        }
+
+    def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        # Reach: tcp -> cube distance
+        tcp_to_obj_dist = torch.linalg.norm(
+            self.cube.pose.p - self.agent.tcp_pose.p, axis=1
+        )
+        reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
+        reward = reaching_reward
+
+        # Grasp: binary (>=2 fingertips in contact)
+        is_grasped = info["is_grasped"]
+        reward += is_grasped
+
+        # Place: cube -> goal (gated by grasp)
+        obj_to_goal_dist = torch.linalg.norm(
+            self.goal_site.pose.p - self.cube.pose.p, axis=1
+        )
+        place_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
+        reward += place_reward * is_grasped
+
+        # Static: arm velocity penalty (gated by placed)
+        qvel = self.agent.robot.get_qvel()[..., :7]  # arm joints only
+        static_reward = 1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
+        reward += static_reward * info["is_obj_placed"]
+
+        reward[info["success"]] = 5
+        return reward
+
+    def compute_normalized_dense_reward(
+        self, obs: Any, action: torch.Tensor, info: dict
+    ):
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 5

@@ -66,6 +66,8 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+from coupled_allegro_wrapper import CoupledAllegroActionWrapper
+from env_contracts import validate_env_setup
 from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
 
 
@@ -108,8 +110,8 @@ class Args:
     """the number of steps to run in each evaluation environment during evaluation"""
     reconfiguration_freq: Optional[int] = None
     eval_reconfiguration_freq: Optional[int] = 1
-    control_mode: Optional[str] = "pd_joint_delta_pos"
-    """the control mode to use for the environment"""
+    control_mode: Optional[str] = None
+    """the control mode to use for the environment (default: pd_ee_delta_pose for PandaAllegro, pd_joint_delta_pos for others)"""
     anneal_lr: bool = False
     gamma: float = 0.8
     gae_lambda: float = 0.9
@@ -787,8 +789,13 @@ def run_ppo_training(
         sim_backend="physx_cuda",
         reward_mode="none",
     )
+    # Resolve control_mode: CLI explicit > task default
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
+    elif "PandaAllegro" in args.env_id:
+        env_kwargs["control_mode"] = "pd_ee_delta_pose"
+    else:
+        env_kwargs["control_mode"] = "pd_joint_delta_pos"
 
     envs = gym.make(
         args.env_id,
@@ -803,9 +810,14 @@ def run_ppo_training(
         **env_kwargs,
     )
 
-    if isinstance(envs.action_space, gym.spaces.Dict):
+    if "PandaAllegro" in args.env_id:
+        # Use coupled 8D action space (6 arm EE + 2 hand scalars)
+        envs = CoupledAllegroActionWrapper(envs)
+        eval_envs = CoupledAllegroActionWrapper(eval_envs)
+    elif isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    validate_env_setup(args.env_id, env_kwargs["control_mode"], envs)
 
     # RewardWrapperDynamic with fixed weights (supports custom functions)
     # In Eureka mode (custom_code provided), raise on runtime errors so the
@@ -1443,6 +1455,18 @@ if __name__ == "__main__":
                     "reach→grasp→carry→above_bowl→releaseの段階的な報酬構造。"
                     "回答の末尾に日本語での簡潔な要約も追加してください。"
                 ),
+                "PickCubePandaAllegro": (
+                    "A Panda arm with Allegro dexterous hand must pick up a box and place it at "
+                    "the goal position (PickCubePandaAllegro-v2).\n"
+                    "The hand uses coupled control: 2D action (finger group + thumb open/close) "
+                    "mapped to 16D joint positions. Arm uses 6D EE delta pose.\n"
+                    "Reward components: w_reach (TCP approach to box), w_grasp (>=2 fingertips in contact), "
+                    "w_place (box toward goal, gated by grasp), "
+                    "w_static (arm static with object placed), w_success (success bonus).\n\n"
+                    "日本語補足: Pandaアーム+Allegro多指ハンドでボックスを掴んで目標位置に運ぶタスク。"
+                    "指は2自由度（親指・対抗指の開閉）で制御。"
+                    "回答の末尾に日本語での簡潔な要約も追加してください。"
+                ),
             }
 
             # Get reward function source code for LLM context
@@ -1482,6 +1506,7 @@ if __name__ == "__main__":
                     "AnymalC": "_compute_anymalc_reach",
                     "PegInsertionSide": "_compute_peg_insertion",
                     "PushT": "_compute_push_t",
+                    "PickCubePandaAllegro": "_compute_pick_cube_allegro",
                 }
                 try:
                     method_name = _reward_method_map[task_id]
@@ -1691,6 +1716,42 @@ Reward design guidelines:
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 - Use info["is_grasped"] to gate place rewards.
 - After placing, reward hand retraction (moving hand above bowl).
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+                "PickCubePandaAllegro": """
+Available state attributes (base = env.unwrapped):
+- base.cube.pose.p: Box position, torch.Tensor (batch_size, 3)
+- base.agent.tcp_pose.p: End effector (TCP) position, torch.Tensor (batch_size, 3)
+- base.goal_site.pose.p: Goal position, torch.Tensor (batch_size, 3)
+- base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, 23) (7 arm + 16 hand)
+- base.agent.tip_links: List of 4 fingertip links [thumb, index, middle, ring]
+- base.agent.tip_links[i].pose.p: Fingertip position, torch.Tensor (batch_size, 3)
+- base.agent.palm_link.pose.p: Palm position, torch.Tensor (batch_size, 3)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["is_grasped"]: torch.Tensor (batch_size,) bool (>=2 fingertips in contact with box)
+- info["is_obj_placed"]: torch.Tensor (batch_size,) bool (box within 0.025m of goal)
+- info["is_robot_static"]: torch.Tensor (batch_size,) bool
+
+Action space: 8D (6 arm EE delta + 2 hand scalars via CoupledAllegroActionWrapper).
+  action[0:6]: arm end-effector delta pose (position + rotation)
+  action[6]: finger group scalar [-1=open, 1=closed] (controls index/middle/ring together)
+  action[7]: thumb scalar [-1=open, 1=closed]
+
+Success condition (from environment):
+- Box within 0.025m (3D Euclidean) of goal AND robot arm is static (joint velocities <= 0.2 rad/s).
+- Key constants: cube_half_size=[0.02, 0.04, 0.02], goal_thresh=0.025m.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
+- ALWAYS use full 3D Euclidean distances for reach/approach components.
+- Use info["is_grasped"] to gate place rewards (only reward placing when grasped).
+- Only use arm joint velocities (first 7) for static penalty, not hand joints.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:

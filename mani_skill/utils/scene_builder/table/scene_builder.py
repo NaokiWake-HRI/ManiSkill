@@ -101,7 +101,7 @@ class TableSceneBuilder(SceneBuilder):
             qpos[:, -2:] = 0.04
             self.env.agent.reset(qpos)
             self.env.agent.robot.set_pose(sapien.Pose([-0.615, 0, 0]))
-        elif self.env.robot_uids == "panda_allegro":
+        elif self.env.robot_uids in ("panda_allegro", "panda_allegro_touch", "panda_allegro_touchlab"):
             qpos = self.env.agent.keyframes["rest"].qpos
             qpos = (
                 self.env._episode_rng.normal(

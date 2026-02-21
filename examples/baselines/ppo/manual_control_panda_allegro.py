@@ -35,12 +35,13 @@ import time
 
 import gymnasium as gym
 import numpy as np
+import torch
 from matplotlib import pyplot as plt
 
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
 from mani_skill.envs.sapien_env import BaseEnv
-from mani_skill.utils import common, visualization
+from mani_skill.utils import common
 
 
 # Coupled hand targets (8D: index[4] + thumb[4])
@@ -55,6 +56,13 @@ THUMB_CLOSED = np.array([1.3, 0.7, 0.7, 1.2])  # joint12: max 1.396 (more pronat
 LERP_RATE = 0.1  # interpolation speed per frame
 
 
+def flip_wrist(env):
+    """Rotate wrist 180 degrees so palm faces up for easier viewing."""
+    qpos = env.unwrapped.agent.robot.get_qpos().clone()
+    qpos[..., 6] -= np.pi  # panda_joint7: 90deg -> -90deg
+    env.unwrapped.agent.robot.set_qpos(qpos)
+
+
 def coupled_8d_to_16d(fingers_4d, thumb_4d):
     """Expand 8D coupled hand target to 16D absolute joint positions.
     index(0-3) = middle(4-7) = ring(8-11), thumb(12-15) independent."""
@@ -67,7 +75,7 @@ def parse_args():
     parser.add_argument("-o", "--obs-mode", type=str, default="state")
     parser.add_argument("--reward-mode", type=str, default="dense")
     parser.add_argument("-c", "--control-mode", type=str, default="pd_ee_delta_pose")
-    parser.add_argument("--render-mode", type=str, default="sensors")
+    parser.add_argument("--render-mode", type=str, default="rgb_array")
     parser.add_argument("--enable-sapien-viewer", action="store_true")
     parser.add_argument("--record-dir", type=str)
     parser.add_argument("--ee-action-scale", type=float, default=0.1)
@@ -110,24 +118,46 @@ def main():
     fingers = FINGERS_OPEN.copy()
     thumb = THUMB_OPEN.copy()
 
-    # Viewer
+    # SAPIEN viewer (3D scene)
     if args.enable_sapien_viewer:
         env.render_human()
-    renderer = visualization.ImageRenderer(wait_for_button_press=False)
 
-    # Disable matplotlib default key shortcuts
-    for key_list_name in [
+    # Check if agent has TouchLab sensors
+    has_tl = hasattr(env.unwrapped.agent, 'tl_links') and len(env.unwrapped.agent.tl_links) > 0
+    tl_labels = ["Index", "Middle", "Ring", "Thumb"]
+
+    # Sensor bar chart (matplotlib)
+    plt.ion()
+    # Disable matplotlib default key shortcuts so they don't interfere
+    for kmap in [
         "keymap.fullscreen", "keymap.home", "keymap.back",
         "keymap.forward", "keymap.pan", "keymap.zoom",
         "keymap.save", "keymap.grid", "keymap.yscale", "keymap.xscale",
     ]:
-        keys_to_remove = [k for k in plt.rcParams[key_list_name]
-                          if len(k) == 1 and k.islower()]
-        for k in keys_to_remove:
+        for k in [c for c in plt.rcParams[kmap] if len(c) == 1 and c.islower()]:
             try:
-                plt.rcParams[key_list_name].remove(k)
+                plt.rcParams[kmap].remove(k)
             except ValueError:
                 pass
+
+    fig, ax = plt.subplots(figsize=(5, 3))
+    fig.canvas.manager.set_window_title("TouchLab Sensors")
+    bar_colors = ["#4285f4", "#ea4335", "#fbbc05", "#34a853"]
+    bars = ax.bar(tl_labels, [0.0] * 4, color=bar_colors)
+    ax.set_ylabel("Impulse (norm)")
+    ax.set_ylim(0, 1)
+    fig.tight_layout()
+
+    pressed_keys = set()
+
+    def _on_key_press(event):
+        pressed_keys.add(event.key)
+
+    def _on_key_release(event):
+        pressed_keys.discard(event.key)
+
+    fig.canvas.mpl_connect("key_press_event", _on_key_press)
+    fig.canvas.mpl_connect("key_release_event", _on_key_release)
 
     EE_SCALE = args.ee_action_scale
     control_timestep = env.unwrapped.control_timestep
@@ -141,18 +171,10 @@ def main():
             continue
         last_update_time = current_time
 
-        # Render
         if args.enable_sapien_viewer:
             env.render_human()
-        render_frame = env.render().cpu().numpy()[0]
-        if after_reset:
-            after_reset = False
-            if args.enable_sapien_viewer:
-                renderer.close()
-                renderer = visualization.ImageRenderer(wait_for_button_press=False)
-        renderer(render_frame)
 
-        pressed = renderer.pressed_keys
+        pressed = pressed_keys
 
         # --- Arm EE delta pose (6D) ---
         ee_action = np.zeros(6)
@@ -185,7 +207,7 @@ def main():
             fingers = FINGERS_OPEN.copy()
             thumb = THUMB_OPEN.copy()
             after_reset = True
-            renderer.pressed_keys.discard("r")
+            pressed_keys.discard("r")
             continue
         if "q" in pressed or "escape" in pressed:
             break
@@ -198,16 +220,32 @@ def main():
 
         obs, reward, terminated, truncated, info = env.step(action)
 
+        # Update sensor bar chart
+        sensor_str = ""
+        if has_tl:
+            tl_impulse = env.unwrapped.agent.get_tl_impulse()
+            tl_norms = torch.linalg.norm(tl_impulse, dim=-1)[0]  # first env
+            for bar, val in zip(bars, tl_norms):
+                bar.set_height(float(val))
+            ymax = max(float(tl_norms.max()), 0.1) * 1.3
+            ax.set_ylim(0, ymax)
+            sensor_str = " TL[" + " ".join(
+                f"{lbl}={v:.1f}" for lbl, v in zip(tl_labels, tl_norms)
+            ) + "]"
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+
         # Compact status line
         info_str = " ".join(
             f"{k}={v.item() if hasattr(v, 'item') else v:.3f}"
             if isinstance(v, (float, int)) or hasattr(v, 'item') else f"{k}={v}"
             for k, v in info.items()
         )
-        print(f"\rR={float(reward):.3f} | fingers={fingers} thumb={thumb} | {info_str}",
+        print(f"\rR={float(reward):.3f} | fingers={fingers} thumb={thumb}{sensor_str} | {info_str}",
               end="", flush=True)
 
     print()
+    plt.close(fig)
     env.close()
 
 

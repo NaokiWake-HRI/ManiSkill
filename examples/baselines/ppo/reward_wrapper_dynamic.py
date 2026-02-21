@@ -74,13 +74,25 @@ TASK_DEFAULTS = {
         "w_tcp_guide": 0.05,
         "w_success": 3.0,
     },
+    "PickCubePandaAllegro": {
+        "w_reach": 1.0,
+        "w_grasp": 1.0,
+        "w_place": 1.0,
+        "w_static": 1.0,
+        "w_success": 5.0,
+    },
 }
 
 
 def _resolve_task_id(env_id: str) -> str:
-    """Extract task name from env_id (e.g. 'PickCube-v1' -> 'PickCube')."""
+    """Extract task name from env_id (e.g. 'PickCube-v1' -> 'PickCube').
+
+    Prefers longest matching key to avoid 'PickCube' matching before
+    'PickCubePandaAllegro'.
+    """
     name = env_id.split("-")[0]
-    for key in TASK_DEFAULTS:
+    # Sort by key length descending so longer (more specific) keys match first
+    for key in sorted(TASK_DEFAULTS.keys(), key=len, reverse=True):
         if key in name:
             return key
     raise ValueError(
@@ -131,6 +143,7 @@ class RewardWrapperDynamic(gym.Wrapper):
             "AnymalC": self._compute_anymalc_reach,
             "PegInsertionSide": self._compute_peg_insertion,
             "PushT": self._compute_push_t,
+            "PickCubePandaAllegro": self._compute_pick_cube_allegro,
         }[self.task_id]
 
         # Custom function mode (Eureka)
@@ -324,6 +337,48 @@ class RewardWrapperDynamic(gym.Wrapper):
             qvel = qvel[..., :-2]
         elif base.robot_uids == "so100":
             qvel = qvel[..., :-1]
+        static_r = (1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))) * info["is_obj_placed"].float()
+
+        scale = self._norm_scale()
+        reward = scale * (
+            w["w_reach"] * reach_r
+            + w["w_grasp"] * grasp_r
+            + w["w_place"] * place_r
+            + w["w_static"] * static_r
+        )
+        reward[info["success"]] = w["w_success"]
+
+        self._last_breakdown = {
+            "reach": (scale * w["w_reach"] * reach_r).mean().item(),
+            "grasp": (scale * w["w_grasp"] * grasp_r).mean().item(),
+            "place": (scale * w["w_place"] * place_r).mean().item(),
+            "static": (scale * w["w_static"] * static_r).mean().item(),
+            "norm_scale": scale,
+        }
+        return reward
+
+    # --- PickCubePandaAllegro ---
+    def _compute_pick_cube_allegro(self, info: dict) -> torch.Tensor:
+        base = self.env.unwrapped
+        w = self.weights
+
+        # reach: tcp -> cube distance
+        tcp_to_obj_dist = torch.linalg.norm(
+            base.cube.pose.p - base.agent.tcp_pose.p, axis=1
+        )
+        reach_r = 1 - torch.tanh(5 * tcp_to_obj_dist)
+
+        # grasp (>=2 fingertips in contact)
+        grasp_r = info["is_grasped"].float()
+
+        # place: cube -> goal distance (gated by grasp)
+        obj_to_goal_dist = torch.linalg.norm(
+            base.goal_site.pose.p - base.cube.pose.p, axis=1
+        )
+        place_r = (1 - torch.tanh(5 * obj_to_goal_dist)) * grasp_r
+
+        # static: arm velocity penalty (gated by placed)
+        qvel = base.agent.robot.get_qvel()[..., :7]  # arm joints only
         static_r = (1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))) * info["is_obj_placed"].float()
 
         scale = self._norm_scale()

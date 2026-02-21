@@ -18,6 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 import mani_skill.envs
 from mani_skill.utils import gym_utils
 from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
+from coupled_allegro_wrapper import CoupledAllegroActionWrapper
+from env_contracts import validate_env_setup
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
@@ -69,8 +71,8 @@ class Args:
     """how often to reconfigure the environment during training"""
     eval_reconfiguration_freq: Optional[int] = 1
     """for benchmarking purposes we want to reconfigure the eval environment each reset to ensure objects are randomized in some tasks"""
-    control_mode: Optional[str] = "pd_joint_delta_pos"
-    """the control mode to use for the environment"""
+    control_mode: Optional[str] = None
+    """the control mode to use for the environment (default: pd_ee_delta_pose for PandaAllegro, pd_joint_delta_pos for others)"""
     anneal_lr: bool = False
     """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.8
@@ -201,13 +203,22 @@ if __name__ == "__main__":
 
     # env setup
     env_kwargs = dict(obs_mode="state", render_mode="rgb_array", sim_backend="physx_cuda")
+    # Resolve control_mode: CLI explicit > task default
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
+    elif "PandaAllegro" in args.env_id:
+        env_kwargs["control_mode"] = "pd_ee_delta_pose"
+    else:
+        env_kwargs["control_mode"] = "pd_joint_delta_pos"
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
-    if isinstance(envs.action_space, gym.spaces.Dict):
+    if "PandaAllegro" in args.env_id:
+        envs = CoupledAllegroActionWrapper(envs)
+        eval_envs = CoupledAllegroActionWrapper(eval_envs)
+    elif isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
+    validate_env_setup(args.env_id, env_kwargs["control_mode"], envs)
     if args.capture_video:
         eval_output_dir = f"runs/{run_dir}/videos"
         if args.evaluate:

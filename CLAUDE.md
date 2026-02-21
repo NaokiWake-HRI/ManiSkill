@@ -123,3 +123,125 @@ Iteration 1+:
 - `ppo_outer_loop.py` と `ppo_outer_loop_full.py` の間に **約80%のコード重複** がある（`run_ppo_training`関数など）。将来的に統合を検討
 - STATE_ACCESS_DOCS は手動管理。環境の `evaluate()` 返り値と照合する自動テストがない
 - `--skip_vlm_llm` と Eureka full mode の併用は非サポート（LLM必須）
+
+---
+
+## PickCubePandaAllegro-v2: TouchLab + Coupled Action (2026-02-20)
+
+PandaAllegro ハンドの RL 訓練パイプライン。pd_ee_delta_pose + CoupledAllegroActionWrapper で 22D→8D アクション空間に変換。
+
+### アーキテクチャ概要
+
+```
+allegro_debug.sh / outer_loop_eureka_full.sh
+  └─ ppo.py / ppo_outer_loop_full.py
+       ├─ gym.make("PickCubePandaAllegro-v2", control_mode="pd_ee_delta_pose")
+       │    → CombinedController → Box(22): arm(6) + hand(16)
+       ├─ CoupledAllegroActionWrapper  → Box(8): arm(6) + finger_scalar(1) + thumb_scalar(1)
+       ├─ env_contracts.validate_env_setup()  → 不一致時 ValueError で即停止
+       └─ RewardWrapperDynamic(task_id="PickCubePandaAllegro")
+```
+
+### 新規・変更ファイル
+
+| ファイル | 種別 | 内容 |
+|---------|------|------|
+| `mani_skill/envs/tasks/tabletop/pick_cube_allegro.py` | 変更 | v2 env 追加（BaseEnv 直接継承、v1 とは独立）。v1 はオリジナル（cube, 回転あり）に復元 |
+| `mani_skill/agents/robots/panda/panda_allegro_touchlab.py` | 新規 | PandaAllegroTouchLab エージェント（4 fingertip TouchLab センサー） |
+| `mani_skill/assets/robots/panda/panda_allegro_touchlab.urdf` | 新規 | TouchLab センサー付き URDF |
+| `examples/baselines/ppo/coupled_allegro_wrapper.py` | 新規 | 8D→22D アクション変換ラッパー |
+| `examples/baselines/ppo/env_contracts.py` | 新規 | env_id ごとの契約バリデーション |
+| `examples/baselines/ppo/allegro_debug.sh` | 変更 | v2 単発デバッグ用スクリプト |
+| `examples/baselines/ppo/ppo.py` | 変更 | CoupledAllegroActionWrapper + validate 追加 |
+| `examples/baselines/ppo/ppo_outer_loop_full.py` | 変更 | 同上 + LLM タスク記述・STATE_ACCESS_DOCS 追加 |
+| `examples/baselines/ppo/reward_wrapper.py` | 変更 | PickCubePandaAllegro タスク追加 |
+| `examples/baselines/ppo/reward_wrapper_dynamic.py` | 変更 | 同上（Eureka 用） |
+| `examples/baselines/ppo/outer_loop_eureka_full.sh` | 変更 | v2 タスクエントリ追加 |
+| `examples/baselines/ppo/outer_loop_vlm_full.sh` | 変更 | 同上 |
+
+### CoupledAllegroActionWrapper の設計
+
+ManiSkill の `pd_ee_delta_pose` は dict config (`dict(arm=..., hand=...)`) → `CombinedController` → **フラット Box(22)**。Dict ではない。
+
+```
+PPO policy → Box(8) → CoupledAllegroActionWrapper.action()
+  action[:, :6]  = arm EE delta (passthrough)
+  action[:, 6]   = finger group scalar [-1=open, 1=close]
+  action[:, 7]   = thumb scalar [-1=open, 1=close]
+  → expand_hand_scalars() → 16D absolute joint pos
+  → torch.cat([arm_6d, hand_16d]) → Box(22) flat tensor → env.step()
+```
+
+指の開閉リミット（manual_control_panda_allegro.py と同一）:
+- `FINGERS_OPEN/CLOSED = [0,0,0,0] / [0.3, 1.0, 1.0, 1.0]` × 3指
+- `THUMB_OPEN/CLOSED = [0.83, 0, 0, 0] / [1.3, 0.7, 0.7, 1.2]`
+
+### control_mode の解決順序
+
+`ppo.py` / `ppo_outer_loop_full.py` 共通:
+```python
+if args.control_mode is not None:       # CLI 明示指定 → 常に尊重
+    env_kwargs["control_mode"] = args.control_mode
+elif "PandaAllegro" in args.env_id:     # PandaAllegro タスクデフォルト
+    env_kwargs["control_mode"] = "pd_ee_delta_pose"
+else:                                    # その他タスクデフォルト
+    env_kwargs["control_mode"] = "pd_joint_delta_pos"
+```
+
+`args.control_mode` のデフォルトは `None`（silent override 排除）。
+
+### env_contracts.py（バリデーション）
+
+```python
+ENV_CONTRACTS = {
+    "PickCubePandaAllegro-v2": {
+        "control_mode": "pd_ee_delta_pose",
+        "raw_action_dim": 22,
+        "wrapped_action_dim": 8,
+    },
+}
+```
+
+- `validate_env_setup()` を gym.make + wrapper 適用後に呼ぶ
+- 契約にない env_id は no-op（既存タスクに影響なし）
+- 不一致時は `ValueError` + env_id / 期待値 / 実測値 / 修正方法を表示
+
+`CoupledAllegroActionWrapper.__init__` 内でも独立チェック:
+- 入力が `Box` でなければ即エラー（Dict が来た＝control_mode 間違い）
+- 入力 dim が 22 でなければ即エラー
+
+### v1 / v2 の分離
+
+| | v1 (`PickCubePandaAllegro-v1`) | v2 (`PickCubePandaAllegro-v2`) |
+|---|---|---|
+| 継承 | `BaseEnv` 直接 | `BaseEnv` 直接（v1 とは独立） |
+| ロボット | `panda_allegro` / `panda_allegro_touch` | `panda_allegro_touchlab` |
+| オブジェクト | 立方体 `half_size=0.03` | 直方体 `[0.02, 0.04, 0.02]` |
+| 回転ランダム化 | あり（Z 軸） | なし |
+| control_mode | `pd_joint_delta_pos`（デフォルト） | `pd_ee_delta_pose` |
+| RL wrapper | なし | `CoupledAllegroActionWrapper` |
+
+v1 はオリジナル状態に復元済み。v2 の変更が v1/Touch-v1 に影響しない。
+
+### Grasp 判定の違い
+
+| | Panda (PickCube-v1) | PandaAllegro |
+|---|---|---|
+| 条件 | 左右指 both ≥0.5N **AND** 方向85°以内 | 4指先のうち ≥2 が ≥0.5N（方向チェックなし） |
+| メソッド | `panda.py:is_grasping()` | `panda_allegro.py:is_grasping()` |
+
+### 報酬構造（v2 デフォルト）
+
+```
+reach   : 1 - tanh(5 * tcp_to_obj_dist)
+grasp   : is_grasped (binary, ≥2 fingertips)
+place   : (1 - tanh(5 * obj_to_goal_dist)) * is_grasped
+static  : (1 - tanh(5 * arm_qvel_norm)) * is_obj_placed
+success : 5 (bonus)
+```
+
+### 既知の注意点
+
+- `_resolve_task_id()` は substring matching（longest match first）。`PickCubePandaAllegro` が `PickCube` より先にマッチするよう key 長降順ソート済み
+- `ppo_outer_loop_full.py` の `_state_access_docs["PickCubePandaAllegro"]` を環境実装と同期させること
+- TouchLab センサーの接触インパルスは `get_tl_impulse()` / `get_tl_obj_impulse(obj)` で取得。現在の報酬関数では未使用（将来の Eureka 生成コード用）

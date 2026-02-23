@@ -2247,9 +2247,9 @@ def compute_reward(info: dict, base) -> torch.Tensor:
             logger.add_scalar("outer_iter/best_avg_return", best["eval_metrics"].get("return", 0.0), global_step_offset)
             logger.add_scalar("outer_iter/iteration", outer_iter, global_step_offset)
 
-        # ========== STEP 4: VLM analysis (Iteration 1+ only) ==========
+        # ========== STEP 4: VLM analysis ==========
         vlm_comment = None
-        if vlm is not None and outer_iter > 0:
+        if vlm is not None:
             print(f"\n[VLM] Analyzing best candidate's video (iteration {outer_iter+1})...")
 
             video_dir = Path(best["eval_video_dir"])

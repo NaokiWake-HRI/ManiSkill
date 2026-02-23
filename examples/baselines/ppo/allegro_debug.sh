@@ -14,13 +14,13 @@ seed=9351
 ENV="PickCubePandaAllegro-v2"
 
 # --- Parallelism ---
-NUM_ENVS=2048        # TouchLab sensors need more GPU memory per env
+NUM_ENVS=4096        # TouchLab sensors need more GPU memory per env
 NUM_EVAL_ENVS=16
 
 # --- Rollout ---
 NUM_STEPS=100          # = max_episode_steps (full-episode rollouts)
 NUM_EVAL_STEPS=100
-TOTAL=6_000_000        # short run for debug; increase for real training
+TOTAL=50_000_000        # short run for debug; increase for real training
 
 # --- PPO ---
 UPDATE_EPOCHS=8        # more gradient steps per rollout
@@ -31,7 +31,7 @@ ENT_COEF=0.01          # entropy bonus for exploration
 LR=3e-4
 REWARD_SCALE=1.0
 
-python ppo.py \
+CUDA_VISIBLE_DEVICES=0 python ppo.py \
   --env_id="${ENV}" \
   --seed=${seed} \
   --num_envs=${NUM_ENVS} \
@@ -48,4 +48,6 @@ python ppo.py \
   --reward_scale=${REWARD_SCALE} \
   --finite_horizon_gae \
   --partial_reset \
-  --exp-name="ppo-${ENV}-debug-${seed}"
+  --track \
+  --wandb-project-name="maniskill-allegro" \
+  --exp-name="ppo-allegro-debug-${ENV}-${seed}-$(date +%Y%m%d_%H%M%S)"

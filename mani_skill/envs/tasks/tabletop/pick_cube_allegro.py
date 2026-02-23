@@ -294,8 +294,8 @@ class PickCubePandaAllegroV2Env(BaseEnv):
     def _default_sim_config(self):
         return SimConfig(
             gpu_memory_config=GPUMemoryConfig(
-                max_rigid_contact_count=self.num_envs * max(1024, self.num_envs) * 16,
-                max_rigid_patch_count=self.num_envs * max(1024, self.num_envs) * 4,
+                max_rigid_contact_count=max(2**21, self.num_envs * 1024),
+                max_rigid_patch_count=max(2**21, self.num_envs * 128),
                 found_lost_pairs_capacity=2**26,
             )
         )

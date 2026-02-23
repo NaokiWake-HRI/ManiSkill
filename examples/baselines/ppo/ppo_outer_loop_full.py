@@ -1800,6 +1800,41 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                 if "reflection_history" in prev_iter:
                     training_summary["reflection_history"] = prev_iter["reflection_history"]
 
+                # Add structured history for LLM (past changes and observed outcomes)
+                history_summary = []
+                vlm_comments = []
+                for hist in outer_loop_history:
+                    hist_best = hist.get("best_candidate", {})
+                    hist_eval = hist_best.get("eval_metrics", {})
+                    rationale = hist_best.get("rationale", "No rationale provided")
+                    history_summary.append(
+                        {
+                            "iteration": hist.get("outer_iter", 0),
+                            "changes": rationale,
+                            "rationale": rationale,
+                            "result": {
+                                "success_rate": hist_best.get("fitness", 0.0),
+                                "avg_return": hist_eval.get("return", 0.0),
+                                "success_once": hist_eval.get("success_once", 0.0),
+                            },
+                        }
+                    )
+
+                    hist_vlm_comment = hist_best.get("vlm_comment")
+                    if not hist_vlm_comment and "reflection_history" in hist:
+                        hist_vlm_comment = hist["reflection_history"].get("vlm_feedback")
+                    if (
+                        isinstance(hist_vlm_comment, str)
+                        and hist_vlm_comment.strip()
+                        and hist_vlm_comment.strip() != "N/A"
+                    ):
+                        vlm_comments.append(
+                            f"Iter {hist.get('outer_iter', 0) + 1}: {hist_vlm_comment.strip()}"
+                        )
+
+                training_summary["history_summary"] = history_summary
+                training_summary["vlm_comments"] = vlm_comments[-5:]
+
                 # Add performance trend across iterations
                 if len(outer_loop_history) > 0:
                     training_summary["performance_trend"] = [
@@ -2231,6 +2266,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                 if frames:
                     episode_info = {
                         "return": best["eval_metrics"].get("return", 0.0),
+                        "success": best["eval_metrics"].get("success_at_end", best["fitness"]),
                         "success_at_end": best["fitness"],
                         "success_once": best["eval_metrics"].get("success_once", 0.0),
                         "length": args.num_eval_steps,

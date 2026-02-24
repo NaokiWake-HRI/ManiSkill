@@ -558,6 +558,11 @@ def _train_candidates_parallel(
 
                 if result.get("success", False):
                     fitness = result["eval_metrics"].get("success_at_end", 0.0)
+                    _lc = result.get("learning_curve", [])
+                    _peak_success_once = max(
+                        (lc.get("success_once", 0.0) for lc in _lc),
+                        default=result["eval_metrics"].get("success_once", 0.0),
+                    )
                     candidate_results.append({
                         "candidate_id": result["candidate_id"],
                         "code": result["code"],
@@ -565,7 +570,7 @@ def _train_candidates_parallel(
                         "is_elite": result["is_elite"],
                         "fitness": fitness,
                         "fitness_success_at_end": fitness,
-                        "fitness_success_once": result["eval_metrics"].get("success_once", 0.0),
+                        "fitness_success_once": _peak_success_once,
                         "fitness_return": result["eval_metrics"].get("return", float("-inf")),
                         "eval_metrics": result["eval_metrics"],
                         "learning_curve": result["learning_curve"],
@@ -681,6 +686,11 @@ def _train_candidates_parallel(
 
                             if retry_result.get("success", False):
                                 fitness = retry_result["eval_metrics"].get("success_at_end", 0.0)
+                                _lc = retry_result.get("learning_curve", [])
+                                _peak_success_once = max(
+                                    (lc.get("success_once", 0.0) for lc in _lc),
+                                    default=retry_result["eval_metrics"].get("success_once", 0.0),
+                                )
                                 candidate_results.append({
                                     "candidate_id": retry_result["candidate_id"],
                                     "code": retry_result["code"],
@@ -688,7 +698,7 @@ def _train_candidates_parallel(
                                     "is_elite": retry_result["is_elite"],
                                     "fitness": fitness,
                                     "fitness_success_at_end": fitness,
-                                    "fitness_success_once": retry_result["eval_metrics"].get("success_once", 0.0),
+                                    "fitness_success_once": _peak_success_once,
                                     "fitness_return": retry_result["eval_metrics"].get("return", float("-inf")),
                                     "eval_metrics": retry_result["eval_metrics"],
                                     "learning_curve": retry_result["learning_curve"],
@@ -2052,7 +2062,14 @@ def compute_reward(info: dict, base) -> torch.Tensor:
 
                         eval_metrics = result["eval_metrics"]
                         fitness = eval_metrics.get("success_at_end", 0.0)
-                        fitness_success_once = eval_metrics.get("success_once", 0.0)
+                        # Use peak success_once across all eval checkpoints (not just final)
+                        # so candidates that briefly succeed during training are preferred
+                        # over candidates that never succeed but have higher final return.
+                        _lc = result.get("learning_curve", [])
+                        fitness_success_once = max(
+                            (lc.get("success_once", 0.0) for lc in _lc),
+                            default=eval_metrics.get("success_once", 0.0),
+                        )
                         fitness_return = eval_metrics.get("return", float("-inf"))
 
                         step_rewards = result.get("step_rewards", [])
@@ -2193,14 +2210,14 @@ def compute_reward(info: dict, base) -> torch.Tensor:
         )
         fitness_end_values = [c.get("fitness_success_at_end", c["fitness"]) for c in candidate_results]
         if len(fitness_end_values) > 1 and max(fitness_end_values) == min(fitness_end_values):
-            print("  [Selection] success_at_end tied across candidates; tie-break used: success_once -> return")
+            print("  [Selection] success_at_end tied across candidates; tie-break used: peak_success_once -> return")
         if best.get("code") is not None:
             last_good_code = best["code"]
         print(f"\n{'='*60}")
         print(
             f"[BEST] Candidate {best['candidate_id']+1} selected "
             f"(fitness_end={best.get('fitness_success_at_end', best['fitness']):.4f}, "
-            f"success_once={best.get('fitness_success_once', best['eval_metrics'].get('success_once', 0.0)):.4f}, "
+            f"peak_success_once={best.get('fitness_success_once', best['eval_metrics'].get('success_once', 0.0)):.4f}, "
             f"return={best.get('fitness_return', best['eval_metrics'].get('return', 0.0)):.2f})"
         )
         print(f"{'='*60}")

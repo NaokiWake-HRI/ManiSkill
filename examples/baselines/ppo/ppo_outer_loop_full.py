@@ -934,6 +934,7 @@ def run_ppo_training(
                 "success_at_end": latest_eval_metrics.get("success_at_end", 0.0),
                 "success_once": latest_eval_metrics.get("success_once", 0.0),
                 "success_rate": latest_eval_metrics.get("success_at_end", 0.0),
+                "episode_len": latest_eval_metrics.get("episode_len", 0.0),
             }
             # Add per-component reward means (Eureka-style)
             if step_breakdowns_list:
@@ -1792,6 +1793,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                     "success_rate": prev_best["fitness"],
                     "success_at_end": prev_best["fitness"],
                     "success_once": prev_best["eval_metrics"].get("success_once", 0.0),
+                    "episode_len": prev_best["eval_metrics"].get("episode_len", 0.0),
                     "learning_curve": prev_best["learning_curve"],
                     "num_episodes": int(prev_best["eval_metrics"].get("num_episodes", 0)),
                 }
@@ -1816,6 +1818,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                                 "success_rate": hist_best.get("fitness", 0.0),
                                 "avg_return": hist_eval.get("return", 0.0),
                                 "success_once": hist_eval.get("success_once", 0.0),
+                                "episode_len": hist_eval.get("episode_len", 0.0),
                             },
                         }
                     )
@@ -1845,6 +1848,7 @@ def compute_reward(info: dict, base) -> torch.Tensor:
                             "success_rate": h["best_candidate"]["fitness"],
                             "success_at_end": h["best_candidate"]["fitness"],
                             "success_once": h["best_candidate"]["eval_metrics"].get("success_once", 0.0),
+                            "episode_len": h["best_candidate"]["eval_metrics"].get("episode_len", 0.0),
                             "learning_curve": h["best_candidate"]["learning_curve"],
                         }
                         for h in outer_loop_history

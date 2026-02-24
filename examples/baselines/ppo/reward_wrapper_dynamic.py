@@ -197,6 +197,20 @@ class RewardWrapperDynamic(gym.Wrapper):
             if not torch.isfinite(reward).all():
                 raise ValueError("Reward contains NaN or Inf")
 
+            # Record breakdown for learning curve (Eureka-style feedback).
+            # If the custom function wrote per-component data into
+            # info["_reward_components"], use that; otherwise record total only.
+            self._last_breakdown = {
+                "total": reward.mean().item(),
+            }
+            custom_comps = info.get("_reward_components")
+            if isinstance(custom_comps, dict):
+                for k, v in custom_comps.items():
+                    if isinstance(v, torch.Tensor):
+                        self._last_breakdown[k] = v.mean().item()
+                    elif isinstance(v, (int, float)):
+                        self._last_breakdown[k] = float(v)
+
             return reward
 
         except Exception as e:

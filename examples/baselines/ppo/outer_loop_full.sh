@@ -1,19 +1,22 @@
 #!/bin/bash
-# PPO Outer Loop: Eureka Full Replacement Mode (LLM generates complete reward functions)
+# PPO Outer Loop: Unified script for VLM+LLM and Eureka (LLM-only) modes
 #
-# This script implements the complete Eureka algorithm from the paper:
+# Modes:
+#   vlm    - VLM+LLM Full Replacement: VLM analyzes robot behavior from videos,
+#            LLM rewrites entire reward function using VLM feedback.
+#   eureka - Eureka Full Replacement: LLM-only, no VLM video analysis.
+#            Ablation counterpart of vlm mode for fair comparison.
+#
+# Common behavior:
 # - Generates K=4 reward function candidates per iteration
 # - Trains K candidates in parallel across GPUs (--gpus flag)
 # - Performs Reward Reflection for next iteration
 # - LLM rewrites entire reward function (not just weights)
-# - NO VLM video analysis (--eureka_mode)
 #
-# This script is the ablation counterpart of outer_loop_vlm_full.sh.
-# The ONLY differences are:
-#   + --eureka_mode                  (disables VLM, LLM-only)
-#   ~ --exp-name prefix              (ppo-eureka-full)
-# All other parameters (seeds, NUM_ENVS, num_eval_envs, GPUs, etc.)
-# are IDENTICAL to outer_loop_vlm_full.sh for fair comparison.
+# Cross-experiment resume (--resume_from_counterpart):
+#   When CROSS_RESUME=1, automatically finds the counterpart experiment's
+#   latest run for each env and resumes from its iter 0.
+#   e.g., eureka mode finds the latest vlm run, vlm mode finds the latest eureka run.
 #
 # Parallelization: K candidates are trained in parallel across GPUs.
 #   With K=4 and 2 GPUs, each outer iteration runs 2 batches of 2.
@@ -24,19 +27,38 @@
 #   GPU 1: NVIDIA GeForce RTX 5090 (32GB)
 #
 # Usage:
-#   export OPENAI_API_KEY=sk-... && bash outer_loop_eureka_full.sh
-#
-# Cross-experiment resume (share iter 0 from vlm_full):
-#   Add --resume_dir and --resume_first_iter_only to reuse vlm_full's
-#   iter 0 result as the starting point, then diverge with eureka from iter 1.
-#   See the --resume_first_iter_only block in the python call below (commented out).
+#   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh vlm
+#   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh eureka
 
+# --- Mode selection ---
+MODE="${1:-vlm}"
+if [ "${MODE}" != "vlm" ] && [ "${MODE}" != "eureka" ]; then
+    echo "Usage: bash outer_loop_full.sh [vlm|eureka]"
+    echo "  vlm    : VLM+LLM mode (default)"
+    echo "  eureka : LLM-only mode (no VLM)"
+    exit 1
+fi
+
+# --- Configuration ---
 seeds=(9351) # 4796 1788
 OUTER_ITERS=5
 WSEED=42
 GPUS="0,1,0,1"
-CROSS_RESUME=0  # Set to 1 to auto-resume from vlm_full's iter 0
-LOG_DIR="logs/eureka_full_$(date +%Y%m%d_%H%M%S)"
+CROSS_RESUME=0  # Set to 1 to auto-resume from counterpart's iter 0
+
+if [ "${MODE}" == "eureka" ]; then
+    EUREKA_ARG="--eureka_mode"
+    EXP_PREFIX="ppo-eureka-full"
+    MODE_LABEL="Eureka Full Replacement (NO VLM)"
+    WANDB_TAG="eureka-full"
+else
+    EUREKA_ARG=""
+    EXP_PREFIX="ppo-vlm-full"
+    MODE_LABEL="VLM+LLM Full Replacement"
+    WANDB_TAG="vlm-full"
+fi
+
+LOG_DIR="logs/${MODE}_full_$(date +%Y%m%d_%H%M%S)"
 
 if [ -z "${OPENAI_API_KEY}" ]; then
     echo "ERROR: OPENAI_API_KEY is not set."
@@ -46,20 +68,21 @@ fi
 
 mkdir -p "${LOG_DIR}"
 
-echo "=== PPO Outer Loop: Eureka Full Replacement Mode (NO VLM) ==="
+echo "=== PPO Outer Loop: ${MODE_LABEL} ==="
 echo "Parallelization: K-candidate parallel (--gpus=${GPUS})"
 echo "Outer iterations: ${OUTER_ITERS}"
 echo "Weight seed: ${WSEED}"
 echo "Seeds: ${seeds[@]}"
 echo "GPUs: ${GPUS}"
+echo "Cross-resume: ${CROSS_RESUME}"
 echo "Logs: ${LOG_DIR}"
 echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "OpenCabinetDoor-v1" # "PickCube-v1" # "PushCube-v1" # "OpenCabinetDrawer-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
+    for ENV in "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" "PegInsertionSide-v1" "PushT-v1" # "PickCube-v1"
     do
-        # Hyperparameters per task — IDENTICAL to outer_loop_vlm_full.sh
+        # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
         # TOTAL timesteps kept the same as before for quick outer-loop iteration.
         # Batch size ratios between tasks are preserved from baselines.sh.
@@ -78,7 +101,7 @@ for seed in "${seeds[@]}"; do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
         if [ "${ENV}" == "PushCube-v1" ] || [ "${ENV}" == "PickCube-v1" ]; then
-            TOTAL=3_000_000 #3_000_000          # Baseline: 50M
+            TOTAL=3_000_000          # Baseline: 50M
             EVAL_STEPS=50
             NUM_ENVS=256             # Baseline: 4096
             NUM_STEPS=100            # Baseline: 4  (batch: 256*100=25,600  1x)
@@ -92,7 +115,7 @@ for seed in "${seeds[@]}"; do
             GAMMA_ARG="--gamma=0.97"
             GAE_LAMBDA_ARG="--gae_lambda=0.95"
         elif [ "${ENV}" == "OpenCabinetDoor-v1" ] || [ "${ENV}" == "OpenCabinetDrawer-v1" ]; then
-            TOTAL=6_000_000          # Baseline: 50M
+            TOTAL=12_000_000          # Baseline: 50M
             EVAL_STEPS=100
             NUM_ENVS=256             # Baseline: 1024
             NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
@@ -150,10 +173,10 @@ for seed in "${seeds[@]}"; do
           --gpus="${GPUS}" \
           ${GAMMA_ARG} \
           ${GAE_LAMBDA_ARG} \
-          --eureka_mode \
+          ${EUREKA_ARG} \
           --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
           --track \
-          --exp-name="ppo-eureka-full-${ENV}-${seed}" \
+          --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \
           2>&1 | tee "${log_file}"
         rc=${PIPESTATUS[0]}
@@ -168,10 +191,10 @@ echo "========================================="
 if [ $any_failed -ne 0 ]; then
     echo "=== WARNING: Some experiments FAILED ==="
 else
-    echo "=== All Eureka full replacement experiments complete ==="
+    echo "=== All ${MODE_LABEL} experiments complete ==="
 fi
 echo "Seeds run: ${seeds[@]}"
 echo "Logs: ${LOG_DIR}"
-echo "Check wandb for results (group: PPO-OuterLoop, tags: eureka-full)"
+echo "Check wandb for results (group: PPO-OuterLoop, tags: ${WANDB_TAG})"
 echo "========================================="
 exit $any_failed

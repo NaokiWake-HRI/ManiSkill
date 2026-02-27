@@ -185,14 +185,18 @@ def plot_summary(run_dir: Path, out_path: Path | None = None):
 
         # Plot best candidate thick
         if step_start is not None:
+            _iter_label = f"Iter {i+1} (cand {best_cand_id})"
+            if entry.get("resumed_from"):
+                _src_type = entry["resumed_from"].get("source_experiment_type", "?")
+                _iter_label += f" [from {_src_type}]"
             plotted = _plot_candidate_tb(
                 ax, run_dir, best_cand_id, step_start, step_end, metric,
                 color=base_color, linewidth=1.8, alpha=0.8,
-                label=f"Iter {i+1} (cand {best_cand_id})")
+                label=_iter_label)
             if not plotted:
                 lc = bc.get("learning_curve", [])
                 _plot_candidate_lc(ax, lc, color=base_color, linewidth=2,
-                                   alpha=0.8, label=f"Iter {i+1} (cand {best_cand_id})")
+                                   alpha=0.8, label=_iter_label)
 
     # --- Current iter: all fresh candidates (thin), best (thick) ---
     if current_is_new and fresh_results:

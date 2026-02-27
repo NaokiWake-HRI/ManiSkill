@@ -18,11 +18,17 @@
 #
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_vlm_full.sh
+#
+# Cross-experiment resume (share iter 0 from eureka_full):
+#   Add --resume_dir and --resume_first_iter_only to reuse eureka_full's
+#   iter 0 result as the starting point, then diverge with VLM from iter 1.
+#   See the --resume_first_iter_only block in the python call below (commented out).
 
 seeds=(9351) # 4796 1788
-OUTER_ITERS=10
+OUTER_ITERS=5
 WSEED=42
 GPUS="0,1,0,1"
+CROSS_RESUME=0  # Set to 1 to auto-resume from eureka_full's iter 0
 LOG_DIR="logs/vlm_full_$(date +%Y%m%d_%H%M%S)"
 
 if [ -z "${OPENAI_API_KEY}" ]; then
@@ -44,7 +50,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "OpenCabinetDrawer-v1" # "OpenCabinetDoor-v1" # "PickCube-v1" # "PushCube-v1" # "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" #"PegInsertionSide-v1" "PushT-v1"
+    for ENV in  "AnymalC-Reach-v1" # "PegInsertionSide-v1" "PushT-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1"
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
@@ -64,8 +70,14 @@ for seed in "${seeds[@]}"; do
         UPDATE_EPOCHS=""
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
-        if [ "${ENV}" == "PushCube-v1" ] || [ "${ENV}" == "PickCube-v1" ]; then
+        if [ "${ENV}" == "PushCube-v1" ]; then
             TOTAL=3_000_000 #3_000_000          # Baseline: 50M
+            EVAL_STEPS=50
+            NUM_ENVS=256             # Baseline: 4096
+            NUM_STEPS=100            # Baseline: 4  (batch: 256*100=25,600  1x)
+            UPDATE_EPOCHS=8
+        elif [ "${ENV}" == "PickCube-v1" ]; then
+            TOTAL=3_000_000          # Baseline: 50M
             EVAL_STEPS=50
             NUM_ENVS=256             # Baseline: 4096
             NUM_STEPS=100            # Baseline: 4  (batch: 256*100=25,600  1x)
@@ -98,7 +110,7 @@ for seed in "${seeds[@]}"; do
             NUM_STEPS=100            # Baseline: 32 (batch: 512*100=51,200  2x)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "AnymalC-Reach-v1" ]; then
-            TOTAL=6_000_000          # Baseline: 50M
+            TOTAL=12_000_000          # Baseline: 50M
             EVAL_STEPS=200
             NUM_ENVS=512             # Baseline: 4096
             NUM_STEPS=200            # Baseline: 16 (batch: 512*200=102,400 4x)
@@ -114,6 +126,11 @@ for seed in "${seeds[@]}"; do
         fi
 
         log_file="${LOG_DIR}/seed_${seed}_${ENV}.log"
+        CROSS_RESUME_ARG=""
+        if [ "${CROSS_RESUME}" -eq 1 ]; then
+            CROSS_RESUME_ARG="--resume_from_counterpart"
+        fi
+
         echo "=== ${ENV} seed=${seed} NUM_ENVS=${NUM_ENVS} ==="
         python -u ppo_outer_loop_full.py \
           --env_id="${ENV}" \
@@ -135,6 +152,7 @@ for seed in "${seeds[@]}"; do
           --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
           --track \
           --exp-name="ppo-vlm-full-${ENV}-${seed}" \
+          ${CROSS_RESUME_ARG} \
           2>&1 | tee "${log_file}"
         rc=${PIPESTATUS[0]}
         if [ $rc -ne 0 ]; then

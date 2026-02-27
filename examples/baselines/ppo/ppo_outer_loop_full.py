@@ -141,6 +141,10 @@ class Args:
     """seed for random weight generation"""
     resume_dir: Optional[str] = None
     """path to a previous run directory to resume from (e.g., runs/outer-loop_full/PushCube-v1/...). Creates a new branched directory; original is not modified."""
+    resume_first_iter_only: bool = False
+    """when resuming, use only the first iteration (iter 0) from the source run. Useful for cross-experiment comparison: e.g., resume eureka_full iter 0 and continue with VLM, or vice versa."""
+    resume_from_counterpart: bool = False
+    """automatically find the counterpart experiment's latest run for this env_id and resume from its iter 0. eureka_mode searches outer-loop_full runs; non-eureka searches eureka_full runs."""
 
     # VLM/LLM arguments
     vlm_model: str = "gpt-5.2"
@@ -1150,6 +1154,30 @@ if __name__ == "__main__":
     experiment_type = "eureka_full" if args.eureka_mode else "outer-loop_full"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
 
+    # --- Auto-discover counterpart experiment's run directory ---
+    if args.resume_from_counterpart:
+        if args.resume_dir is not None:
+            raise ValueError("Cannot use both --resume_dir and --resume_from_counterpart")
+        # Determine counterpart experiment type
+        counterpart_type = "outer-loop_full" if args.eureka_mode else "eureka_full"
+        counterpart_base = Path("runs") / counterpart_type / args.env_id
+        if counterpart_base.exists():
+            # Find all run directories that have a completed outer_loop_history.json
+            _candidates = []
+            for _d in counterpart_base.iterdir():
+                if _d.is_dir() and (_d / "outer_loop_history.json").exists():
+                    _candidates.append(_d)
+            if _candidates:
+                # Pick the latest by modification time of outer_loop_history.json
+                _candidates.sort(key=lambda d: (d / "outer_loop_history.json").stat().st_mtime)
+                args.resume_dir = str(_candidates[-1])
+                args.resume_first_iter_only = True
+                print(f"[Auto-discover] Found counterpart run: {args.resume_dir}")
+            else:
+                print(f"[Auto-discover] No completed runs found in {counterpart_base}, starting fresh")
+        else:
+            print(f"[Auto-discover] Counterpart directory not found: {counterpart_base}, starting fresh")
+
     # --- Resume from previous run (creates a new branched directory) ---
     _resumed_history = None
     _resume_start_iter = 0
@@ -1168,6 +1196,22 @@ if __name__ == "__main__":
 
         with open(_hist_path) as f:
             _resumed_history = json.load(f)
+
+        # --resume_first_iter_only: keep only iter 0 from the source run.
+        # This enables cross-experiment comparison (e.g., eureka iter0 → vlm iter1+).
+        if args.resume_first_iter_only:
+            if len(_resumed_history) == 0:
+                raise ValueError("Source run has no completed iterations to resume from")
+            _resumed_history = [_resumed_history[0]]
+            # Tag the copied iteration with provenance metadata
+            _src_experiment_type = "eureka_full" if "eureka_full" in str(_src_dir) else "outer-loop_full"
+            _resumed_history[0]["resumed_from"] = {
+                "source_dir": str(_src_dir),
+                "source_experiment_type": _src_experiment_type,
+                "target_experiment_type": experiment_type,
+            }
+            print(f"[Resume] --resume_first_iter_only: using only iter 0 from source run ({_src_experiment_type})")
+
         _resume_start_iter = len(_resumed_history)
         _resume_global_step_offset = _resume_start_iter * args.total_timesteps_per_iter
 
@@ -1211,6 +1255,8 @@ if __name__ == "__main__":
 
         print(f"\n{'='*60}")
         print(f"RESUMING from: {_src_dir}")
+        if args.resume_first_iter_only:
+            print(f"  Mode: cross-experiment (first iter only)")
         print(f"  Previous iterations: {_resume_start_iter}")
         print(f"  Additional iterations: {args.num_outer_iters - _resume_start_iter}")
         print(f"  Total iterations: {args.num_outer_iters}")

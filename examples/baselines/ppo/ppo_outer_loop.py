@@ -23,9 +23,7 @@ Usage:
     python ppo_outer_loop.py --env_id PushCube-v1 --skip_vlm_llm --num_outer_iters=2 --total_timesteps_per_iter=50000
 """
 
-import base64
 import inspect
-import io
 import json
 import os
 import random as py_random
@@ -36,14 +34,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import cv2
 import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
-from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 # ManiSkill specific imports
@@ -53,7 +49,13 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
+from ppo_common import (
+    layer_init, Agent, Logger,
+    crop_tiled_frame, extract_frames_from_video, build_vlm_prompt,
+    generate_reward_plot_html, append_html_to_file, generate_random_weights,
+)
 from reward_wrapper import RewardWrapper, TASK_DEFAULTS, _resolve_task_id
+from task_descriptions import get_llm_task_descs
 
 
 @dataclass
@@ -149,255 +151,6 @@ class Args:
     batch_size: int = 0
     minibatch_size: int = 0
     num_iterations: int = 0
-
-
-# ============================================================================
-# Network
-# ============================================================================
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.orthogonal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
-    return layer
-
-
-class Agent(nn.Module):
-    def __init__(self, envs):
-        super().__init__()
-        obs_dim = np.array(envs.single_observation_space.shape).prod()
-        act_dim = np.prod(envs.single_action_space.shape)
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 1)),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, act_dim), std=0.01 * np.sqrt(2)),
-        )
-        self.actor_logstd = nn.Parameter(torch.ones(1, act_dim) * -0.5)
-
-    def get_value(self, x):
-        return self.critic(x)
-
-    def get_action(self, x, deterministic=False):
-        action_mean = self.actor_mean(x)
-        if deterministic:
-            return action_mean
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        return probs.sample()
-
-    def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        if action is None:
-            action = probs.sample()
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.critic(x)
-
-
-# ============================================================================
-# Logger
-# ============================================================================
-
-class Logger:
-    def __init__(self, log_wandb=False, tensorboard: SummaryWriter = None) -> None:
-        self.writer = tensorboard
-        self.log_wandb = log_wandb
-
-    def add_scalar(self, tag, scalar_value, step):
-        if self.log_wandb:
-            wandb.log({tag: scalar_value}, step=step)
-        self.writer.add_scalar(tag, scalar_value, step)
-
-    def close(self):
-        self.writer.close()
-
-
-# ============================================================================
-# Video / VLM utilities
-# ============================================================================
-
-def crop_tiled_frame(frame: np.ndarray, num_total_envs: int, num_show_envs: int) -> np.ndarray:
-    """Crop a tiled frame to show only the first num_show_envs environments."""
-    if num_show_envs >= num_total_envs:
-        return frame
-    h, w = frame.shape[:2]
-    nrows = int(np.sqrt(num_total_envs))
-    ncols = int(np.ceil(num_total_envs / nrows))
-    env_h = h // nrows
-    env_w = w // ncols
-    show_rows = int(np.ceil(np.sqrt(num_show_envs)))
-    show_cols = int(np.ceil(num_show_envs / show_rows))
-    return frame[:env_h * show_rows, :env_w * show_cols]
-
-
-def extract_frames_from_video(
-    video_path: Path,
-    max_frames: int = 8,
-    num_total_envs: int = 1,
-    num_show_envs: int = 1,
-) -> List[np.ndarray]:
-    """Extract evenly-sampled frames from MP4 video."""
-    cap = cv2.VideoCapture(str(video_path))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames == 0:
-        cap.release()
-        return []
-
-    if total_frames <= max_frames:
-        indices = list(range(total_frames))
-    else:
-        indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
-
-    frames = []
-    for idx in indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            if num_show_envs < num_total_envs:
-                frame = crop_tiled_frame(frame, num_total_envs, num_show_envs)
-            frames.append(frame)
-    cap.release()
-    return frames
-
-
-def build_vlm_prompt(env_id: str) -> str:
-    """Build a VLM prompt focused on failure analysis."""
-    return f"""Analyze this robot manipulation video for the task: {env_id}.
-
-Focus on FAILURE ANALYSIS:
-1. What is the robot currently doing? Describe the behavior you see.
-2. What is going WRONG? Be specific about failure modes:
-   - Is the robot failing to reach the target?
-   - Is it reaching but failing to grasp/push/open?
-   - Is it succeeding partially but then losing the object?
-   - Is it moving too fast, too slow, or in the wrong direction?
-3. What reward signal adjustments might help fix the observed failures?
-
-Be concise and specific. Focus on actionable observations.
-Do NOT provide a numerical score - focus on qualitative analysis.
-
-After your English analysis, provide a brief summary in Japanese (日本語での簡潔な要約も追加してください)."""
-
-
-def generate_reward_plot_html(
-    step_rewards: torch.Tensor,
-    num_envs: int,
-    breakdowns: Optional[List[Dict[str, float]]] = None,
-) -> str:
-    """Generate an HTML snippet with per-step reward plot from an eval rollout.
-
-    Args:
-        step_rewards: tensor of shape (num_eval_steps, num_envs)
-        num_envs: number of eval environments
-        breakdowns: list of dicts (one per timestep) with component means
-    Returns:
-        HTML string with base64-embedded PNG plot
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    rewards_np = step_rewards.cpu().numpy()  # (T, E)
-    T = rewards_np.shape[0]
-    timesteps = np.arange(T)
-
-    has_breakdowns = breakdowns and len(breakdowns) == T
-    fig, axes = plt.subplots(2 if has_breakdowns else 1, 1,
-                             figsize=(10, 7 if has_breakdowns else 4),
-                             sharex=True)
-    if not has_breakdowns:
-        axes = [axes]
-
-    # Top: total reward
-    ax = axes[0]
-    for e in range(min(num_envs, 8)):
-        ax.plot(timesteps, rewards_np[:, e], alpha=0.3, linewidth=0.8)
-    mean_r = rewards_np.mean(axis=1)
-    ax.plot(timesteps, mean_r, "k-", linewidth=2, label=f"mean (n={num_envs})")
-    ax.set_ylabel("Total Reward")
-    ax.set_title("Per-Step Reward During Eval Rollout")
-    ax.legend(loc="upper right")
-    ax.grid(True, alpha=0.3)
-
-    # Bottom: component breakdown
-    if has_breakdowns:
-        ax2 = axes[1]
-        component_keys = [k for k in breakdowns[0] if k != "norm_scale"]
-        for key in component_keys:
-            values = [bd.get(key, 0.0) for bd in breakdowns]
-            ax2.plot(timesteps, values, linewidth=1.5, label=key)
-        ax2.set_xlabel("Episode Timestep")
-        ax2.set_ylabel("Component (mean across envs)")
-        ax2.set_title("Reward Component Breakdown")
-        ax2.legend(loc="upper right")
-        ax2.grid(True, alpha=0.3)
-    else:
-        axes[0].set_xlabel("Episode Timestep")
-
-    fig.tight_layout()
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=120)
-    plt.close(fig)
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.read()).decode("utf-8")
-
-    return (
-        '<div style="margin-top:20px; border-top:1px solid #ccc; padding-top:10px;">'
-        '<h3>Per-Step Reward (Eval Rollout)</h3>'
-        f'<img src="data:image/png;base64,{img_b64}" style="max-width:100%;">'
-        '</div>'
-    )
-
-
-def append_html_to_file(file_path: Path, html_snippet: str):
-    """Append an HTML snippet before the closing </body> tag."""
-    content = file_path.read_text()
-    if "</body>" in content:
-        content = content.replace("</body>", html_snippet + "\n</body>")
-    else:
-        content += html_snippet
-    file_path.write_text(content)
-
-
-# ============================================================================
-# Random weight generation
-# ============================================================================
-
-def generate_random_weights(
-    env_id: str,
-    seed: int = 42,
-    w_min: float = 0.01,
-    w_max: float = 10.0,
-    ws_min: float = 0.1,
-    ws_max: float = 20.0,
-) -> Dict[str, float]:
-    """Generate random reward weights for a task."""
-    task_id = _resolve_task_id(env_id)
-    rng = py_random.Random(seed)
-    defaults = TASK_DEFAULTS[task_id]
-    weights = {}
-    for k in defaults:
-        if k == "w_success":
-            weights[k] = rng.uniform(ws_min, ws_max)
-        else:
-            weights[k] = rng.uniform(w_min, w_max)
-    return weights
 
 
 # ============================================================================
@@ -979,88 +732,7 @@ if __name__ == "__main__":
             if vlm_comment is not None or args.eureka_mode:
                 # Build task description for LLM (appears in prompt via llm_task_description)
                 task_id = _resolve_task_id(args.env_id)
-                _llm_task_descs = {
-                    "PushCube": (
-                        "The robot arm must push a cube to the goal position (PushCube).\n"
-                        "Reward components: w_reach (TCP approach to push position behind cube), "
-                        "w_push (cube movement toward goal, gated by reach), "
-                        "w_z_keep (keep cube on table surface), w_success (success bonus).\n\n"
-                        "日本語補足: ロボットアームがキューブを目標位置まで押すタスク。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PickCube": (
-                        f"The robot must pick up a cube and place it at the goal ({args.env_id}).\n"
-                        "Reward components: w_reach (TCP approach to cube), w_grasp (grasp success), "
-                        "w_place (cube toward goal, gated by grasp), "
-                        "w_static (robot static with object placed), w_success (success bonus).\n\n"
-                        "日本語補足: ロボットがキューブを掴んで目標位置に運ぶタスク。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "OpenCabinetDoor": (
-                        "The robot must open a cabinet door (OpenCabinetDoor).\n"
-                        "Reward components: w_reach (TCP to handle), w_open (door opening progress), "
-                        "w_static (maintain open state), w_success (success bonus).\n\n"
-                        "日本語補足: キャビネットのドアを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "OpenCabinetDrawer": (
-                        "The robot must open a cabinet drawer (OpenCabinetDrawer).\n"
-                        "Reward components: w_reach (TCP to handle), w_open (drawer opening progress), "
-                        "w_static (maintain open state), w_success (success bonus).\n\n"
-                        "日本語補足: キャビネットの引き出しを開けるタスク。回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PegInsertionSide": (
-                        "The robot must grasp a peg and insert it into a hole from the side (PegInsertionSide).\n"
-                        "This is a multi-stage task: reach the peg, grasp it, align with the hole, then insert.\n"
-                        "Reward components: w_reach (gripper approach to peg tail), "
-                        "w_grasp (binary grasp success), "
-                        "w_pre_insertion (peg-hole yz alignment, gated by grasp), "
-                        "w_insertion (peg head into hole, gated by grasp AND pre-insertion alignment), "
-                        "w_success (success bonus).\n\n"
-                        "日本語補足: ペグを掴んで横方向から穴に挿入するタスク。"
-                        "reach→grasp→alignment→insertionの段階的な報酬構造。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "PushT": (
-                        "The robot must push a T-shaped block to match the goal position and rotation (PushT).\n"
-                        "This is a 2D pushing task requiring both position and rotation alignment.\n"
-                        "Reward components: w_rotation (cos similarity of tee vs goal z-rotation, squared), "
-                        "w_position (tee-to-goal xy distance, tanh-shaped and squared), "
-                        "w_tcp_guide (encourage TCP to stay near the tee block), "
-                        "w_success (success bonus).\n\n"
-                        "日本語補足: T字ブロックを目標位置・回転に合わせるタスク。"
-                        "位置と回転の両方を合わせる必要がある。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "AnymalC": (
-                        "A quadruped robot (AnymalC) must walk to a goal position (AnymalC-Reach).\n"
-                        "The robot must maintain balance while locomoting toward the target.\n"
-                        "Reward components: w_reach (robot-to-goal distance, tanh-shaped), "
-                        "w_vel_z_penalty (penalize vertical velocity oscillation), "
-                        "w_ang_vel_penalty (penalize angular velocity in xy), "
-                        "w_contact_penalty (penalize undesired knee/body contacts with ground), "
-                        "w_qpos_penalty (penalize deviation from default standing pose).\n"
-                        "Note: reward has a base of +1.0 per step; fails (falls) give 0.\n\n"
-                        "日本語補足: 四脚ロボットが目標位置まで歩行するタスク。"
-                        "バランスを保ちながら移動する必要がある。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                    "UnitreeG1PlaceAppleInBowl": (
-                        "A humanoid robot (UnitreeG1) must pick up an apple and place it into a bowl "
-                        "(UnitreeG1PlaceAppleInBowl).\n"
-                        "Multi-stage: reach apple, grasp it, carry to above the bowl, then release.\n"
-                        "Reward components: w_reach (TCP-to-apple distance), "
-                        "w_grasp (binary grasp success), "
-                        "w_place (apple-to-bowl distance with +0.15m z-offset, gated by grasp), "
-                        "w_above_bowl (binary bonus when apple is within 0.025m of above-bowl target), "
-                        "w_release (encourage opening hand, gated by above_bowl), "
-                        "w_success (success bonus).\n"
-                        "Note: the bowl target has a +0.15m z-offset to encourage bringing the apple "
-                        "above the bowl before releasing.\n\n"
-                        "日本語補足: ヒューマノイドロボットがリンゴを掴んでボウルに入れるタスク。"
-                        "reach→grasp→carry→above_bowl→releaseの段階的な報酬構造。"
-                        "回答の末尾に日本語での簡潔な要約も追加してください。"
-                    ),
-                }
+                _llm_task_descs = get_llm_task_descs(args.env_id)
 
                 # Compute per-component reward means from final eval (Eureka-style)
                 reward_components = {}

@@ -90,47 +90,122 @@ python -m mani_skill.trajectory.replay_trajectory \
 
 This will use environment states to replay trajectories, turn on the ray-tracer (There is also "rt" which is higher quality but slower), and save all videos including failed trajectories.
 
-## PickCubePandaAllegro (Dexterous Hand)
+---
 
-Training PPO for the Panda + Allegro dexterous hand on PickCube.
+# Outer Loop Reward Optimization (Custom Extension)
 
-### Scripted Demo (Reference Trajectory Generation)
+Below is **not** part of upstream ManiSkill. It implements an Eureka-style
+([Ma et al., 2023](https://eureka-research.github.io/)) outer-loop reward
+optimization system that uses LLM (and optionally VLM) to iteratively improve
+reward functions for ManiSkill tasks.
 
-Scripted phase-based heuristic that generates approach -> descend -> grasp -> lift trajectories. Useful for producing demonstration data or verifying the environment.
+## Architecture
 
-```bash
-# Visualise:
-python -m mani_skill.examples.demo_scripted_pick_cube_allegro \
-    --render-mode human --shader rt-fast
+The system has **3 operating modes**, all sharing the same PPO training core:
 
-# Record HDF5 trajectories:
-python -m mani_skill.examples.demo_scripted_pick_cube_allegro \
-    --num-episodes 100 --record-dir demos/PickCubePandaAllegro-v1
-
-# Convert to coupled control mode for RL:
-python -m mani_skill.trajectory.replay_trajectory \
-    demos/PickCubePandaAllegro-v1/trajectory.h5 \
-    --save-traj -c pd_joint_delta_pos_coupled -o state
+```
+                         ┌──────────────────────────────────────────────────────┐
+                         │            Outer Loop (N iterations)                 │
+                         │                                                      │
+  ┌──────────┐  random   │  ┌───────────────┐   train K    ┌────────────────┐  │
+  │  Init    │──weights──►│  │ Generate K    │──candidates──►│  PPO Training  │  │
+  │  (Iter 0)│           │  │ Candidates    │  (parallel)  │  (per cand.)   │  │
+  └──────────┘           │  └───────┬───────┘              └───────┬────────┘  │
+                         │          │                              │            │
+                         │          │ LLM                  eval    │            │
+                         │          │                    metrics   │            │
+                         │  ┌───────┴───────┐              ┌──────┴─────────┐  │
+                         │  │  Reward       ◄──────────────│  Select Best   │  │
+                         │  │  Reflection   │  fitness     │  Candidate     │  │
+                         │  └───────┬───────┘              └───────┬────────┘  │
+                         │          │                              │            │
+                         │          │ (VLM mode only)      ┌──────┴─────────┐  │
+                         │          ◄──────────────────────│  VLM Video     │  │
+                         │                                 │  Analysis      │  │
+                         │                                 └────────────────┘  │
+                         └──────────────────────────────────────────────────────┘
 ```
 
-Key parameters in `mani_skill/examples/demo_scripted_pick_cube_allegro.py`:
+### 3 Modes
 
-| Parameter | Description |
-|---|---|
-| `GRASP_XY_OFFSET` | TCP XY offset from cube centre (negative X = toward robot base) |
-| `GRASP_Z_OFFSET` | TCP height above cube centre for grasping |
-| `APPROACH_Z_OFFSET` | Safe height above cube during approach |
-| `ARM_GAIN` | Proportional gain for position delta (lower = slower) |
+| Mode | Script | LLM Output | VLM | Description |
+|------|--------|-----------|-----|-------------|
+| **Params-only** | `ppo_outer_loop.py` | JSON weight dict | optional | LLM tunes `{w_reach: 1.5, w_grasp: 3.0, ...}` weights for a fixed reward template |
+| **Eureka-full** | `ppo_outer_loop_full.py --eureka_mode` | Python function | no | LLM generates entire `compute_reward()` function (Eureka paper style) |
+| **VLM-full** | `ppo_outer_loop_full.py` | Python function | yes | Same as Eureka-full, but VLM analyzes eval videos and feeds failure analysis to LLM |
 
-Control mode: `pd_ee_target_delta_pose` (22D: arm pos 3D + rot 3D + hand 16D absolute joint pos). Rotation delta is kept at zero to lock wrist orientation.
+**Key concepts:**
+- Each iteration trains **K candidates** (default 4) with different reward functions, then selects the best by `success_at_end` fitness
+- **Reward Reflection**: LLM receives per-component reward statistics and learning curves from the previous iteration to guide improvements
+- **Elite carry-over**: The best candidate from iteration N is carried into iteration N+1 as one of the K slots
+- Parallel training across multiple GPUs is supported (`--gpus="0,1,0,1"`)
 
-### PPO Training (Coupled Fingers)
+### Reward Wrappers
+
+| File | Used by | Description |
+|------|---------|-------------|
+| `reward_wrapper.py` | `ppo_outer_loop.py` | Fixed YAML-based template with tunable weights per component |
+| `reward_wrapper_dynamic.py` | `ppo_outer_loop_full.py` | Extends the above with `set_custom_function()` for LLM-generated Python code |
+
+Both use **weighted additive components** (e.g. `w_reach * reach_reward + w_grasp * grasp_reward + ...`) with `_norm_scale()` for magnitude stability. Environment `reward_mode="none"` is required.
+
+### Supported Tasks
+
+| Task | Components |
+|------|-----------|
+| PushCube-v1 | w_reach, w_push, w_z_keep, w_success |
+| PickCube-v1 | w_reach, w_grasp, w_place, w_static, w_success |
+| OpenCabinetDoor-v1 | w_reach, w_open, w_static, w_success |
+| OpenCabinetDrawer-v1 | w_reach, w_open, w_static, w_success |
+| PegInsertionSide-v1 | w_reach, w_grasp, w_pre_insertion, w_insertion, w_success |
+| PushT-v1 | w_rotation, w_position, w_tcp_guide, w_success |
+| AnymalC-Reach-v1 | w_reach, w_vel_z_penalty, w_ang_vel_penalty, w_contact_penalty, w_qpos_penalty |
+| UnitreeG1PlaceAppleInBowl-v1 | w_reach, w_grasp, w_place, w_above_bowl, w_release, w_success |
+| PickCubePandaAllegro-v2 | w_reach, w_grasp, w_place, w_static, w_success |
+
+## Quick Start
+
+Requires `OPENAI_API_KEY` (or compatible endpoint) for LLM/VLM.
 
 ```bash
-# Quick debug (see allegro_debug.sh):
+# Params-only (weight tuning, LLM-only or VLM+LLM):
+bash outer_loop_params.sh eureka   # LLM-only
+bash outer_loop_params.sh vlm      # VLM+LLM
+
+# Full replacement (reward function generation, LLM-only or VLM+LLM):
+bash outer_loop_full.sh eureka     # LLM-only
+bash outer_loop_full.sh vlm        # VLM+LLM
+```
+
+Manual single-task example:
+
+```bash
+export OPENAI_API_KEY=sk-...
+
+# Params-only mode:
+python ppo_outer_loop.py \
+  --env_id="PickCube-v1" --num_outer_iters=5
+
+# Eureka-full mode:
+python ppo_outer_loop_full.py \
+  --env_id="PickCube-v1" --eureka_mode \
+  --num_outer_iters=5 --num_reward_candidates=4
+
+# Debug (no LLM/VLM):
+python ppo_outer_loop.py \
+  --env_id="PickCube-v1" --skip_vlm_llm \
+  --num_outer_iters=2 --total_timesteps_per_iter=50000
+```
+
+## PickCubePandaAllegro (Dexterous Hand)
+
+Training PPO for the Panda + Allegro dexterous hand on PickCube. `coupled_allegro_wrapper.py` maps the 22D action space to 8D (6 arm EE delta + 2 hand scalars).
+
+```bash
+# Quick debug:
 bash allegro_debug.sh
 
-# Manually:
+# Full training:
 python ppo.py \
   --env_id="PickCubePandaAllegro-v1" \
   --control_mode="pd_joint_delta_pos_coupled" \
@@ -141,81 +216,63 @@ python ppo.py \
   --finite_horizon_gae --partial_reset
 ```
 
-Control mode `pd_joint_delta_pos_coupled` uses 15D action space: 7 arm joints + 4 index finger + 4 thumb (middle/ring fingers mirror index via `PDJointPosMimicController`).
-
-The environment uses a 6-stage dense reward: reaching + contact (opposing grasp) + lift (gated by contact) + place (gated by grasp) + static.
-
-### Touch Variant (FSR Tactile Sensors)
-
-```bash
-python ppo.py \
-  --env_id="PickCubePandaAllegroTouch-v1" \
-  --control_mode="pd_joint_delta_pos_coupled" \
-  --num_envs=4096 --num_steps=100 \
-  --total_timesteps=50_000_000
-```
-
-Same as above but with FSR tactile sensor observations and direction-aware contact reward.
-
 ## Iterative VLM/LLM Reward Tuning
 
-`ppo_iterative.py` splits training into segments and uses VLM (video analysis) + LLM for reward weight adjustment between segments.
+`ppo_iterative.py` splits a single training run into segments and adjusts reward weights between segments (without restarting from scratch). Lighter-weight than the outer loop but less thorough.
 
 ```bash
-# With VLM/LLM:
 export OPENAI_API_KEY=sk-... && python ppo_iterative.py \
-  --env_id="PickCubePandaAllegro-v1" \
-  --control_mode="pd_joint_delta_pos_coupled" \
-  --num_envs=256 --num_steps=100 \
+  --env_id="PickCube-v1" \
   --total_timesteps=10_000_000 --num_segments=10
-
-# Without VLM/LLM (reward wrapper only, for debugging):
-python ppo_iterative.py --env_id="PickCube-v1" \
-  --total_timesteps=10_000_000 --num_segments=10 --skip_vlm_llm
 ```
 
-See `baselines_iterative.sh` for full baseline commands.
-
-## Outer Loop Reward Optimization
-
-`ppo_outer_loop.py` runs full PPO training with fixed weights per iteration, then uses VLM/LLM to suggest new weights and restarts from scratch. Iteration 1 (random weights) serves as the baseline.
-
-```bash
-# VLM + LLM mode (default):
-export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py \
-  --env_id="PickCube-v1" --num_outer_iters=5
-
-# Eureka mode (LLM-only, learning curve data):
-export OPENAI_API_KEY=sk-... && python ppo_outer_loop.py \
-  --env_id="PickCube-v1" --eureka_mode
-
-# Debug (no VLM/LLM):
-python ppo_outer_loop.py --env_id="PickCube-v1" \
-  --skip_vlm_llm --num_outer_iters=2 --total_timesteps_per_iter=50000
-```
-
-See `outer_loop_run.sh` for multi-task experiment commands.
-
-### Reward Wrapper
-
-`reward_wrapper.py` provides a configurable `RewardWrapper` with per-component weights. Supported tasks: PickCube, PushCube, OpenCabinetDoor/Drawer. Use with `reward_mode="none"` and place before `ManiSkillVectorEnv`.
+---
 
 ## File Overview
 
+### ManiSkill Upstream
+
 | File | Description |
-|---|---|
-| `ppo.py` | Standard PPO (CleanRL-based, state-based) |
+|------|-------------|
+| `ppo.py` | Standard PPO baseline (CleanRL-based, state observations) |
 | `ppo_fast.py` | PPO with CUDA Graphs (requires torchrl/tensordict) |
 | `ppo_rgb.py` | PPO with RGB visual observations |
-| `ppo_iterative.py` | PPO + iterative VLM/LLM reward tuning (inner loop) |
-| `ppo_outer_loop.py` | PPO + outer-loop VLM/LLM reward optimization |
-| `reward_wrapper.py` | Configurable reward wrapper with tunable weights |
-| `generate_rollout_videos.py` | Generate videos from saved checkpoints |
-| `plot_outer_loop_iterations.py` | Plot outer-loop iteration results |
-| `allegro_debug.sh` | Allegro hand PPO training script |
 | `baselines.sh` | Standard PPO baseline commands |
-| `baselines_iterative.sh` | Iterative reward tuning baseline commands |
-| `outer_loop_run.sh` | Outer-loop multi-task experiment commands |
+| `examples.sh` | Full list of tested PPO commands for many tasks |
+| `README.md` | This file (upstream sections above + custom extension below) |
+
+### Outer Loop System
+
+| File | Description |
+|------|-------------|
+| `ppo_outer_loop.py` | Params-only outer loop (LLM tunes weight dicts) |
+| `ppo_outer_loop_full.py` | Eureka-full / VLM-full outer loop (LLM generates reward functions) |
+| `ppo_common.py` | Shared utilities: Agent network, Logger, video/VLM helpers, random weight generation |
+| `task_descriptions.py` | Per-task LLM prompt descriptions and state access documentation |
+| `reward_wrapper.py` | Fixed-template reward wrapper with tunable weights |
+| `reward_wrapper_dynamic.py` | Dynamic reward wrapper supporting LLM-generated Python code |
+| `env_contracts.py` | Environment setup validation (action dims, control modes) |
+| `coupled_allegro_wrapper.py` | Maps 22D PandaAllegro action space to 8D coupled control |
+| `ppo_iterative.py` | Iterative reward tuning (inner loop, no restart) |
+| `generate_rollout_videos.py` | Generate rollout videos from saved checkpoints |
+
+### Shell Scripts
+
+| File | Description |
+|------|-------------|
+| `outer_loop_params.sh` | Params-only mode (takes `vlm` or `eureka` argument) |
+| `outer_loop_full.sh` | Full replacement mode (takes `vlm` or `eureka` argument) |
+| `allegro_debug.sh` | PandaAllegro single-run debug script |
+| `iterative.sh` | Iterative reward tuning (in-place weight adjustment, no restart) |
+
+### Plotting (`plotting/`)
+
+| File | Description |
+|------|-------------|
+| `plot_all_tasks.py` | All-tasks summary: training curves + success vs iteration (`--mode` selects outer-loop/eureka/full) |
+| `plot_single_run.py` | Single-run progress monitor for full (multi-candidate) modes, works mid-run |
+| `plot_outer_loop_iterations.py` | Per-iteration overlay with arbitrary `--metric` (e.g. reward weights) |
+| `plot_method_comparison.py` | Compare outer-loop vs eureka across tasks |
 
 ## Some Notes
 

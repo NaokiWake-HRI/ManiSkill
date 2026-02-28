@@ -1,14 +1,15 @@
-"""Outer-loop full (VLM+LLM reward generation) summary plot. Works mid-run.
+"""Single-run summary plot for full (multi-candidate) modes. Works mid-run.
 
 Usage:
-    python plot_outer_loop_full_summary.py                          # latest PushCube run
-    python plot_outer_loop_full_summary.py --env PushCube-v1        # specific env
-    python plot_outer_loop_full_summary.py --run_dir runs/outer-loop_full/PushCube-v1/...  # specific run
+    python plot_single_run.py --mode outer-loop_full                          # latest PushCube run
+    python plot_single_run.py --mode eureka_full --env PushCube-v1            # specific env
+    python plot_single_run.py --mode outer-loop_full --run_dir runs/outer-loop_full/PushCube-v1/...
 """
 
 import argparse
 import json
 import glob
+import re
 from pathlib import Path
 
 import matplotlib
@@ -17,12 +18,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-OUTER_LOOP_DIR = Path(__file__).parent / "runs" / "outer-loop_full"
+RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
+
+MODE_DIRS = {
+    "outer-loop_full": RUNS_DIR / "outer-loop_full",
+    "eureka_full": RUNS_DIR / "eureka_full",
+}
+
+MODE_LABELS = {
+    "outer-loop_full": "Outer-Loop Full",
+    "eureka_full": "Eureka Full",
+}
 
 
-def latest_run(task: str) -> Path:
-    task_dir = OUTER_LOOP_DIR / task
-    runs = sorted(task_dir.iterdir(), key=lambda p: p.name)
+def _dir_creation_time(p: Path) -> str:
+    """Use the timestamp embedded in the directory name (last _YYYYMMDD_HHMMSS segment)."""
+    m = re.search(r"(\d{8}_\d{6})$", p.name)
+    return m.group(1) if m else p.name
+
+
+def latest_run(task: str, mode: str) -> Path:
+    task_dir = MODE_DIRS[mode] / task
+    if not task_dir.is_dir():
+        raise FileNotFoundError(f"No runs found for {task} in {task_dir}")
+    runs = sorted(task_dir.iterdir(), key=_dir_creation_time)
+    if not runs:
+        raise FileNotFoundError(f"No runs found for {task} in {task_dir}")
     return runs[-1]
 
 
@@ -63,11 +84,9 @@ def load_tb_scalar(tb_dir: str, tag: str):
 
 def detect_iter_ranges_from_lc(entry: dict):
     """Get step range for an iteration from learning_curve (works for both history entry and result JSON)."""
-    # History entry: best_candidate.learning_curve
     if "best_candidate" in entry:
         lc = entry["best_candidate"].get("learning_curve", [])
     else:
-        # Result JSON: learning_curve directly
         lc = entry.get("learning_curve", [])
     if not lc:
         return None, None
@@ -106,7 +125,7 @@ def _plot_candidate_lc(ax, lc, color, linewidth, alpha, label, marker="o-"):
             markersize=4, alpha=alpha, label=label)
 
 
-def plot_summary(run_dir: Path, out_path: Path | None = None):
+def plot_summary(run_dir: Path, mode: str, out_path: Path | None = None):
     run_dir = Path(run_dir)
     env_name = run_dir.parent.name
 
@@ -132,7 +151,6 @@ def plot_summary(run_dir: Path, out_path: Path | None = None):
         last_hist_start = 0
 
     # Filter current results: only keep those whose step range is BEYOND the last history entry
-    # (i.e., belongs to an iteration not yet recorded in history)
     fresh_results = []
     for cr in current_results:
         lc = cr.get("learning_curve", [])
@@ -169,7 +187,7 @@ def plot_summary(run_dir: Path, out_path: Path | None = None):
         for c in all_cands:
             cid = c["candidate_id"]
             if cid == best_cand_id:
-                continue  # plot best separately
+                continue
             c_step_start, c_step_end = None, None
             c_lc = c.get("learning_curve", [])
             if c_lc:
@@ -233,24 +251,33 @@ def plot_summary(run_dir: Path, out_path: Path | None = None):
         line.set_linewidth(3.0)
     ax.grid(True, alpha=0.3)
 
-    # === Right: success_once per outer iteration ===
+    # === Right: success_once & success_at_end per outer iteration ===
     ax2 = axes[1]
     iters_done = [e["outer_iter"] + 1 for e in history]
-    success_done = [e["best_candidate"]["eval_metrics"]["success_once"] for e in history]
+    success_once_done = [e["best_candidate"]["eval_metrics"]["success_once"] for e in history]
+    success_at_end_done = [e["best_candidate"]["eval_metrics"].get("success_at_end", None) for e in history]
+    has_success_at_end = any(v is not None for v in success_at_end_done)
 
-    # All candidates as scatter
+    # All candidates as scatter (success_at_end = pink squares)
     for entry in history:
         all_cands = entry.get("all_candidates", [])
         for c in all_cands:
             em = c.get("eval_metrics", {})
-            s = em.get("success_once", 0)
-            ax2.plot(entry["outer_iter"] + 1, s, "o", color="lightgray",
-                     markersize=6, alpha=0.6, zorder=1)
+            # s = em.get("success_once", 0)
+            # ax2.plot(entry["outer_iter"] + 1, s, "o", color="lightgray",
+            #          markersize=6, alpha=0.6, zorder=1)
+            sae = em.get("success_at_end")
+            if sae is not None:
+                ax2.plot(entry["outer_iter"] + 1, sae, "s", color="mistyrose",
+                         markersize=5, alpha=0.5, zorder=1)
 
-    # Best line
+    # Best lines
     if iters_done:
-        ax2.plot(iters_done, success_done, "o-", color="black", linewidth=2.5,
-                 markersize=8, label="Best candidate", zorder=3)
+        ax2.plot(iters_done, success_once_done, "o-", color="black", linewidth=2.5,
+                 markersize=8, label="success_once (best)", zorder=3)
+        if has_success_at_end:
+            ax2.plot(iters_done, success_at_end_done, "s--", color="tab:red", linewidth=2,
+                     markersize=7, label="success_at_end (best)", zorder=3)
 
     # Current iter candidates (fresh only)
     if current_is_new and fresh_results:
@@ -259,32 +286,41 @@ def plot_summary(run_dir: Path, out_path: Path | None = None):
             s = cr["eval_metrics"]["success_once"]
             ax2.plot(cur_iter, s, "o", color="lightblue", markersize=6,
                      alpha=0.7, zorder=1)
-        best_s = max(cr["eval_metrics"]["success_once"] for cr in fresh_results)
+        best_cr = max(fresh_results, key=lambda r: r["eval_metrics"]["success_once"])
+        best_s = best_cr["eval_metrics"]["success_once"]
         ax2.plot(cur_iter, best_s, "s", color="blue", markersize=10,
                  label=f"Iter {cur_iter}* (in-progress)", zorder=3)
+        best_sae = best_cr["eval_metrics"].get("success_at_end")
+        if best_sae is not None:
+            ax2.plot(cur_iter, best_sae, "s", color="tab:red", markersize=8,
+                     alpha=0.7, zorder=3)
 
     ax2.set_xlabel("Outer Iteration")
-    ax2.set_ylabel("success_once (best)")
+    ax2.set_ylabel("success (best)")
     ax2.set_ylim(-0.05, 1.05)
     ax2.set_title(f"{env_name}: Outer Loop Progress", fontweight="bold")
-    ax2.legend(loc="best")
+    ax2.legend(loc="best", fontsize=9)
     ax2.grid(True, alpha=0.3)
     max_iter = len(history) + (1 if current_is_new else 0)
     ax2.set_xticks(range(1, max_iter + 1))
 
-    fig.suptitle(f"Outer-Loop Full - {env_name} ({run_dir.name})",
+    mode_label = MODE_LABELS[mode]
+    fig.suptitle(f"{mode_label} - {env_name} ({run_dir.name})",
                  fontsize=12, fontweight="bold")
     plt.tight_layout()
 
     if out_path is None:
-        out_path = run_dir / "outer_loop_full_summary.png"
+        out_path = run_dir / f"{mode.replace('-', '_')}_summary.png"
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     print(f"Saved to {out_path}")
     plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Outer-loop full summary plot")
+    parser = argparse.ArgumentParser(description="Single-run summary plot (full/multi-candidate mode)")
+    parser.add_argument("--mode", type=str, required=True,
+                        choices=list(MODE_DIRS.keys()),
+                        help="Run mode: outer-loop_full or eureka_full")
     parser.add_argument("--env", type=str, default="PushCube-v1")
     parser.add_argument("--run_dir", type=str, default=None,
                         help="Specific run directory (overrides --env)")
@@ -294,10 +330,10 @@ def main():
     if args.run_dir:
         run_dir = Path(args.run_dir)
     else:
-        run_dir = latest_run(args.env)
+        run_dir = latest_run(args.env, args.mode)
         print(f"Latest run: {run_dir}")
 
-    plot_summary(run_dir, Path(args.out) if args.out else None)
+    plot_summary(run_dir, args.mode, Path(args.out) if args.out else None)
 
 
 if __name__ == "__main__":

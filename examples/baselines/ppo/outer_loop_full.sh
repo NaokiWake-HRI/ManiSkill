@@ -80,7 +80,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1" "AnymalC-Reach-v1" "PegInsertionSide-v1" "PushT-v1" # "PickCube-v1"
+    for ENV in "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1"#"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" # "PickCube-v1"
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
@@ -107,10 +107,10 @@ for seed in "${seeds[@]}"; do
             NUM_STEPS=100            # Baseline: 4  (batch: 256*100=25,600  1x)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "PegInsertionSide-v1" ]; then
-            TOTAL=24_000_000          # Baseline: 75M
+            TOTAL=75_000_000          # Baseline: 75M
             EVAL_STEPS=100
-            NUM_ENVS=1024            # Baseline: 2048
-            NUM_STEPS=64             # Baseline: 16 (batch: 1024*64=65,536  2x)
+            NUM_ENVS=2048            # Baseline: 2048
+            NUM_STEPS=16             # Baseline: 16 (batch: 2048*16=32,768)
             UPDATE_EPOCHS=8
             GAMMA_ARG="--gamma=0.97"
             GAE_LAMBDA_ARG="--gae_lambda=0.95"
@@ -121,17 +121,17 @@ for seed in "${seeds[@]}"; do
             NUM_STEPS=100            # Baseline: 16 (batch: 256*100=25,600  1x)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "PushT-v1" ]; then
-            TOTAL=24_000_000          # Baseline: 50M
+            TOTAL=50_000_000          # Baseline: 50M
             EVAL_STEPS=100
-            NUM_ENVS=1024            # Baseline: 4096
-            NUM_STEPS=128            # Baseline: 16 (batch: 1024*128=131,072  2x)
+            NUM_ENVS=4096            # Baseline: 4096
+            NUM_STEPS=16             # Baseline: 16 (batch: 4096*16=65,536)
             UPDATE_EPOCHS=8
             GAMMA_ARG="--gamma=0.99"
         elif [ "${ENV}" == "UnitreeG1PlaceAppleInBowl-v1" ]; then
-            TOTAL=12_000_000          # Baseline: 50M
+            TOTAL=50_000_000          # Baseline: 50M
             EVAL_STEPS=100
-            NUM_ENVS=512             # Baseline: 1024
-            NUM_STEPS=100            # Baseline: 32 (batch: 512*100=51,200  2x)
+            NUM_ENVS=1024            # Baseline: 1024
+            NUM_STEPS=32             # Baseline: 32 (batch: 1024*32=32,768)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "AnymalC-Reach-v1" ]; then
             TOTAL=6_000_000          # Baseline: 50M

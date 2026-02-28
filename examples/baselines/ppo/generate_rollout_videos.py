@@ -26,7 +26,7 @@ from mani_skill.utils.wrappers.flatten import FlattenActionSpaceWrapper
 from mani_skill.utils.wrappers.record import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
 
-from ppo_outer_loop import Agent
+from ppo_common import Agent
 from reward_wrapper import RewardWrapper
 
 

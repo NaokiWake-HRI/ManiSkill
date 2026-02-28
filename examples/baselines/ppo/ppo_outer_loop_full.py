@@ -1285,17 +1285,32 @@ if __name__ == "__main__":
                     hist_best = hist.get("best_candidate", {})
                     hist_eval = hist_best.get("eval_metrics", {})
                     rationale = hist_best.get("rationale", "No rationale provided")
+                    best_cand_id = hist_best.get("candidate_id", -1)
                     history_summary.append(
                         {
                             "iteration": hist.get("outer_iter", 0),
+                            "best_candidate_id": best_cand_id,
                             "changes": rationale,
                             "rationale": rationale,
                             "result": {
                                 "success_rate": hist_best.get("fitness", 0.0),
+                                "success_at_end": hist_best.get("fitness_success_at_end", hist_best.get("fitness", 0.0)),
+                                "success_once": hist_best.get("fitness_success_once", hist_eval.get("success_once", 0.0)),
                                 "avg_return": hist_eval.get("return", 0.0),
-                                "success_once": hist_eval.get("success_once", 0.0),
                                 "episode_len": hist_eval.get("episode_len", 0.0),
                             },
+                            "other_tried_ideas": [
+                                {
+                                    "candidate_id": cand.get("candidate_id", -1),
+                                    "rationale": cand.get("rationale", "N/A"),
+                                    "success_at_end": cand.get("fitness_success_at_end", cand.get("fitness", 0.0)),
+                                    "success_once": cand.get("fitness_success_once",
+                                                    cand.get("eval_metrics", {}).get("success_once", 0.0)),
+                                    "is_elite": cand.get("is_elite", False),
+                                }
+                                for cand in hist.get("all_candidates", [])
+                                if cand.get("candidate_id", -1) != best_cand_id
+                            ],
                         }
                     )
 
@@ -1308,7 +1323,7 @@ if __name__ == "__main__":
                         and hist_vlm_comment.strip() != "N/A"
                     ):
                         vlm_comments.append(
-                            f"Iter {hist.get('outer_iter', 0) + 1}: {hist_vlm_comment.strip()}"
+                            f"Iter {hist.get('outer_iter', 0) + 1} (about Best candidate's behavior): {hist_vlm_comment.strip()}"
                         )
 
                 training_summary["history_summary"] = history_summary

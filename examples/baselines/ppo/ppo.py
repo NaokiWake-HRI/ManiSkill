@@ -207,15 +207,12 @@ if __name__ == "__main__":
     if args.control_mode is not None:
         env_kwargs["control_mode"] = args.control_mode
     elif "PandaAllegro" in args.env_id:
-        env_kwargs["control_mode"] = "pd_ee_delta_pose"
+        env_kwargs["control_mode"] = "pd_joint_target_delta_pos_arm_abs_hand"
     else:
         env_kwargs["control_mode"] = "pd_joint_delta_pos"
     envs = gym.make(args.env_id, num_envs=args.num_envs if not args.evaluate else 1, reconfiguration_freq=args.reconfiguration_freq, **env_kwargs)
     eval_envs = gym.make(args.env_id, num_envs=args.num_eval_envs, reconfiguration_freq=args.eval_reconfiguration_freq, **env_kwargs)
-    if "PandaAllegro" in args.env_id:
-        envs = CoupledAllegroActionWrapper(envs)
-        eval_envs = CoupledAllegroActionWrapper(eval_envs)
-    elif isinstance(envs.action_space, gym.spaces.Dict):
+    if isinstance(envs.action_space, gym.spaces.Dict):
         envs = FlattenActionSpaceWrapper(envs)
         eval_envs = FlattenActionSpaceWrapper(eval_envs)
     validate_env_setup(args.env_id, env_kwargs["control_mode"], envs)

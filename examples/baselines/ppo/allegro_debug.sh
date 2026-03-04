@@ -1,11 +1,10 @@
 #!/bin/bash
-# PPO single-run debug for Panda+Allegro+TouchLab (PickCube v2, coupled fingers)
+# PPO single-run debug for Panda+Allegro+TouchLab (PickCube v2)
 #
 # Uses ppo.py directly (no outer loop / no Eureka).
-# CoupledAllegroActionWrapper reduces 22D -> 8D action space:
-#   [0:6] arm EE delta pose (pd_ee_delta_pose)
-#   [6]   finger group scalar [-1=open, 1=closed]
-#   [7]   thumb scalar [-1=open, 1=closed]
+# SimToolReal-style control: arm joint delta (7D) + hand absolute pos (16D) = 23D
+#   control_mode: pd_joint_target_delta_pos_arm_abs_hand
+#   sim_freq=120, control_freq=60 (matching SimToolReal's 60Hz control + 2 substeps)
 #
 # Usage:
 #   bash allegro_debug.sh
@@ -18,14 +17,14 @@ NUM_ENVS=4096        # TouchLab sensors need more GPU memory per env
 NUM_EVAL_ENVS=16
 
 # --- Rollout ---
-NUM_STEPS=100          # = max_episode_steps (full-episode rollouts)
-NUM_EVAL_STEPS=100
-TOTAL=50_000_000        # short run for debug; increase for real training
+NUM_STEPS=300          # = max_episode_steps (60Hz * 5s = 300 steps)
+NUM_EVAL_STEPS=300
+TOTAL=200_000_000      # increased for higher control freq + larger action space
 
 # --- PPO ---
 UPDATE_EPOCHS=8        # more gradient steps per rollout
-NUM_MINIBATCHES=32     # minibatch = 256*100/32 = 800
-GAMMA=0.95             # longer horizon for grasp→lift→place chain
+NUM_MINIBATCHES=32
+GAMMA=0.995            # match SimToolReal (longer horizon at 60Hz)
 GAE_LAMBDA=0.95
 ENT_COEF=0.01          # entropy bonus for exploration
 LR=3e-4

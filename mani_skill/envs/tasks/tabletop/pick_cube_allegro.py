@@ -263,16 +263,16 @@ class PickCubePandaAllegroTouchEnv(PickCubePandaAllegroEnv):
         super().__init__(*args, robot_uids="panda_allegro_touch", **kwargs)
 
 
-@register_env("PickCubePandaAllegro-v2", max_episode_steps=100)
+@register_env("PickCubePandaAllegro-v2", max_episode_steps=300)
 class PickCubePandaAllegroV2Env(BaseEnv):
     """PickCube with Panda + Allegro + TouchLab tactile sensors (4 fingertip patches).
 
-    Uses pd_ee_delta_pose control mode (6D arm EE delta + 16D hand absolute = 22D).
-    For RL, wrap with CoupledAllegroActionWrapper to get 8D action space
-    (6 arm EE + 2 hand scalars: finger group + thumb).
-
-    Success criteria: same as PickCube-v1 (cube at goal + robot static).
-    Reward: reach + grasp + place + static + success bonus.
+    SimToolReal-style control and reward:
+      - Arm: joint target delta pos (7D), Hand: absolute joint pos (16D) = 23D
+      - sim_freq=120, control_freq=60 (matching SimToolReal)
+      - Phase 1 (pre-lift): fingertip delta reward + lifting reward
+      - Phase 2 (post-lift): place delta reward + success bonus
+      - Action penalties: arm (0.03) >> hand (0.003)
     """
 
     SUPPORTED_ROBOTS = ["panda_allegro_touchlab"]
@@ -287,12 +287,14 @@ class PickCubePandaAllegroV2Env(BaseEnv):
                  robot_init_qpos_noise=0.02, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         if "control_mode" not in kwargs:
-            kwargs["control_mode"] = "pd_ee_delta_pose"
+            kwargs["control_mode"] = "pd_joint_target_delta_pos_arm_abs_hand"
         super().__init__(*args, robot_uids=robot_uids, **kwargs)
 
     @property
     def _default_sim_config(self):
         return SimConfig(
+            sim_freq=120,
+            control_freq=60,
             gpu_memory_config=GPUMemoryConfig(
                 max_rigid_contact_count=max(2**21, self.num_envs * 1024),
                 max_rigid_patch_count=max(2**21, self.num_envs * 128),
@@ -336,6 +338,17 @@ class PickCubePandaAllegroV2Env(BaseEnv):
         )
         self._hidden_objects.append(self.goal_site)
 
+    # --- SimToolReal-style reward parameters ---
+    fingertip_delta_rew_scale = 50.0
+    lifting_rew_scale = 20.0
+    lifting_bonus = 300.0
+    lifting_bonus_threshold = 0.15
+    place_rew_scale = 200.0
+    reach_goal_bonus = 1000.0
+    success_steps = 10
+    arm_actions_penalty_scale = 0.03
+    hand_actions_penalty_scale = 0.003
+
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
             b = len(env_idx)
@@ -362,6 +375,23 @@ class PickCubePandaAllegroV2Env(BaseEnv):
             goal_xyz[:, 1] += self.cube_spawn_center[1]
             goal_xyz[:, 2] = torch.rand((b)) * self.max_goal_height + xyz[:, 2]
             self.goal_site.set_pose(Pose.create_from_pq(goal_xyz))
+
+            # Initialize SimToolReal-style tracking states
+            n_envs = self.num_envs
+            n_tips = 4  # thumb, index, middle, ring
+            if not hasattr(self, "_closest_fingertip_dist"):
+                self._closest_fingertip_dist = torch.full((n_envs, n_tips), float("inf"), device=self.device)
+                self._lifted_object = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._near_goal_steps = torch.zeros(n_envs, dtype=torch.long, device=self.device)
+                self._object_init_z = torch.zeros(n_envs, device=self.device)
+                self._closest_obj_to_goal_dist = torch.full((n_envs,), float("inf"), device=self.device)
+            # Reset only the envs being initialized
+            # Use -1 as sentinel; first reward step will initialize to actual distance
+            self._closest_fingertip_dist[env_idx] = -1.0
+            self._lifted_object[env_idx] = False
+            self._near_goal_steps[env_idx] = 0
+            self._object_init_z[env_idx] = xyz[:, 2]
+            self._closest_obj_to_goal_dist[env_idx] = -1.0
 
     def _get_obs_extra(self, info: dict):
         obs = dict(
@@ -392,33 +422,97 @@ class PickCubePandaAllegroV2Env(BaseEnv):
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # Reach: tcp -> cube distance
-        tcp_to_obj_dist = torch.linalg.norm(
-            self.cube.pose.p - self.agent.tcp_pose.p, axis=1
+        # === Phase 1: Fingertip delta reward (before lifting) ===
+        # Per-finger distance to object center
+        tip_positions = torch.stack(
+            [link.pose.p for link in self.agent.tip_links], dim=1
+        )  # (n_envs, 4, 3)
+        tip_to_obj = tip_positions - self.cube.pose.p.unsqueeze(1)
+        curr_fingertip_dist = torch.linalg.norm(tip_to_obj, dim=-1)  # (n_envs, 4)
+
+        # On first step after reset, initialize closest to current (no free reward)
+        first_step_mask = self._closest_fingertip_dist[:, 0] < 0
+        self._closest_fingertip_dist[first_step_mask] = curr_fingertip_dist[first_step_mask]
+
+        # Delta = improvement from historical closest distance per finger
+        fingertip_deltas = self._closest_fingertip_dist - curr_fingertip_dist
+        self._closest_fingertip_dist = torch.minimum(
+            self._closest_fingertip_dist, curr_fingertip_dist
         )
-        reaching_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
-        reward = reaching_reward
+        # Only reward positive improvement, clip to prevent explosion
+        fingertip_deltas = torch.clamp(fingertip_deltas, 0, 10)
+        fingertip_delta_rew = fingertip_deltas.sum(dim=-1)  # sum across 4 fingers
+        # Disable after lifting
+        fingertip_delta_rew = fingertip_delta_rew * (~self._lifted_object)
+        fingertip_delta_rew = fingertip_delta_rew * self.fingertip_delta_rew_scale
 
-        # Grasp: binary (>=2 fingertips in contact)
-        is_grasped = info["is_grasped"]
-        reward += is_grasped
+        # === Phase 1: Lifting reward ===
+        cube_z = self.cube.pose.p[:, 2]
+        # +0.05 offset (from SimToolReal): gives small positive reward at rest,
+        # so the agent gets a gradient signal toward "up" from the start.
+        # Effective lift threshold = lifting_bonus_threshold - 0.05 = 0.10m actual rise.
+        z_lift = 0.05 + cube_z - self._object_init_z
+        lifting_rew = torch.clamp(z_lift, 0, 0.5)
 
-        # Place: cube -> goal (gated by grasp)
+        # Check if object crossed lifting threshold
+        lifted_object = (z_lift > self.lifting_bonus_threshold) | self._lifted_object
+        just_lifted = lifted_object & (~self._lifted_object)
+        lift_bonus_rew = self.lifting_bonus * just_lifted.float()
+
+        # Stop lifting reward once lifted
+        lifting_rew = lifting_rew * (~lifted_object)
+        lifting_rew = lifting_rew * self.lifting_rew_scale
+
+        # Update lifted state
+        self._lifted_object = lifted_object
+
+        # === Phase 2: Place reward (after lifting) ===
         obj_to_goal_dist = torch.linalg.norm(
             self.goal_site.pose.p - self.cube.pose.p, axis=1
         )
-        place_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
-        reward += place_reward * is_grasped
+        # Initialize closest distance on the step when object is first lifted
+        just_entered_phase2 = lifted_object & (self._closest_obj_to_goal_dist < 0)
+        self._closest_obj_to_goal_dist[just_entered_phase2] = obj_to_goal_dist[just_entered_phase2]
 
-        # Static: arm velocity penalty (gated by placed)
-        qvel = self.agent.robot.get_qvel()[..., :7]  # arm joints only
-        static_reward = 1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))
-        reward += static_reward * info["is_obj_placed"]
+        # Delta-based: reward for getting closer to goal
+        place_deltas = self._closest_obj_to_goal_dist - obj_to_goal_dist
+        # Only update closest distance AFTER lift (preserve Phase 2 improvement room)
+        lifted_mask = lifted_object
+        self._closest_obj_to_goal_dist[lifted_mask] = torch.minimum(
+            self._closest_obj_to_goal_dist[lifted_mask], obj_to_goal_dist[lifted_mask]
+        )
+        place_deltas = torch.clamp(place_deltas, 0, 100)
+        place_rew = place_deltas * lifted_object.float()
+        place_rew = place_rew * self.place_rew_scale
 
-        reward[info["success"]] = 5
+        # === Success bonus (distributed over success_steps) ===
+        near_goal = obj_to_goal_dist <= self.goal_thresh
+        is_robot_static = self.agent.is_static(0.2)
+        near_goal_and_static = near_goal & is_robot_static
+        # Consecutive near-goal tracking
+        self._near_goal_steps = (self._near_goal_steps + near_goal_and_static.long()) * near_goal_and_static.long()
+        bonus_rew = near_goal_and_static.float() * (self.reach_goal_bonus / self.success_steps)
+
+        # === Action penalties ===
+        qvel = self.agent.robot.get_qvel()
+        arm_penalty = -torch.sum(torch.abs(qvel[..., :7]), dim=-1) * self.arm_actions_penalty_scale
+        hand_penalty = -torch.sum(torch.abs(qvel[..., 7:23]), dim=-1) * self.hand_actions_penalty_scale
+
+        # === Total reward ===
+        reward = (
+            fingertip_delta_rew
+            + lifting_rew
+            + lift_bonus_rew
+            + place_rew
+            + bonus_rew
+            + arm_penalty
+            + hand_penalty
+        )
         return reward
 
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: dict
     ):
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 5
+        # SimToolReal-style delta rewards don't have a fixed max, so no normalization.
+        # Return raw dense reward directly.
+        return self.compute_dense_reward(obs=obs, action=action, info=info)

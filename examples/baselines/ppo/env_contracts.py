@@ -18,9 +18,9 @@ import gymnasium as gym
 # ──────────────────────────────────────────────────────────────
 ENV_CONTRACTS = {
     "PickCubePandaAllegro-v2": {
-        "control_mode": "pd_ee_delta_pose",
-        "raw_action_dim": 22,       # CombinedController: arm(6) + hand(16)
-        "wrapped_action_dim": 8,    # CoupledAllegroActionWrapper: arm(6) + scalars(2)
+        "control_mode": "pd_joint_target_delta_pos_arm_abs_hand",
+        "raw_action_dim": 23,       # CombinedController: arm(7) + hand(16)
+        "wrapped_action_dim": 23,   # No wrapper, full DOF control
     },
     # NOTE: v1 は RL 訓練パイプライン未対応（CoupledAllegroActionWrapper が
     # "PandaAllegro" substring match で適用されるため、v1 を ppo.py で走らせると

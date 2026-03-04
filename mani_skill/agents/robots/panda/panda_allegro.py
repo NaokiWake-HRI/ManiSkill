@@ -235,6 +235,17 @@ class PandaAllegro(BaseAgent):
         hand_pd_joint_target_delta_pos = deepcopy(hand_pd_joint_delta_pos)
         hand_pd_joint_target_delta_pos.use_target = True
 
+        # Hand absolute position with normalized action [-1, 1] -> joint limits
+        hand_pd_joint_pos_normalized = PDJointPosControllerConfig(
+            self.hand_joint_names,
+            lower=None,
+            upper=None,
+            stiffness=self.hand_stiffness,
+            damping=self.hand_damping,
+            force_limit=self.hand_force_limit,
+            normalize_action=True,
+        )
+
         controller_configs = dict(
             pd_joint_delta_pos=dict(
                 arm=arm_pd_joint_delta_pos, hand=hand_pd_joint_delta_pos
@@ -260,6 +271,11 @@ class PandaAllegro(BaseAgent):
             pd_joint_vel=dict(arm=arm_pd_joint_vel, hand=hand_pd_joint_pos),
             pd_joint_delta_pos_coupled=dict(
                 arm=arm_pd_joint_delta_pos, hand=hand_pd_joint_delta_pos_coupled
+            ),
+            # Arm: joint target delta (like SimToolReal), Hand: absolute joint pos normalized [-1,1]
+            pd_joint_target_delta_pos_arm_abs_hand=dict(
+                arm=arm_pd_joint_target_delta_pos,
+                hand=hand_pd_joint_pos_normalized,
             ),
         )
 

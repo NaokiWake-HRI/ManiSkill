@@ -1145,6 +1145,11 @@ if __name__ == "__main__":
             _prev_best = outer_loop_history[-1]["best_candidate"]
             last_good_code = _prev_best.get("code")
         print(f"[Resume] Restored {len(outer_loop_history)} iterations, global_step_offset={global_step_offset}")
+        # Persist resumed history immediately so mid-run visualization can see it
+        _hist_save_path = f"runs/{run_dir}/outer_loop_history.json"
+        with open(_hist_save_path, "w") as f:
+            json.dump(outer_loop_history, f, indent=2, default=str)
+        print(f"[Resume] Saved resumed history to {_hist_save_path}")
 
     for outer_iter in range(_resume_start_iter, args.num_outer_iters):
         print(f"\n{'='*60}")

@@ -443,22 +443,33 @@ def plot_task_full(ax_left, ax_right, run_dir: Path, task_name: str,
 
     # Right panel: best candidate line + all candidates scatter
     iters = [e["outer_iter"] + 1 for e in history]
-    success = [_get_success_full(e) for e in history]
+    success_once = [_get_success_full(e) for e in history]
+    success_at_end = [e["best_candidate"]["eval_metrics"].get("success_at_end")
+                      for e in history]
+    has_success_at_end = any(v is not None for v in success_at_end)
 
+    # All candidates scatter (success_at_end as pink squares)
     for entry in history:
         it = entry["outer_iter"] + 1
         for cand in entry.get("all_candidates", []):
-            cs = cand.get("eval_metrics", {}).get("success_once", 0.0)
-            ax_right.plot(it, cs, "o", alpha=0.3, markersize=5,
-                          color="tab:cyan", zorder=0)
+            em = cand.get("eval_metrics", {})
+            sae = em.get("success_at_end")
+            if sae is not None:
+                ax_right.plot(it, sae, "s", color="mistyrose",
+                              markersize=5, alpha=0.5, zorder=1)
 
-    ax_right.plot(iters, success, "o-", color="black",
-                  linewidth=1.8, markersize=5, zorder=2)
+    # Best lines
+    ax_right.plot(iters, success_once, "o-", color="black",
+                  linewidth=1.8, markersize=5, label="success_once (best)", zorder=2)
+    if has_success_at_end:
+        ax_right.plot(iters, success_at_end, "s--", color="tab:red",
+                      linewidth=1.5, markersize=5, label="success_at_end (best)", zorder=2)
     ax_right.set_xticks(iters)
 
     ax_right.set_xlabel("Outer iteration")
-    ax_right.set_ylabel("success_once")
+    ax_right.set_ylabel("success (best)")
     ax_right.set_ylim(-0.05, 1.05)
+    ax_right.legend(loc="best", fontsize=8)
     ax_right.grid(True, alpha=0.3)
     ax_right.set_title(f"{task_name} (eval)", fontweight="bold")
 
@@ -535,35 +546,50 @@ def plot_task_full_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name
 
     # Right panel
     all_iters = []
-    all_success = []
+    all_success_once = []
+    all_success_at_end = []
     for history in all_histories:
         iters = [e["outer_iter"] + 1 for e in history]
-        success = [_get_success_full(e) for e in history]
+        success_once = [_get_success_full(e) for e in history]
+        success_at_end = [e["best_candidate"]["eval_metrics"].get("success_at_end")
+                          for e in history]
         all_iters.append(iters)
-        all_success.append(success)
+        all_success_once.append(success_once)
+        all_success_at_end.append(success_at_end)
 
         for entry in history:
             it = entry["outer_iter"] + 1
             for cand in entry.get("all_candidates", []):
-                cs = cand.get("eval_metrics", {}).get("success_once", 0.0)
-                ax_right.plot(it, cs, "o", alpha=0.15, markersize=4,
-                              color="tab:cyan", zorder=0)
+                em = cand.get("eval_metrics", {})
+                sae = em.get("success_at_end")
+                if sae is not None:
+                    ax_right.plot(it, sae, "s", alpha=0.1, markersize=3,
+                                  color="mistyrose", zorder=0)
+
+    has_sae = any(v is not None for vals in all_success_at_end for v in vals)
 
     if all_iters:
-        for iters, success in zip(all_iters, all_success):
-            ax_right.plot(iters, success, "o", alpha=0.5, markersize=6,
+        for iters, s_once in zip(all_iters, all_success_once):
+            ax_right.plot(iters, s_once, "o", alpha=0.5, markersize=6,
                           color="gray", zorder=1)
         iters_ref = all_iters[0]
-        success_array = np.array(all_success)
-        mean_success = np.mean(success_array, axis=0)
-        ax_right.plot(iters_ref, mean_success, "o-", color="black",
+        once_array = np.array(all_success_once)
+        mean_once = np.mean(once_array, axis=0)
+        ax_right.plot(iters_ref, mean_once, "o-", color="black",
                       linewidth=2.5, markersize=8,
-                      label=f"Mean (n={n_seeds})", zorder=2)
+                      label=f"success_once (n={n_seeds})", zorder=2)
+        if has_sae:
+            sae_array = np.array([[v if v is not None else np.nan for v in vals]
+                                  for vals in all_success_at_end])
+            mean_sae = np.nanmean(sae_array, axis=0)
+            ax_right.plot(iters_ref, mean_sae, "s--", color="tab:red",
+                          linewidth=2, markersize=7,
+                          label=f"success_at_end (n={n_seeds})", zorder=2)
         ax_right.set_xticks(iters_ref)
-        ax_right.legend(loc="best")
+        ax_right.legend(loc="best", fontsize=8)
 
     ax_right.set_xlabel("Outer iteration")
-    ax_right.set_ylabel("success_once")
+    ax_right.set_ylabel("success (best)")
     ax_right.set_ylim(-0.05, 1.05)
     ax_right.grid(True, alpha=0.3)
     ax_right.set_title(f"{task_name} (eval)", fontweight="bold")

@@ -1,8 +1,10 @@
-"""Compare outer-loop vs eureka: success_once vs outer iteration for 4 tasks.
+"""Compare outer-loop vs eureka: success_once vs outer iteration for tasks.
 
 Usage:
-    python plot_method_comparison.py                        # aggregate all available seeds
-    python plot_method_comparison.py --seeds 1788 4796 9351 # use specific seeds
+    python plot_method_comparison.py                              # standard mode, all seeds
+    python plot_method_comparison.py --mode full                  # full (multi-candidate) mode
+    python plot_method_comparison.py --seeds 1788 4796 9351       # use specific seeds
+    python plot_method_comparison.py --mode full --seeds 1788 4796 # full mode with specific seeds
 """
 
 import argparse
@@ -15,18 +17,34 @@ import numpy as np
 
 plt.rcParams.update({"font.size": 13})
 
-BASE_DIR = Path(__file__).parent / "runs"
+BASE_DIR = Path(__file__).resolve().parent.parent / "runs"
 
-METHODS = {
-    "outer-loop": {"label": "Outer-Loop", "color": "#e67e22", "marker": "o"},
+METHODS_STANDARD = {
     "eureka": {"label": "Eureka (LLM-only)", "color": "#1a5276", "marker": "s"},
+    "outer-loop": {"label": "Outer-Loop", "color": "#e67e22", "marker": "o"},
 }
 
-TASKS = [
+METHODS_FULL = {
+    "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
+    "outer-loop_full": {"label": "Outer-Loop Full", "color": "#e67e22", "marker": "o"},
+}
+
+TASKS_STANDARD = [
     "PushCube-v1",
     "PickCube-v1",
     "OpenCabinetDoor-v1",
     "OpenCabinetDrawer-v1",
+    "UnitreeG1PlaceAppleInBowl-v1",
+    "AnymalC-Reach-v1",
+]
+
+TASKS_FULL = [
+    "PushCube-v1",
+    "PickCube-v1",
+    "OpenCabinetDoor-v1",
+    "OpenCabinetDrawer-v1",
+    "PegInsertionSide-v1",
+    "PushT-v1",
     "UnitreeG1PlaceAppleInBowl-v1",
     "AnymalC-Reach-v1",
 ]
@@ -38,7 +56,9 @@ def _extract_timestamp(name: str) -> str:
 
 
 def _extract_seed(name: str) -> str | None:
-    m = re.search(r"-(\d+)-\S+-\d{8}_\d{6}$", name)
+    # Strip _resumeN_TIMESTAMP suffix if present (e.g. _resume1_20260302_185045)
+    stripped = re.sub(r"_resume\d+_\d{8}_\d{6}$", "", name)
+    m = re.search(r"-(\d+)-\S+-\d{8}_\d{6}$", stripped)
     return m.group(1) if m else None
 
 
@@ -53,32 +73,57 @@ def latest_run(method: str, task: str, seed: str) -> Path | None:
     return runs[-1]
 
 
-def load_success(run_dir: Path) -> list[float] | None:
+def load_success(run_dir: Path, is_full: bool) -> list[float] | None:
     history_path = run_dir / "outer_loop_history.json"
     if not history_path.exists():
         return None
     with open(history_path) as f:
         history = json.load(f)
-    return [e["success_once"] for e in history]
+    if is_full:
+        return [e["best_candidate"]["eval_metrics"].get("success_once", 0.0) for e in history]
+    else:
+        return [e["success_once"] for e in history]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Outer-loop vs Eureka comparison")
+    parser.add_argument("--mode", type=str, default="standard", choices=["standard", "full"],
+                        help="standard: single-candidate, full: multi-candidate")
     parser.add_argument("--seeds", nargs="+", type=str, default=["1788", "4796", "9351"])
     args = parser.parse_args()
 
+    is_full = args.mode == "full"
+    methods = METHODS_FULL if is_full else METHODS_STANDARD
+    tasks = TASKS_FULL if is_full else TASKS_STANDARD
     seeds = args.seeds
-    n_tasks = len(TASKS)
-    fig, axes = plt.subplots(1, n_tasks, figsize=(4.5 * n_tasks, 4), sharey=True)
 
-    for ax, task in zip(axes, TASKS):
-        for method, style in METHODS.items():
+    # Filter to tasks that have data for ALL methods
+    filtered_tasks = []
+    for task in tasks:
+        if all(any(latest_run(m, task, s) is not None for s in seeds) for m in methods):
+            filtered_tasks.append(task)
+        else:
+            missing = [m for m in methods if not any(latest_run(m, task, s) is not None for s in seeds)]
+            print(f"Skipping {task}: no data for {missing}")
+    tasks = filtered_tasks
+
+    n_tasks = len(tasks)
+    if n_tasks == 0:
+        print("No tasks with data for all methods.")
+        return
+    n_cols = 4
+    n_rows = (n_tasks + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4 * n_rows), sharey=True)
+    axes_flat = axes.flatten() if n_rows > 1 else axes
+
+    for ax, task in zip(axes_flat, tasks):
+        for method, style in methods.items():
             all_success = []
             for seed in seeds:
                 run_dir = latest_run(method, task, seed)
                 if run_dir is None:
                     continue
-                success = load_success(run_dir)
+                success = load_success(run_dir, is_full)
                 if success is not None:
                     all_success.append(success)
 
@@ -98,21 +143,29 @@ def main():
             mean = np.mean(arr, axis=0)
             ax.plot(iters, mean, f'{style["marker"]}-', color=style["color"],
                     linewidth=2.5, markersize=8,
-                    label=f'{style["label"]} (n={len(all_success)})', zorder=2)
+                    label=style["label"] if (is_full and len(all_success) == 1) else f'{style["label"]} (n={len(all_success)})', zorder=2)
 
         ax.set_xlabel("Outer iteration")
         ax.set_xticks(np.arange(1, 6))
         ax.set_ylim(-0.05, 1.05)
         ax.grid(True, alpha=0.3)
         ax.set_title(task, fontweight="bold")
-        ax.legend(loc="lower right", fontsize=10)
+        ax.legend(loc="upper left", fontsize=10)
 
-    axes[0].set_ylabel("success_once")
+    # Hide unused axes
+    for ax in axes_flat[n_tasks:]:
+        ax.set_visible(False)
 
-    fig.suptitle("Outer-Loop vs Eureka (LLM-only)", fontsize=15, fontweight="bold")
+    # y-label on leftmost column only
+    for row in range(n_rows):
+        axes_flat[row * n_cols].set_ylabel("success_once")
+
+    title = "Outer-Loop vs Eureka (LLM-only)" + (" [Full]" if is_full else "")
+    fig.suptitle(title, fontsize=15, fontweight="bold")
     plt.tight_layout()
 
-    out_path = BASE_DIR / "method_comparison.png"
+    out_filename = f"method_comparison{'_full' if is_full else ''}.png"
+    out_path = BASE_DIR / out_filename
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
     print(f"Saved to {out_path.resolve()}")
     plt.close()

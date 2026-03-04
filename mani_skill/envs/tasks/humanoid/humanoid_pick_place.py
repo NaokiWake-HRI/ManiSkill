@@ -246,7 +246,7 @@ class UnitreeG1PlaceAppleInBowlEnv(HumanoidPlaceAppleInBowl):
     def _default_sim_config(self):
         return SimConfig(
             gpu_memory_config=GPUMemoryConfig(
-                max_rigid_contact_count=2**22, max_rigid_patch_count=2**21, collision_stack_size=2**23
+                max_rigid_contact_count=2**22, max_rigid_patch_count=2**21, collision_stack_size=2**25
             ),
             # TODO (stao): G1 robot may need some custom collision disabling as the dextrous fingers may often be close to each other
             # and slow down simulation. A temporary fix is to reduce contact_offset value down so that we don't check so many possible

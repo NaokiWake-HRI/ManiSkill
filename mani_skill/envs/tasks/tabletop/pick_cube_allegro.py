@@ -263,7 +263,7 @@ class PickCubePandaAllegroTouchEnv(PickCubePandaAllegroEnv):
         super().__init__(*args, robot_uids="panda_allegro_touch", **kwargs)
 
 
-@register_env("PickCubePandaAllegro-v2", max_episode_steps=300)
+@register_env("PickCubePandaAllegro-v2", max_episode_steps=600)
 class PickCubePandaAllegroV2Env(BaseEnv):
     """PickCube with Panda + Allegro + TouchLab tactile sensors (4 fingertip patches).
 

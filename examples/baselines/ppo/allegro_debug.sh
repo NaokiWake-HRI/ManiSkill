@@ -6,29 +6,40 @@
 #   control_mode: pd_joint_target_delta_pos_arm_abs_hand
 #   sim_freq=120, control_freq=60 (matching SimToolReal's 60Hz control + 2 substeps)
 #
+# Hyperparameters aligned with SimToolReal (rl_games PPO):
+#   num_envs=8192, horizon=16, gamma=0.99, lr=1e-4, ent=0.0, clip=0.1
+#   reward_scale=0.01, vf_coef=4.0, grad_norm=1.0
+#   network=[1024,1024,512,512] ELU
+#
 # Usage:
 #   bash allegro_debug.sh
 
 seed=9351
 ENV="PickCubePandaAllegro-v2"
 
-# --- Parallelism ---
-NUM_ENVS=4096        # TouchLab sensors need more GPU memory per env
+# --- Parallelism (SimToolReal: 8192) ---
+NUM_ENVS=8192
 NUM_EVAL_ENVS=16
 
-# --- Rollout ---
-NUM_STEPS=300          # = max_episode_steps (60Hz * 5s = 300 steps)
-NUM_EVAL_STEPS=300
-TOTAL=200_000_000      # increased for higher control freq + larger action space
+# --- Rollout (SimToolReal: horizon=16, episode=600) ---
+NUM_STEPS=16               # short rollout, frequent PPO updates (SimToolReal: 16)
+NUM_EVAL_STEPS=600          # full episode for evaluation (60Hz * 10s = 600 steps)
+TOTAL=200_000_000
 
-# --- PPO ---
-UPDATE_EPOCHS=8        # more gradient steps per rollout
-NUM_MINIBATCHES=32
-GAMMA=0.995            # match SimToolReal (longer horizon at 60Hz)
-GAE_LAMBDA=0.95
-ENT_COEF=0.01          # entropy bonus for exploration
-LR=3e-4
-REWARD_SCALE=1.0
+# --- PPO (aligned with SimToolReal) ---
+UPDATE_EPOCHS=4             # SimToolReal: mini_epochs=4
+NUM_MINIBATCHES=4           # batch=8192*16=131072, minibatch=32768 (SimToolReal: 32768)
+GAMMA=0.99                  # SimToolReal: 0.99
+GAE_LAMBDA=0.95             # SimToolReal: 0.95
+ENT_COEF=0.0                # SimToolReal: 0.0
+LR=1e-4                     # SimToolReal: 1e-4
+CLIP_COEF=0.1               # SimToolReal: e_clip=0.1
+VF_COEF=4.0                 # SimToolReal: critic_coef=4.0
+MAX_GRAD_NORM=1.0           # SimToolReal: grad_norm=1.0
+REWARD_SCALE=0.01           # SimToolReal: reward_shaper scale=0.01
+
+# --- Network (SimToolReal: [1024,1024,512,512] ELU) ---
+ACTIVATION="elu"
 
 CUDA_VISIBLE_DEVICES=0 python ppo.py \
   --env_id="${ENV}" \
@@ -44,7 +55,12 @@ CUDA_VISIBLE_DEVICES=0 python ppo.py \
   --gae_lambda=${GAE_LAMBDA} \
   --ent_coef=${ENT_COEF} \
   --learning_rate=${LR} \
+  --clip_coef=${CLIP_COEF} \
+  --vf_coef=${VF_COEF} \
+  --max_grad_norm=${MAX_GRAD_NORM} \
   --reward_scale=${REWARD_SCALE} \
+  --hidden_sizes 1024 1024 512 512 \
+  --activation=${ACTIVATION} \
   --finite_horizon_gae \
   --partial_reset \
   --track \

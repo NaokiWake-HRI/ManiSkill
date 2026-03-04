@@ -107,6 +107,11 @@ class Args:
     """override the run directory under runs/ (e.g. 'debug')"""
     finite_horizon_gae: bool = False
 
+    # Network architecture
+    hidden_sizes: tuple = (256, 256, 256)
+    """hidden layer sizes for actor and critic networks"""
+    activation: str = "tanh"
+    """activation function: tanh or elu"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -122,27 +127,26 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+def _build_mlp(input_dim, hidden_sizes, output_dim, activation, output_std=np.sqrt(2)):
+    """Build an MLP with given hidden sizes and activation."""
+    act_cls = nn.ELU if activation == "elu" else nn.Tanh
+    layers = []
+    prev = input_dim
+    for h in hidden_sizes:
+        layers.append(layer_init(nn.Linear(prev, h)))
+        layers.append(act_cls())
+        prev = h
+    layers.append(layer_init(nn.Linear(prev, output_dim), std=output_std))
+    return nn.Sequential(*layers)
+
+
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, envs, hidden_sizes=(256, 256, 256), activation="tanh"):
         super().__init__()
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 1)),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, 256)),
-            nn.Tanh(),
-            layer_init(nn.Linear(256, np.prod(envs.single_action_space.shape)), std=0.01*np.sqrt(2)),
-        )
+        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        act_dim = np.prod(envs.single_action_space.shape)
+        self.critic = _build_mlp(obs_dim, hidden_sizes, 1, activation)
+        self.actor_mean = _build_mlp(obs_dim, hidden_sizes, act_dim, activation, output_std=0.01*np.sqrt(2))
         self.actor_logstd = nn.Parameter(torch.ones(1, np.prod(envs.single_action_space.shape)) * -0.5)
 
     def get_value(self, x):
@@ -257,7 +261,7 @@ if __name__ == "__main__":
     else:
         print("Running evaluation")
 
-    agent = Agent(envs).to(device)
+    agent = Agent(envs, hidden_sizes=args.hidden_sizes, activation=args.activation).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup

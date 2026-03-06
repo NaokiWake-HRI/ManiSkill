@@ -45,6 +45,8 @@ OUTER_ITERS=5
 WSEED=42
 GPUS="0,1,0,1"
 CROSS_RESUME=0  # Set to 1 to auto-resume from counterpart's iter 0
+EARLY_STOP_SUCCESS=0  # Set to 1 to stop when success_rate >= 1.0
+VLM_REWARD_PLOT=0     # Set to 1 to send per-step reward plot to VLM
 
 if [ "${MODE}" == "eureka" ]; then
     EUREKA_ARG="--eureka_mode"
@@ -80,7 +82,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
+    for ENV in "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
@@ -141,6 +143,18 @@ for seed in "${seeds[@]}"; do
             UPDATE_EPOCHS=8
             GAMMA_ARG="--gamma=0.99"
             GAE_LAMBDA_ARG="--gae_lambda=0.95"
+        elif [ "${ENV}" == "RotateValveLevel0-v1" ]; then
+            TOTAL=50_000_000         # Ref: TriFingerRotateCube 50M
+            EVAL_STEPS=80            # max_episode_steps=80
+            NUM_ENVS=128             # Dexterity tasks: smaller envs
+            NUM_STEPS=250            # Ref: TriFingerRotateCube 250
+            UPDATE_EPOCHS=8
+        elif [ "${ENV}" == "UnitreeG1TransportBox-v1" ]; then
+            TOTAL=100_000_000        # Baseline: 100M
+            EVAL_STEPS=100           # max_episode_steps=100
+            NUM_ENVS=1024            # Baseline: 1024
+            NUM_STEPS=32             # Baseline: 32 (batch: 1024*32=32,768)
+            UPDATE_EPOCHS=8
         else
             TOTAL=3_000_000
             EVAL_STEPS=50
@@ -153,6 +167,14 @@ for seed in "${seeds[@]}"; do
         CROSS_RESUME_ARG=""
         if [ "${CROSS_RESUME}" -eq 1 ]; then
             CROSS_RESUME_ARG="--resume_from_counterpart"
+        fi
+        EARLY_STOP_ARG=""
+        if [ "${EARLY_STOP_SUCCESS}" -eq 1 ]; then
+            EARLY_STOP_ARG="--early_stop_success"
+        fi
+        VLM_REWARD_PLOT_ARG=""
+        if [ "${VLM_REWARD_PLOT}" -eq 1 ]; then
+            VLM_REWARD_PLOT_ARG="--vlm_reward_plot"
         fi
 
         echo "=== ${ENV} seed=${seed} NUM_ENVS=${NUM_ENVS} ==="
@@ -178,6 +200,8 @@ for seed in "${seeds[@]}"; do
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \
+          ${EARLY_STOP_ARG} \
+          ${VLM_REWARD_PLOT_ARG} \
           2>&1 | tee "${log_file}"
         rc=${PIPESTATUS[0]}
         if [ $rc -ne 0 ]; then

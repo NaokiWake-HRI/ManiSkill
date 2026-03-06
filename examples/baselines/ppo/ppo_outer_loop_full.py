@@ -171,6 +171,8 @@ class Args:
     """number of reward function candidates to generate per iteration (K in Eureka paper)"""
     enable_reward_reflection: bool = True
     """enable Reward Reflection: analyze learning curves and provide feedback to LLM"""
+    early_stop_success: bool = False
+    """stop outer loop early when best candidate reaches success_at_end >= 1.0"""
 
     # Parallel K-candidate training
     gpus: Optional[str] = None
@@ -408,7 +410,7 @@ def _train_candidates_parallel(
 
                 try:
                     suggestions = llm.suggest_parameters(fix_summary)
-                except (ValueError, SyntaxError) as e:
+                except (ValueError, SyntaxError, TypeError) as e:
                     print(f"    LLM suggest_parameters failed: {e}")
                     continue
 
@@ -904,7 +906,12 @@ if __name__ == "__main__":
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.exp_name}-{args.env_id}-{timestamp}"
-    experiment_type = "eureka_full" if args.eureka_mode else "outer-loop_full"
+    if args.eureka_mode:
+        experiment_type = "eureka_full"
+    elif args.vlm_reward_plot:
+        experiment_type = "outer-loop_full_reward_plot"
+    else:
+        experiment_type = "outer-loop_full"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
 
     # --- Auto-discover counterpart experiment's run directory ---
@@ -912,7 +919,12 @@ if __name__ == "__main__":
         if args.resume_dir is not None:
             raise ValueError("Cannot use both --resume_dir and --resume_from_counterpart")
         # Determine counterpart experiment type
-        counterpart_type = "outer-loop_full" if args.eureka_mode else "eureka_full"
+        if args.eureka_mode:
+            counterpart_type = "outer-loop_full"
+        elif args.vlm_reward_plot:
+            counterpart_type = "outer-loop_full"
+        else:
+            counterpart_type = "eureka_full"
         counterpart_base = Path("runs") / counterpart_type / args.env_id
         if counterpart_base.exists():
             # Find all run directories that have a completed outer_loop_history.json
@@ -1319,17 +1331,22 @@ if __name__ == "__main__":
                         }
                     )
 
-                    hist_vlm_comment = hist_best.get("vlm_comment")
-                    if not hist_vlm_comment and "reflection_history" in hist:
-                        hist_vlm_comment = hist["reflection_history"].get("vlm_feedback")
-                    if (
-                        isinstance(hist_vlm_comment, str)
-                        and hist_vlm_comment.strip()
-                        and hist_vlm_comment.strip() != "N/A"
-                    ):
-                        vlm_comments.append(
-                            f"Iter {hist.get('outer_iter', 0) + 1} (about Best candidate's behavior): {hist_vlm_comment.strip()}"
-                        )
+                    # Only collect VLM comments when VLM is active in this run.
+                    # Without this guard, stale VLM comments from a resumed
+                    # VLM+LLM run leak into the Eureka (LLM-only) baseline prompt,
+                    # giving Eureka an unfair information advantage.
+                    if vlm is not None:
+                        hist_vlm_comment = hist_best.get("vlm_comment")
+                        if not hist_vlm_comment and "reflection_history" in hist:
+                            hist_vlm_comment = hist["reflection_history"].get("vlm_feedback")
+                        if (
+                            isinstance(hist_vlm_comment, str)
+                            and hist_vlm_comment.strip()
+                            and hist_vlm_comment.strip() != "N/A"
+                        ):
+                            vlm_comments.append(
+                                f"Iter {hist.get('outer_iter', 0) + 1} (about Best candidate's behavior): {hist_vlm_comment.strip()}"
+                            )
 
                 training_summary["history_summary"] = history_summary
                 training_summary["vlm_comments"] = vlm_comments[-5:]
@@ -1455,7 +1472,7 @@ if __name__ == "__main__":
 
                     try:
                         suggestions = llm.suggest_parameters(retry_summary, seed=None)
-                    except (ValueError, SyntaxError) as e:
+                    except (ValueError, SyntaxError, TypeError) as e:
                         print(f"    ✗ suggest_parameters failed (attempt {compile_attempt+1}): {e}")
                         retry_query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
                         retry_prompt = retry_query_info.get("prompt", "(no prompt)") if retry_query_info else "(no query info)"
@@ -1886,7 +1903,7 @@ if __name__ == "__main__":
                 "best_candidate": best,
                 "all_candidates": candidate_results,
                 "reward_statistics": best["reward_statistics"],
-                "vlm_feedback": best.get("vlm_comment", "N/A"),
+                "vlm_feedback": best.get("vlm_comment", "N/A") if vlm is not None else "N/A",
             }
             print(f"  Reflection data prepared (best fitness={best['fitness']:.4f})")
 
@@ -1906,6 +1923,15 @@ if __name__ == "__main__":
         history_path = f"runs/{run_dir}/outer_loop_history.json"
         with open(history_path, "w") as f:
             json.dump(outer_loop_history, f, indent=2, default=str)
+
+        # Early stop if success rate reached 1.0
+        if args.early_stop_success:
+            best_fitness = best.get("fitness_success_at_end", best["fitness"])
+            if best_fitness >= 1.0:
+                print(f"\n{'='*60}")
+                print(f"SUCCESS RATE reached {best_fitness:.4f} at iteration {outer_iter+1}. Early stopping.")
+                print(f"{'='*60}")
+                break
 
     # --- Save final results ---
     history_path = f"runs/{run_dir}/outer_loop_history.json"

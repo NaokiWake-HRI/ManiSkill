@@ -103,6 +103,34 @@ def get_llm_task_descs(env_id: str) -> dict:
             "指は2自由度（親指・対抗指の開閉）で制御。"
             "回答の末尾に日本語での簡潔な要約も追加してください。"
         ),
+        "RotateValve": (
+            "A three-fingered DClaw hand must rotate a valve by 90 degrees "
+            "(RotateValveLevel0).\n"
+            "The valve has 3 capsule-shaped heads. The DClaw has 3 fingertips that must "
+            "maintain contact with the valve tips while rotating.\n"
+            "Reward components: w_contact (fingertip-to-valve distance error), "
+            "w_velocity (directed angular velocity of valve rotation), "
+            "w_progress (cumulative rotation toward goal).\n"
+            "Note: No explicit success bonus — reward is continuous.\n\n"
+            "日本語補足: 3本指のDClawハンドでバルブを90度回転させるタスク。"
+            "指先をバルブ先端に接触させながら回転させる必要がある。"
+            "回答の末尾に日本語での簡潔な要約も追加してください。"
+        ),
+        "UnitreeG1TransportBox": (
+            "A humanoid robot (UnitreeG1 upper body) must grasp a box from one table "
+            "and transport it to a second table (UnitreeG1TransportBox).\n"
+            "This is a 4-stage task: (1) face the box, (2) grasp with both hands, "
+            "(3) turn and carry to the other table, (4) release the box.\n"
+            "Reward components: w_face_box (torso orientation toward table 1), "
+            "w_grasp (arms down + TCPs near box grasp points, gated by facing), "
+            "w_transport (turn toward table 2, gated by grasping), "
+            "w_release (raise arms to release, gated by box at target), "
+            "w_success (success bonus).\n"
+            "Success requires box resting on table 2 AND not being grasped.\n\n"
+            "日本語補足: ヒューマノイドが箱をテーブル1からテーブル2に運ぶタスク。"
+            "向き変え→両手把持→運搬→リリースの4段階。"
+            "回答の末尾に日本語での簡潔な要約も追加してください。"
+        ),
     }
 
 
@@ -340,6 +368,73 @@ Reward design guidelines:
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 - Use info["is_grasped"] to gate place rewards (only reward placing when grasped).
 - Only use arm joint velocities (first 7) for static penalty, not hand joints.
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+    "RotateValve": """
+Available state attributes (base = env.unwrapped):
+- base.agent.tip_poses: 3 fingertip poses, torch.Tensor (batch_size, 3, 7) [x,y,z,qw,qx,qy,qz]
+- base.valve.qpos: Valve joint position, torch.Tensor (batch_size, 1)
+- base.valve.qvel: Valve joint velocity, torch.Tensor (batch_size, 1)
+- base.valve_link.pose.p: Valve center position, torch.Tensor (batch_size, 3)
+- base.rest_qpos: Initial valve joint position, torch.Tensor (batch_size, 1)
+- base.rotate_direction: Target rotation direction (+1 or -1), torch.Tensor (batch_size,)
+- base.capsule_lens: Valve tip radius from center, torch.Tensor (batch_size,)
+- base.capsule_offset: Offset constant (0.01), float
+- base.success_threshold: Required rotation angle (pi/2 for Level0), float
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["valve_rotation"]: torch.Tensor (batch_size,) float (cumulative rotation from start)
+
+Success condition (from environment):
+- valve_rotation * rotate_direction > success_threshold (pi/2 = 90 degrees for Level0).
+- Max episode steps: 80 for Level0.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 6] range. No explicit success bonus (reward is continuous).
+- Fingertip contact: compute distance between 3 fingertip XY positions and valve center,
+  compare to desired distance (capsule_lens - capsule_offset).
+- Velocity: reward valve angular velocity in the correct direction.
+- Progress: reward cumulative rotation toward goal.
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+    "UnitreeG1TransportBox": """
+Available state attributes (base = env.unwrapped):
+- base.agent.robot.qpos: Robot joint positions, torch.Tensor (batch_size, n_joints)
+  - qpos[:, 0]: torso yaw (rotation around vertical axis)
+  - qpos[:, 3]: right shoulder pitch
+  - qpos[:, 4]: left shoulder pitch
+- base.agent.right_tcp.pose.p: Right hand TCP position, torch.Tensor (batch_size, 3)
+- base.agent.left_tcp.pose.p: Left hand TCP position, torch.Tensor (batch_size, 3)
+- base.box.pose.p: Box position, torch.Tensor (batch_size, 3)
+- base.box_right_grasp_point.p: Target grasp point for right hand, torch.Tensor (batch_size, 3)
+- base.box_left_grasp_point.p: Target grasp point for left hand, torch.Tensor (batch_size, 3)
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool (box on table 2 AND not grasped)
+- info["facing_table_with_box"]: torch.Tensor (batch_size,) bool (torso facing table 1)
+- info["box_grasped"]: torch.Tensor (batch_size,) bool (both hands contact box)
+- info["box_at_correct_table_xy"]: torch.Tensor (batch_size,) bool (box XY over table 2)
+- info["left_hand_hit_box"]: torch.Tensor (batch_size,) bool
+- info["right_hand_hit_box"]: torch.Tensor (batch_size,) bool
+
+Success condition (from environment):
+- Box resting on table 2 (Z in [0.750, 0.751], XY within table bounds) AND box NOT grasped.
+- Max episode steps: 100.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
+- 4-stage task: face box -> grasp -> transport -> release.
+- Each stage gates on the previous stage's success (use info dict booleans).
+- Torso yaw ~-1.4 rad faces table 1, ~+1.4 rad faces table 2.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:

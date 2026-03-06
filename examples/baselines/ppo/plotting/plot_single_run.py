@@ -163,10 +163,10 @@ def plot_summary(run_dir: Path, mode: str, out_path: Path | None = None):
     print(f"Current result JSONs: {len(current_results)} total, {len(fresh_results)} fresh (new_iter={current_is_new})")
 
     # --- Figure ---
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-    # === Left: Learning curves from tensorboard (dense) ===
-    ax = axes[0]
+    # === Top-Left: Learning curves from tensorboard (success_once) ===
+    ax = axes[0, 0]
     n_total = len(history) + (1 if current_is_new else 0)
     metric = "train/success_once"
 
@@ -245,63 +245,149 @@ def plot_summary(run_dir: Path, mode: str, out_path: Path | None = None):
     ax.set_xlabel("Step (within iteration)")
     ax.set_ylabel("success_once")
     ax.set_ylim(-0.05, 1.05)
-    ax.set_title(f"{env_name}: Learning Curves (bold=best, thin=others)", fontweight="bold")
+    ax.set_title(f"{env_name}: LC success_once (bold=best, thin=others)", fontweight="bold")
     leg = ax.legend(loc="lower right", fontsize=9)
     for line in leg.get_lines():
         line.set_linewidth(3.0)
     ax.grid(True, alpha=0.3)
 
-    # === Right: success_once & success_at_end per outer iteration ===
-    ax2 = axes[1]
+    # === Top-Right: Learning curves from tensorboard (success_at_end) ===
+    ax_sae = axes[0, 1]
+    metric_sae = "train/success_at_end"
+
+    for i, entry in enumerate(history):
+        bc = entry["best_candidate"]
+        best_cand_id = bc["candidate_id"]
+        step_start, step_end = detect_iter_ranges_from_lc(entry)
+
+        if i == 0:
+            base_color = (0.5, 0.5, 0.5)
+        else:
+            progress = (i - 1) / max(n_total - 2, 1)
+            base_color = plt.cm.coolwarm(progress)
+
+        all_cands = entry.get("all_candidates", [])
+        for c in all_cands:
+            cid = c["candidate_id"]
+            if cid == best_cand_id:
+                continue
+            c_lc = c.get("learning_curve", [])
+            if c_lc:
+                c_step_start = c_lc[0]["step"]
+                c_step_end = c_lc[-1]["step"]
+                _plot_candidate_tb(
+                    ax_sae, run_dir, cid, c_step_start, c_step_end, metric_sae,
+                    color=base_color, linewidth=0.6, alpha=0.25, label=None)
+
+        if step_start is not None:
+            _iter_label = f"Iter {i+1} (cand {best_cand_id})"
+            if entry.get("resumed_from"):
+                _src_type = entry["resumed_from"].get("source_experiment_type", "?")
+                _iter_label += f" [from {_src_type}]"
+            _plot_candidate_tb(
+                ax_sae, run_dir, best_cand_id, step_start, step_end, metric_sae,
+                color=base_color, linewidth=1.8, alpha=0.8, label=_iter_label)
+
+    if current_is_new and fresh_results:
+        best_current = max(fresh_results, key=lambda r: r["eval_metrics"]["success_once"])
+        best_cand_id = best_current["candidate_id"]
+        cur_iter_label = len(history) + 1
+        for cr in fresh_results:
+            cid = cr["candidate_id"]
+            lc = cr.get("learning_curve", [])
+            if not lc:
+                continue
+            step_start = lc[0]["step"]
+            step_end = lc[-1]["step"]
+            is_best = (cid == best_cand_id)
+            lw = 1.8 if is_best else 0.6
+            alpha = 0.9 if is_best else 0.3
+            label = f"Iter {cur_iter_label}* (cand {cid})" if is_best else None
+            _plot_candidate_tb(
+                ax_sae, run_dir, cid, step_start, step_end, metric_sae,
+                color="blue", linewidth=lw, alpha=alpha, label=label)
+
+    ax_sae.set_xlabel("Step (within iteration)")
+    ax_sae.set_ylabel("success_at_end")
+    ax_sae.set_ylim(-0.05, 1.05)
+    ax_sae.set_title(f"{env_name}: LC success_at_end (bold=best, thin=others)", fontweight="bold")
+    leg_sae = ax_sae.legend(loc="lower right", fontsize=9)
+    for line in leg_sae.get_lines():
+        line.set_linewidth(3.0)
+    ax_sae.grid(True, alpha=0.3)
+
+    # === Common data for bottom panels ===
     iters_done = [e["outer_iter"] + 1 for e in history]
     success_once_done = [e["best_candidate"]["eval_metrics"]["success_once"] for e in history]
     success_at_end_done = [e["best_candidate"]["eval_metrics"].get("success_at_end", None) for e in history]
     has_success_at_end = any(v is not None for v in success_at_end_done)
+    max_iter = len(history) + (1 if current_is_new else 0)
 
-    # All candidates as scatter (success_at_end = pink squares)
+    # === Bottom-Left: success_once only (selected best_candidate + scatter) ===
+    ax_so = axes[1, 0]
+
     for entry in history:
         all_cands = entry.get("all_candidates", [])
         for c in all_cands:
             em = c.get("eval_metrics", {})
-            # s = em.get("success_once", 0)
-            # ax2.plot(entry["outer_iter"] + 1, s, "o", color="lightgray",
-            #          markersize=6, alpha=0.6, zorder=1)
+            s = em.get("success_once", 0)
+            ax_so.plot(entry["outer_iter"] + 1, s, "o", color="lightgray",
+                       markersize=6, alpha=0.6, zorder=1)
+
+    if iters_done:
+        ax_so.plot(iters_done, success_once_done, "o-", color="black", linewidth=2.5,
+                   markersize=8, zorder=3)
+
+    if current_is_new and fresh_results:
+        cur_iter = len(history) + 1
+        for cr in fresh_results:
+            s = cr["eval_metrics"]["success_once"]
+            ax_so.plot(cur_iter, s, "o", color="lightblue", markersize=6,
+                       alpha=0.7, zorder=1)
+        best_cr = max(fresh_results, key=lambda r: r["eval_metrics"]["success_once"])
+        ax_so.plot(cur_iter, best_cr["eval_metrics"]["success_once"], "s", color="blue",
+                   markersize=10, zorder=3)
+
+    ax_so.set_xlabel("Outer Iteration")
+    ax_so.set_ylabel("success_once (best)")
+    ax_so.set_ylim(-0.05, 1.05)
+    ax_so.set_title(f"{env_name}: Outer Loop - success_once", fontweight="bold")
+    ax_so.grid(True, alpha=0.3)
+    ax_so.set_xticks(range(1, max_iter + 1))
+
+    # === Bottom-Right: success_at_end only (selected best_candidate + scatter) ===
+    ax2 = axes[1, 1]
+
+    for entry in history:
+        all_cands = entry.get("all_candidates", [])
+        for c in all_cands:
+            em = c.get("eval_metrics", {})
             sae = em.get("success_at_end")
             if sae is not None:
                 ax2.plot(entry["outer_iter"] + 1, sae, "s", color="mistyrose",
                          markersize=5, alpha=0.5, zorder=1)
 
-    # Best lines
-    if iters_done:
-        ax2.plot(iters_done, success_once_done, "o-", color="black", linewidth=2.5,
-                 markersize=8, label="success_once (best)", zorder=3)
-        if has_success_at_end:
-            ax2.plot(iters_done, success_at_end_done, "s--", color="tab:red", linewidth=2,
-                     markersize=7, label="success_at_end (best)", zorder=3)
+    if iters_done and has_success_at_end:
+        ax2.plot(iters_done, success_at_end_done, "s-", color="tab:red", linewidth=2.5,
+                 markersize=8, zorder=3)
 
-    # Current iter candidates (fresh only)
     if current_is_new and fresh_results:
         cur_iter = len(history) + 1
-        for cr in fresh_results:
-            s = cr["eval_metrics"]["success_once"]
-            ax2.plot(cur_iter, s, "o", color="lightblue", markersize=6,
-                     alpha=0.7, zorder=1)
         best_cr = max(fresh_results, key=lambda r: r["eval_metrics"]["success_once"])
-        best_s = best_cr["eval_metrics"]["success_once"]
-        ax2.plot(cur_iter, best_s, "s", color="blue", markersize=10,
-                 label=f"Iter {cur_iter}* (in-progress)", zorder=3)
         best_sae = best_cr["eval_metrics"].get("success_at_end")
+        for cr in fresh_results:
+            sae = cr["eval_metrics"].get("success_at_end")
+            if sae is not None:
+                ax2.plot(cur_iter, sae, "s", color="lightsalmon", markersize=6,
+                         alpha=0.7, zorder=1)
         if best_sae is not None:
-            ax2.plot(cur_iter, best_sae, "s", color="tab:red", markersize=8,
-                     alpha=0.7, zorder=3)
+            ax2.plot(cur_iter, best_sae, "s", color="tab:red", markersize=10, zorder=3)
 
     ax2.set_xlabel("Outer Iteration")
-    ax2.set_ylabel("success (best)")
+    ax2.set_ylabel("success_at_end (best)")
     ax2.set_ylim(-0.05, 1.05)
-    ax2.set_title(f"{env_name}: Outer Loop Progress", fontweight="bold")
-    ax2.legend(loc="best", fontsize=9)
+    ax2.set_title(f"{env_name}: Outer Loop - success_at_end", fontweight="bold")
     ax2.grid(True, alpha=0.3)
-    max_iter = len(history) + (1 if current_is_new else 0)
     ax2.set_xticks(range(1, max_iter + 1))
 
     mode_label = MODE_LABELS[mode]

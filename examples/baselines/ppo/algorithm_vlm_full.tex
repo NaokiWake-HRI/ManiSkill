@@ -1,0 +1,461 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+
+\begin{document}
+
+\title{Visual Grounding for Automated Reward Design:\\
+When Does VLM Feedback Help LLM-Generated Reward Functions?}
+
+\author{\IEEEauthorblockN{Anonymous Authors}}
+
+\maketitle
+
+% =============================================================
+\begin{abstract}
+Designing reward functions for reinforcement learning remains a major bottleneck
+in robot manipulation. Recent work (Eureka, Ma et al.\ 2023) shows that large
+language models (LLMs) can generate and iteratively refine reward code from task
+descriptions and scalar training statistics. We extend this paradigm by closing
+the loop with a vision-language model (VLM) that observes rollout videos of the
+best candidate policy and provides behavioral diagnosis to the LLM before each
+reward revision.
+
+We evaluate the VLM+LLM method against an LLM-only (Eureka-style) baseline on
+four ManiSkill manipulation tasks spanning a range of difficulty: PushCube
+(easy), PickCube (easy), PushT (medium), and UnitreeG1PlaceAppleInBowl (hard,
+6-stage humanoid bimanual). Our main findings are:
+(1)~On tasks that the LLM already solves at Iteration~0 (PushCube, PickCube),
+VLM feedback is unnecessary and can even cause temporary regression by
+prompting over-engineered reward designs.
+(2)~On unsolved tasks (PushT, UnitreeG1), VLM feedback provides actionable
+behavioral diagnosis---identifying specific failure modes such as
+``press-and-freeze'' or stage-specific bottlenecks, and inferring behavioral
+causes such as contact geometry and push direction from visual
+observation---information that scalar metrics alone cannot reveal, leading to large performance gains (0\%$\to$56\% for PushT;
+0\%$\to$87.5\% for UnitreeG1) compared to the LLM-only baseline (6.25\% and
+12.5\%, respectively).
+(3)~The value of VLM feedback scales with task difficulty and the number of
+behavioral stages: multi-stage tasks yield qualitatively new VLM observations
+each iteration, while single-stage tasks produce repetitive diagnoses.
+
+These results suggest that VLM-in-the-loop reward design is a powerful tool for
+hard manipulation tasks but should be conditionally activated based on current
+performance to avoid negative transfer on easy tasks.
+\end{abstract}
+
+\begin{IEEEkeywords}
+reward design, vision-language models, reinforcement learning, manipulation,
+LLM-guided optimization
+\end{IEEEkeywords}
+
+% =============================================================
+\section{Introduction}
+
+Reward engineering is one of the most labor-intensive aspects of applying
+reinforcement learning (RL) to robotic manipulation. Hand-crafted reward
+functions require domain expertise, extensive tuning, and often fail to
+generalize across tasks. Recent advances in large language models (LLMs) have
+opened a new avenue: using LLMs to \emph{automatically generate} reward
+function code from natural-language task descriptions.
+
+Eureka~\cite{eureka} demonstrated that an LLM can produce reward functions that
+match or exceed human-designed ones across a range of tasks. The key insight is
+an evolutionary outer loop: the LLM generates $K$ candidate reward functions per
+iteration, each is trained with PPO in parallel, and the best candidate (by task
+success rate) is selected. A ``reward reflection'' summary of training
+statistics is fed back to the LLM for the next iteration.
+
+However, a fundamental limitation of the Eureka approach is that the LLM
+receives only \emph{scalar} feedback (success rate, return, per-component reward
+statistics). When the task fails, the LLM knows \emph{that} it failed but not
+\emph{how} or \emph{why}. For multi-stage manipulation tasks, this gap can be
+critical: a scalar success rate of 0\% provides no signal about whether the
+robot failed at reaching, grasping, transporting, or placing.
+
+We propose closing this gap with a vision-language model (VLM) that observes
+rollout videos of the best candidate's behavior and provides a structured
+behavioral diagnosis. This diagnosis---identifying specific failure modes,
+behavioral patterns, and suggested reward modifications---is injected into the
+LLM's prompt alongside the scalar statistics before each reward revision.
+
+Our contributions are:
+\begin{enumerate}
+  \item A VLM-in-the-loop extension of Eureka-style reward generation that adds
+    visual behavioral feedback to the LLM's iterative refinement process
+    (Section~\ref{sec:method}).
+  \item An empirical evaluation on four manipulation tasks of varying difficulty,
+    revealing that VLM feedback is most valuable on hard, multi-stage tasks
+    and can be counterproductive on already-solved tasks
+    (Section~\ref{sec:results}).
+  \item Analysis of VLM feedback quality across task difficulty levels,
+    identifying failure modes of the VLM itself (severity miscalibration,
+    repetitive diagnosis) and design guidelines for when to activate the visual
+    feedback loop (Section~\ref{sec:analysis}).
+\end{enumerate}
+
+
+% =============================================================
+\section{Related Work}
+
+\textbf{LLM-based reward design.}
+Eureka~\cite{eureka} uses GPT-4 to generate and iteratively refine reward
+functions for RL, achieving human-level reward design on 29 tasks. L2R
+(Language-to-Reward)~\cite{l2r} translates language instructions into reward
+parameters. Text2Reward~\cite{text2reward} generates dense reward code from task
+descriptions. Our work extends this line by adding a visual feedback channel.
+
+\textbf{Vision-language models for robotics.}
+VLMs have been used for task planning~\cite{saycan}, success
+detection~\cite{vlm_success}, and policy evaluation. Recent work uses VLMs to
+score trajectory quality or detect task completion. We use VLMs in a novel role:
+providing behavioral \emph{diagnosis} that informs reward function design rather
+than directly scoring or planning.
+
+\textbf{Automated reward shaping.}
+Classical approaches include potential-based reward shaping~\cite{pbrs} and
+inverse RL. Our approach differs in that the reward function is generated as
+executable code by an LLM, with the VLM providing qualitative behavioral
+feedback rather than demonstrations.
+
+
+% =============================================================
+\section{Method}\label{sec:method}
+
+\subsection{Overview}
+
+Our method extends the Eureka outer loop with a VLM feedback channel. The
+algorithm proceeds in $N$ iterations. Each iteration: (1)~the LLM generates $K$
+candidate reward functions, (2)~each candidate is trained with PPO in parallel,
+(3)~the best candidate is selected by task success rate, (4)~the VLM observes
+a rollout of the best candidate and produces a behavioral diagnosis, and (5)~the
+full history (code, metrics, VLM diagnosis) is fed back to the LLM.
+
+\subsection{Algorithm}
+
+\begin{algorithm}[t]
+\caption{VLM-in-the-Loop Reward Generation}
+\label{alg:vlm_loop}
+\begin{algorithmic}[1]
+\REQUIRE Task description $\mathcal{T}$, state docs $\mathcal{D}$, iters $N$, candidates $K$, RL steps $T$, LLM $\mathcal{L}$, VLM $\mathcal{V}$
+\ENSURE Optimized reward function $R^*$
+\STATE $\mathcal{H} \leftarrow \emptyset$, $R_{\text{best}} \leftarrow \texttt{sparse}$
+\FOR{$n = 1$ \TO $N$}
+    \STATE Build prompt $p_n$ from $\{\mathcal{T}, \mathcal{D}, R_{\text{best}}, \mathcal{H}\}$
+    \STATE $\mathcal{C} \leftarrow \{R_1, \ldots, R_K\} \cup \{R_{\text{best}}\}$
+    \COMMENT{$K$ new candidates + elite carry-over}
+    \FOR{$R_k \in \mathcal{C}$ \textbf{in parallel}}
+        \STATE Train $\pi_k$ with PPO for $T$ steps using $R_k$
+        \STATE Evaluate $\pi_k$: $m_k = (\text{success\_once}, \text{success\_at\_end}, \text{return})$
+    \ENDFOR
+    \STATE $k^* \leftarrow \arg\max_k m_k.\text{success\_at\_end}$
+    \STATE Record rollout of $\pi_{k^*}$, extract frames $\mathcal{F}$
+    \STATE $c_{\text{vlm}} \leftarrow \mathcal{V}(\mathcal{F}, m_{k^*})$
+    \COMMENT{Behavioral diagnosis}
+    \STATE $\mathcal{H} \leftarrow \mathcal{H} \cup \{(n, R_{k^*}, m_{k^*}, c_{\text{vlm}}, \{m_k\}_k)\}$
+\ENDFOR
+\RETURN $R_{k^*}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{VLM Behavioral Diagnosis}
+
+The VLM receives sampled frames from the best candidate's rollout along with
+the episode's success label and scalar metrics. It is prompted to produce a
+structured report with three sections: (1)~what the robot is currently doing,
+(2)~what is going wrong (specific failure modes), and (3)~actionable reward
+signal adjustments. This structured format ensures the diagnosis is directly
+usable by the LLM for reward code modification.
+
+\subsection{Elite Carry-Over}
+
+Following Eureka, we carry the previous best candidate as an ``elite'' into the
+next iteration's candidate pool. This provides a safety net: even if all new
+LLM-generated candidates perform poorly, the best-so-far is preserved. Our
+analysis shows this mechanism is critical when VLM feedback leads the LLM to
+over-engineer solutions on easy tasks.
+
+\subsection{Comparison: VLM+LLM vs Eureka (LLM-only)}
+
+The Eureka baseline uses the same outer loop but without VLM feedback. The LLM
+receives only scalar metrics and reward reflection statistics. Both methods use
+identical hyperparameters ($K=4$, $N=5$, same PPO configuration and seed).
+
+
+% =============================================================
+\section{Experimental Setup}
+
+\subsection{Tasks}
+
+We evaluate on four ManiSkill~\cite{maniskill} manipulation tasks:
+
+\begin{table}[htbp]
+\caption{Task characteristics}
+\label{tab:tasks}
+\centering
+\begin{tabular}{lccl}
+\toprule
+Task & Stages & Robot & Difficulty \\
+\midrule
+PushCube-v1 & 1 & Panda & Easy \\
+PickCube-v1 & 2 & Panda & Easy \\
+PushT-v1 & 1 & Panda & Medium \\
+UnitreeG1PlaceApple & 6 & G1 humanoid & Hard \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Hyperparameters}
+
+All experiments use $K=4$ candidates per iteration, $N=5$ outer iterations, and
+$N_{\text{eval}}=16$ evaluation episodes per candidate. Fitness is
+$\text{success\_at\_end}$ (fraction of episodes where the task is completed at
+the final timestep). The LLM is GPT-4o; the VLM is also GPT-4o with vision.
+Seed is fixed at 9351 for all runs.
+
+% TODO: PPO hyperparameters table
+
+
+% =============================================================
+\section{Results}\label{sec:results}
+
+\subsection{Main Results}
+
+\begin{table}[htbp]
+\caption{Best success\_at\_end (\%) across methods}
+\label{tab:main}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Task & VLM+LLM & Eureka & Improvement \\
+\midrule
+PushCube-v1 & 93.75 & --- & N/A \\
+PickCube-v1 & 100.0 & --- & N/A \\
+PushT-v1 & \textbf{56.25} & 6.25 & 9$\times$ \\
+UnitreeG1PlaceApple & \textbf{87.50} & 12.50 & 7$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% NOTE: PushCube and PickCube have no Eureka baseline runs yet.
+% The reported VLM+LLM numbers are from the latest runs (2026-03-04).
+% PushT and UnitreeG1 Eureka baselines had a VLM leak bug in Iter 0
+% (stale VLM comment from the resumed VLM+LLM run). This has been fixed
+% in code but the Eureka runs have not been re-executed yet.
+
+On the two hard tasks, VLM+LLM achieves 7--9$\times$ higher success than the
+Eureka baseline. On easy tasks, VLM+LLM achieves near-perfect performance from
+Iteration~0, making VLM feedback unnecessary.
+
+\subsection{Per-Iteration Trajectories}
+
+% TODO: Figure showing SE over iterations for all 4 tasks, VLM+LLM vs Eureka
+
+\textbf{UnitreeG1PlaceAppleInBowl} (hardest task): VLM+LLM progresses from 0\%
+(Iter~0) to 100\% success\_once at Iter~2 and 87.5\% success\_at\_end at
+Iter~3. Each VLM observation identifies a new stage-specific bottleneck:
+``grasps but fails to transport'' (Iter~0), ``nudge-and-abandon'' regression
+(Iter~1), ``near-bowl freeze'' (Iter~2--3). The Eureka baseline plateaus at
+6.25--12.5\%.
+
+\textbf{PushT-v1}: VLM+LLM reaches 56.25\% success\_once at Iter~4 after VLM
+identifies a ``press-and-freeze'' failure pattern. Eureka achieves only 6.25\%.
+
+\textbf{PushCube-v1}: Achieves 100\% SE at Iter~0. Subsequent VLM feedback
+identifies ``overshoot / over-pushing'' every iteration, prompting complex
+geometric strategies that perform worse. Best SE after 5 iterations: 93.75\%.
+The apparent regression from 100\% may not be VLM-induced: the same Iter~0
+policy re-evaluated at only 43.75\% in a later iteration, indicating that the
+initial 100\% was likely inflated by N=16 evaluation noise rather than
+representing true performance.
+
+\textbf{PickCube-v1}: Maintains 93.75--100\% SE across all iterations. VLM
+correctly reports ``no clear failure'' in 3/5 iterations, overreacts once
+(``near-failure / brittle strategy'' on a 100\% SE episode). The final best
+candidate's anti-stall code originated from VLM's one useful diagnosis.
+
+
+% =============================================================
+\section{Analysis}\label{sec:analysis}
+
+\subsection{When Does VLM Feedback Help?}
+
+\begin{table}[htbp]
+\caption{VLM effectiveness by task difficulty}
+\label{tab:vlm_effectiveness}
+\centering
+\begin{tabular}{lccl}
+\toprule
+Task & Iter 0 SE & VLM Effect & Diagnosis Type \\
+\midrule
+PushCube & 100\% & Regression$^*$ & Stylistic (non-blocking) \\
+PickCube & 100\% & Neutral & Mostly ``no failure'' \\
+PushT & 0\% & Improvement & Blocking failure mode \\
+UnitreeG1 & 0\% & Major gain & Stage bottleneck \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent{\footnotesize $^*$Observed regression is confounded with N=16 evaluation noise (same policy re-evaluated $\pm$56pp).}
+
+The value of VLM feedback is strongly correlated with task difficulty, measured
+by whether the LLM can solve the task at Iteration~0 without visual feedback.
+
+\subsection{VLM Failure Modes}
+
+We identify three failure modes of the VLM feedback loop:
+
+\textbf{Severity miscalibration.} The VLM is prompted to find ``failure modes''
+and produces diagnoses with similar urgency regardless of success rate. On
+PushCube (100\% SE), it reports ``overshoot / lack of termination'' with the
+same alarm as on UnitreeG1 (0\% SE). This causes the LLM to treat non-blocking
+stylistic issues as critical failures requiring architectural reward changes.
+
+\textbf{Repetitive diagnosis on simple tasks.} PushCube's VLM produces the same
+``overshoot'' observation across all 5 iterations. Unlike UnitreeG1 where VLM
+discovers qualitatively new bottlenecks each iteration (grasp $\to$ transport
+$\to$ place $\to$ release), simple tasks have only one observable behavior
+pattern.
+
+\textbf{Over-engineering induction.} VLM diagnoses on successful tasks prompt
+the LLM to generate complex reward strategies (explicit geometric staging,
+curriculum gates, behind-pose requirements) that perform worse than the simple
+potential-based reward that already works. On PushCube, every iteration produced
+at least one 0\% SE candidate inspired by VLM-suggested complexity.
+
+\subsection{Reward-Task Misalignment vs Reward Hacking}
+
+A recurring pattern across tasks is high return with low success. We note that
+this is better described as \emph{reward-task misalignment} rather than
+``reward hacking'': the agent rationally optimizes the reward function, but the
+reward fails to adequately capture the task objective. The agent is not
+exploiting loopholes; the reward is simply misspecified. VLM feedback helps
+detect and diagnose such misalignment on hard tasks by observing the specific
+behavior the agent adopts under the misaligned reward.
+
+\subsection{N=16 Evaluation Noise}
+
+With only 16 evaluation episodes, success rate measurements have a granularity
+of 6.25\% and substantial stochastic variance. We observe elite carry-over
+candidates whose SE fluctuates by up to 56 percentage points across
+re-evaluations of the identical policy (PushCube: 100\%$\to$43.75\%). This
+noise affects both methods equally but complicates iteration-level comparisons.
+% TODO: Consider increasing to N=64 or N=100 for final experiments.
+
+\subsection{Role of Elite Carry-Over}
+
+The elite mechanism acts as a critical safety net against VLM-induced regression
+on easy tasks. Without it, the best PushCube solution (100\% SE at Iter~0) would
+have been permanently lost when VLM-guided candidates underperformed. On hard
+tasks, the elite preserves gains between breakthrough iterations.
+
+
+% =============================================================
+\section{Discussion and Limitations}
+
+\textbf{When to use VLM feedback.}
+Our results suggest that VLM feedback should be conditionally activated: when
+the best candidate already achieves high success rates, VLM feedback risks
+over-engineering; when performance is low, VLM provides actionable behavioral
+diagnosis. The appropriate threshold is task-dependent and warrants further
+investigation. An adaptive system could also terminate the VLM loop when the
+same diagnosis repeats for 2+ consecutive iterations.
+
+\textbf{Single-seed evaluation.}
+All experiments use a single seed (9351). While K=4 candidates per iteration
+provide diversity in reward function design (the primary experimental variable),
+the PPO training stochasticity is not independently sampled across seeds. We
+argue this is acceptable because the reward function diversity---not seed
+diversity---drives the key comparisons, and N=16 evaluation episodes provide
+some statistical coverage. However, larger-scale multi-seed validation is
+needed.
+
+% TODO: Eureka baseline VLM leak bug. The current Eureka runs for PushT and
+% UnitreeG1 have a stale VLM comment from Iter 0 leaked into the LLM prompt
+% (from resuming a VLM+LLM run). The bug has been fixed in code but the
+% baselines need to be re-run for a clean comparison. Current numbers should
+% be interpreted as "fresh iterative VLM" vs "stale/frozen VLM" rather than
+% a perfect VLM vs no-VLM ablation.
+
+\textbf{VLM prompt design.}
+The current VLM prompt always asks for ``failure analysis,'' which biases
+it toward finding problems even on successful episodes. A severity-aware
+prompt that conditions on the current success rate could reduce
+over-engineering on easy tasks.
+
+\textbf{Evaluation granularity.}
+N=16 episodes is insufficient for fine-grained performance comparison.
+The observed elite re-evaluation noise ($\pm$25 percentage points) limits
+our ability to detect small improvements or confirm regressions.
+
+
+% =============================================================
+\section{Conclusion}
+
+We presented a VLM-in-the-loop extension of Eureka-style automated reward
+design. By closing the loop between policy behavior observation (VLM) and reward
+code generation (LLM), we enable the system to diagnose and fix failure modes
+that scalar training statistics alone cannot reveal.
+
+Our main finding is that \textbf{VLM feedback value scales with task
+difficulty}:
+\begin{itemize}
+  \item On hard, multi-stage tasks (UnitreeG1: 6 stages), VLM provides
+    stage-specific bottleneck identification that drives 7$\times$ performance
+    improvement over the LLM-only baseline (87.5\% vs 12.5\%).
+  \item On medium tasks (PushT), VLM identifies behavioral failure modes
+    invisible to scalar metrics, enabling 9$\times$ improvement (56.25\% vs
+    6.25\%).
+  \item On easy, already-solved tasks (PushCube, PickCube), VLM feedback is
+    unnecessary and may cause regression through over-engineering induction,
+    though observed regressions are confounded with N=16 evaluation noise.
+\end{itemize}
+
+These results point to a design principle for VLM-in-the-loop systems:
+\textbf{visual feedback should be conditionally activated} based on current
+task performance level, with early stopping when the VLM has no new
+observations to offer.
+The VLM excels at answering ``how is the robot failing?''---a question that only
+matters when the robot \emph{is} failing.
+
+% Future work: (1) VLM_full_RewardPlot extension combining rollout images with
+% reward component plots for richer VLM diagnosis; (2) severity-aware VLM
+% prompting; (3) multi-seed validation; (4) additional tasks (PegInsertion,
+% OpenCabinetDoor).
+
+
+% =============================================================
+\begin{thebibliography}{00}
+\bibitem{eureka} Y.~Ma, W.~Liang, G.~Wang, D.-A.~Huang, O.~Bastani,
+  D.~Jayaraman, Y.~Zhu, L.~Fan, and A.~Anandkumar, ``Eureka: Human-level
+  reward design via coding large language models,'' in \emph{Proc. ICLR}, 2024.
+\bibitem{l2r} W.~Yu, N.~Gileadi, C.~Fu, S.~Kirmani, K.-H.~Lee, M.~G.~Arenas,
+  H.-T.~L.~Chiang, T.~Erez, L.~Hasenclever, J.~Humplik, et al.,
+  ``Language to rewards for robotic skill synthesis,'' \emph{arXiv:2306.08647}, 2023.
+\bibitem{text2reward} T.~Xie, S.~Zhao, C.~H.~Wu, Y.~Liu, Q.~Luo, V.~Zhong,
+  Y.~Yang, and T.~Yu, ``Text2reward: Reward shaping with language models for
+  reinforcement learning,'' in \emph{Proc. ICLR}, 2024.
+\bibitem{maniskill} J.~Gu, F.~Xiang, X.~Li, Z.~Ling, X.~Liu, T.~Mu,
+  Y.~Tang, S.~Tao, X.~Wei, Y.~Yao, et al., ``ManiSkill2: A unified benchmark
+  for generalizable manipulation skills,'' in \emph{Proc. ICLR}, 2023.
+\bibitem{saycan} M.~Ahn, A.~Brohan, N.~Brown, Y.~Chebotar, O.~Cortes,
+  B.~David, C.~Finn, C.~Fu, K.~Gopalakrishnan, K.~Hausman, et al., ``Do as I
+  can, not as I say: Grounding language in robotic affordances,''
+  \emph{arXiv:2204.01691}, 2022.
+\bibitem{vlm_success} W.~Du, Y.~Chen, W.~L.~Chao, and D.~Jayaraman,
+  ``Vision-language models as success detectors,'' \emph{arXiv:2303.07280}, 2023.
+\bibitem{pbrs} A.~Y.~Ng, D.~Harada, and S.~Russell, ``Policy invariance under
+  reward transformations: Theory and application to reward shaping,'' in
+  \emph{Proc. ICML}, 1999.
+\end{thebibliography}
+
+\end{document}

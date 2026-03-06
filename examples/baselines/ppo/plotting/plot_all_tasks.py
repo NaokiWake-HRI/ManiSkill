@@ -149,7 +149,8 @@ def load_tb_scalar(run_dir: str, tag: str):
     events = ea.Scalars(tag)
     steps = np.array([e.step for e in events])
     values = np.array([e.value for e in events])
-    return steps, values
+    order = np.argsort(steps)
+    return steps[order], values[order]
 
 
 def load_history(run_dir: Path) -> list[dict]:
@@ -196,6 +197,21 @@ def _iter_step_range(history_entry: dict) -> tuple[int, int]:
     if not lc:
         return 0, 0
     return lc[0]["step"], lc[-1]["step"]
+
+
+def _best_cand_dir(run_dir: Path, history_entry: dict) -> Path:
+    """Return the cand_X directory for the best candidate of an iteration."""
+    cand_id = history_entry["best_candidate"]["candidate_id"]
+    return run_dir / f"cand_{cand_id}"
+
+
+def _load_tb_cached(cache: dict, cand_dir: Path, tag: str):
+    """Load TB scalar from cand_dir, using cache to avoid re-reading."""
+    key = str(cand_dir)
+    if key not in cache:
+        steps, values = load_tb_scalar(key, tag)
+        cache[key] = (steps, values)
+    return cache[key]
 
 
 def _get_success_full(entry: dict) -> float:
@@ -406,30 +422,36 @@ def plot_task_full(ax_left, ax_right, run_dir: Path, task_name: str,
     metric = "train/success_once"
 
     # Left panel: per-iteration training curves (best candidate, from TB)
-    tb_steps, tb_values = load_tb_scalar(str(run_dir), metric)
-    if tb_steps is None:
+    if iter_filter is not None:
+        plot_indices = [i for i in range(n_iters) if (i + 1) in iter_filter][::-1]
+    else:
+        plot_indices = list(range(n_iters))[::-1]
+
+    tb_cache = {}
+    has_any_curve = False
+    for i in plot_indices:
+        start, end = _iter_step_range(history[i])
+        if start == end == 0:
+            continue
+        cand_dir = _best_cand_dir(run_dir, history[i])
+        tb_steps, tb_values = _load_tb_cached(tb_cache, cand_dir, metric)
+        if tb_steps is None:
+            continue
+        ix, iv = extract_iteration(tb_steps, tb_values, start, end + 1)
+        if len(ix) == 0:
+            continue
+
+        color, alpha = _iter_color(i, n_iters)
+        if len(iv) > 1:
+            smoothed = rolling_mean(iv, window=50)
+            ax_left.plot(ix, smoothed, color=color, alpha=alpha,
+                         linewidth=1.8, label=f"Iter {i+1}")
+            has_any_curve = True
+
+    if not has_any_curve:
         ax_left.text(0.5, 0.5, f"No {metric}", ha="center", va="center",
                      transform=ax_left.transAxes)
     else:
-        if iter_filter is not None:
-            plot_indices = [i for i in range(n_iters) if (i + 1) in iter_filter][::-1]
-        else:
-            plot_indices = list(range(n_iters))[::-1]
-
-        for i in plot_indices:
-            start, end = _iter_step_range(history[i])
-            if start == end == 0:
-                continue
-            ix, iv = extract_iteration(tb_steps, tb_values, start, end + 1)
-            if len(ix) == 0:
-                continue
-
-            color, alpha = _iter_color(i, n_iters)
-            if len(iv) > 1:
-                smoothed = rolling_mean(iv, window=50)
-                ax_left.plot(ix, smoothed, color=color, alpha=alpha,
-                             linewidth=1.8, label=f"Iter {i+1}")
-
         ax_left.set_xlabel("Step (within iteration)")
         ax_left.set_ylabel("success_once")
         ax_left.set_xlim(0, None)
@@ -495,10 +517,6 @@ def plot_task_full_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name
         return
 
     metric = "train/success_once"
-    all_tb = []
-    for run_dir in run_dirs:
-        steps, values = load_tb_scalar(str(run_dir), metric)
-        all_tb.append((steps, values))
 
     # Left panel
     n_iters = len(all_histories[0])
@@ -507,13 +525,20 @@ def plot_task_full_aggregated(ax_left, ax_right, run_dirs: list[Path], task_name
     else:
         plot_indices = list(range(n_iters))[::-1]
 
+    # Per-run TB cache (keyed by cand_dir path)
+    tb_caches = [{} for _ in run_dirs]
+
     for i in plot_indices:
         seed_curves = []
-        for history, (tb_steps, tb_values) in zip(all_histories, all_tb):
-            if i >= len(history) or tb_steps is None:
+        for history, run_dir, tb_cache in zip(all_histories, run_dirs, tb_caches):
+            if i >= len(history):
                 continue
             start, end = _iter_step_range(history[i])
             if start == end == 0:
+                continue
+            cand_dir = _best_cand_dir(run_dir, history[i])
+            tb_steps, tb_values = _load_tb_cached(tb_cache, cand_dir, metric)
+            if tb_steps is None:
                 continue
             ix, iv = extract_iteration(tb_steps, tb_values, start, end + 1)
             if len(ix) > 0 and len(iv) > 1:

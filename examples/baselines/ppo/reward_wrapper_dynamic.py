@@ -81,6 +81,18 @@ TASK_DEFAULTS = {
         "w_static": 1.0,
         "w_success": 5.0,
     },
+    "RotateValve": {
+        "w_contact": 1.0,
+        "w_velocity": 4.0,
+        "w_progress": 1.0,
+    },
+    "UnitreeG1TransportBox": {
+        "w_face_box": 1.0,
+        "w_grasp": 1.0,
+        "w_transport": 1.0,
+        "w_release": 1.0,
+        "w_success": 5.0,
+    },
 }
 
 
@@ -144,6 +156,8 @@ class RewardWrapperDynamic(gym.Wrapper):
             "PegInsertionSide": self._compute_peg_insertion,
             "PushT": self._compute_push_t,
             "PickCubePandaAllegro": self._compute_pick_cube_allegro,
+            "RotateValve": self._compute_rotate_valve,
+            "UnitreeG1TransportBox": self._compute_transport_box,
         }[self.task_id]
 
         # Custom function mode (Eureka)
@@ -683,6 +697,106 @@ class RewardWrapperDynamic(gym.Wrapper):
             "rotation": (scale * w["w_rotation"] * rotation_r).mean().item(),
             "position": (scale * w["w_position"] * position_r).mean().item(),
             "tcp_guide": (scale * w["w_tcp_guide"] * tcp_guide_r).mean().item(),
+            "norm_scale": scale,
+        }
+        return reward
+
+    # --- RotateValve ---
+    def _compute_rotate_valve(self, info: dict) -> torch.Tensor:
+        base = self.env.unwrapped
+        w = self.weights
+
+        # contact: fingertip distance to ideal contact circle on valve
+        tip_poses = base.agent.tip_poses  # (b, 3, 7)
+        tip_pos = tip_poses[:, :, :2]  # (b, 3, 2)
+        valve_pos = base.valve_link.pose.p[:, :2]  # (b, 2)
+        valve_tip_dist = torch.linalg.norm(tip_pos - valve_pos[:, None, :], dim=-1)
+        desired_dist = base.capsule_lens[:, None] - base.capsule_offset
+        error = torch.norm(valve_tip_dist - desired_dist, dim=-1)
+        contact_r = 1 - torch.tanh(error * 10)
+
+        # velocity: directed rotation velocity
+        directed_vel = base.valve.qvel[:, 0] * base.rotate_direction
+        velocity_r = torch.tanh(5 * directed_vel)
+
+        # progress: cumulative rotation toward goal
+        rotation = info["valve_rotation"]
+        progress_r = torch.clip(rotation * base.rotate_direction / (torch.pi / 2), -1, 1)
+
+        scale = self._norm_scale()
+        reward = scale * (
+            w["w_contact"] * contact_r
+            + w["w_velocity"] * velocity_r
+            + w["w_progress"] * progress_r
+        )
+
+        self._last_breakdown = {
+            "contact": (scale * w["w_contact"] * contact_r).mean().item(),
+            "velocity": (scale * w["w_velocity"] * velocity_r).mean().item(),
+            "progress": (scale * w["w_progress"] * progress_r).mean().item(),
+            "norm_scale": scale,
+        }
+        return reward
+
+    # --- UnitreeG1TransportBox ---
+    def _compute_transport_box(self, info: dict) -> torch.Tensor:
+        base = self.env.unwrapped
+        w = self.weights
+
+        # Stage 1: face the box (turn torso toward table 1)
+        face_box_r = 1 - torch.tanh((base.agent.robot.qpos[:, 0] + 1.4).abs())
+
+        # Stage 2: grasp - arms down + TCPs near box grasp points
+        arm_down_r = (
+            (1 - torch.tanh(base.agent.robot.qpos[:, 3].abs())) / 4
+            + (1 - torch.tanh(base.agent.robot.qpos[:, 4].abs())) / 4
+        )
+        right_tcp_dist = torch.linalg.norm(
+            base.agent.right_tcp.pose.p - base.box_right_grasp_point.p, dim=1
+        )
+        left_tcp_dist = torch.linalg.norm(
+            base.agent.left_tcp.pose.p - base.box_left_grasp_point.p, dim=1
+        )
+        tcp_r = (
+            (1 - torch.tanh(3 * right_tcp_dist)) / 4
+            + (1 - torch.tanh(3 * left_tcp_dist)) / 4
+        )
+        grasp_r = (1 + arm_down_r + tcp_r)
+        # Only count grasp reward when facing box
+        grasp_r = torch.where(info["facing_table_with_box"], grasp_r, torch.zeros_like(grasp_r))
+
+        # Stage 3: transport - turn toward table 2 while grasping
+        turn_r = 1 - torch.tanh((base.agent.robot.qpos[:, 0] - 1.4).abs() / 5)
+        transport_r = (2 + turn_r)
+        transport_r = torch.where(info["box_grasped"], transport_r, torch.zeros_like(transport_r))
+
+        # Stage 4: release - raise arms to let go
+        arm_up_r = (
+            (1 - torch.tanh((base.agent.robot.qpos[:, 3] - 1.25).abs())) / 2
+            + (1 - torch.tanh((base.agent.robot.qpos[:, 4] + 1.25).abs())) / 2
+        )
+        release_r = (3 + arm_up_r)
+        release_r = torch.where(info["box_at_correct_table_xy"], release_r, torch.zeros_like(release_r))
+
+        scale = self._norm_scale()
+        # Staged reward: take the highest active stage
+        reward = scale * torch.max(
+            torch.max(
+                torch.max(
+                    w["w_face_box"] * face_box_r,
+                    w["w_grasp"] * grasp_r,
+                ),
+                w["w_transport"] * transport_r,
+            ),
+            w["w_release"] * release_r,
+        )
+        reward[info["success"]] = w["w_success"]
+
+        self._last_breakdown = {
+            "face_box": (scale * w["w_face_box"] * face_box_r).mean().item(),
+            "grasp": (scale * w["w_grasp"] * grasp_r).mean().item(),
+            "transport": (scale * w["w_transport"] * transport_r).mean().item(),
+            "release": (scale * w["w_release"] * release_r).mean().item(),
             "norm_scale": scale,
         }
         return reward

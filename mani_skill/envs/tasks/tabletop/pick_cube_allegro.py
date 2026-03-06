@@ -385,13 +385,104 @@ class PickCubePandaAllegroV2Env(BaseEnv):
                 self._near_goal_steps = torch.zeros(n_envs, dtype=torch.long, device=self.device)
                 self._object_init_z = torch.zeros(n_envs, device=self.device)
                 self._closest_obj_to_goal_dist = torch.full((n_envs,), float("inf"), device=self.device)
+                # Cached values written by _update_trackers, read by obs/reward
+                self._cached_fingertip_deltas = torch.zeros((n_envs, n_tips), device=self.device)
+                self._cached_place_deltas = torch.zeros(n_envs, device=self.device)
+                self._cached_z_lift = torch.zeros(n_envs, device=self.device)
+                self._cached_just_lifted = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._cached_was_lifted = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._cached_obj_to_goal_dist = torch.zeros(n_envs, device=self.device)
+                self._cached_near_goal = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._cached_is_robot_static = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._cached_near_goal_and_static = torch.zeros(n_envs, dtype=torch.bool, device=self.device)
+                self._can_advance_accumulators = False
             # Reset only the envs being initialized
-            # Use -1 as sentinel; first reward step will initialize to actual distance
+            # -1 sentinel: _update_trackers replaces with actual distance before obs
             self._closest_fingertip_dist[env_idx] = -1.0
             self._lifted_object[env_idx] = False
             self._near_goal_steps[env_idx] = 0
             self._object_init_z[env_idx] = xyz[:, 2]
             self._closest_obj_to_goal_dist[env_idx] = -1.0
+            self._trackers_need_update = True
+
+    # ------------------------------------------------------------------
+    # Tracker update: single source of truth for delta-reward state.
+    # Called from evaluate() (which ManiSkill invokes before get_obs and
+    # compute_reward).  Two guards:
+    #   _trackers_need_update  – armed by _before_control_step (physics
+    #       step) or _initialize_episode (reset); gates the whole update.
+    #   _can_advance_accumulators – armed ONLY by _before_control_step;
+    #       gates near_goal_steps so partial-reset re-evaluations of
+    #       surviving envs cannot double-count.
+    # ------------------------------------------------------------------
+    def _update_trackers(self):
+        if not self._trackers_need_update:
+            return
+        self._trackers_need_update = False
+
+        # --- Fingertip distances (n_envs, 4) ---
+        tip_positions = torch.stack(
+            [link.pose.p for link in self.agent.tip_links], dim=1
+        )
+        curr_fingertip_dist = torch.linalg.norm(
+            tip_positions - self.cube.pose.p.unsqueeze(1), dim=-1
+        )
+        # Replace sentinel with actual distance (produces zero delta)
+        first_step = self._closest_fingertip_dist[:, 0] < 0
+        self._closest_fingertip_dist[first_step] = curr_fingertip_dist[first_step]
+
+        self._cached_fingertip_deltas = torch.clamp(
+            self._closest_fingertip_dist - curr_fingertip_dist, 0, 10
+        )
+        self._closest_fingertip_dist = torch.minimum(
+            self._closest_fingertip_dist, curr_fingertip_dist
+        )
+
+        # --- Lifting ---
+        cube_z = self.cube.pose.p[:, 2]
+        self._cached_z_lift = 0.05 + cube_z - self._object_init_z
+
+        self._cached_was_lifted = self._lifted_object.clone()
+        self._lifted_object = (
+            (self._cached_z_lift > self.lifting_bonus_threshold)
+            | self._cached_was_lifted
+        )
+        self._cached_just_lifted = self._lifted_object & (~self._cached_was_lifted)
+
+        # --- Place (obj → goal) ---
+        obj_to_goal_dist = torch.linalg.norm(
+            self.goal_site.pose.p - self.cube.pose.p, axis=1
+        )
+        self._cached_obj_to_goal_dist = obj_to_goal_dist
+
+        # Initialize closest on the step lift first occurs
+        just_entered_phase2 = self._lifted_object & (self._closest_obj_to_goal_dist < 0)
+        self._closest_obj_to_goal_dist[just_entered_phase2] = obj_to_goal_dist[
+            just_entered_phase2
+        ]
+
+        self._cached_place_deltas = torch.clamp(
+            self._closest_obj_to_goal_dist - obj_to_goal_dist, 0, 100
+        )
+        mask = self._lifted_object
+        self._closest_obj_to_goal_dist[mask] = torch.minimum(
+            self._closest_obj_to_goal_dist[mask], obj_to_goal_dist[mask]
+        )
+
+        # --- Near-goal tracking ---
+        self._cached_near_goal = obj_to_goal_dist <= self.goal_thresh
+        self._cached_is_robot_static = self.agent.is_static(0.2)
+        self._cached_near_goal_and_static = (
+            self._cached_near_goal & self._cached_is_robot_static
+        )
+        # Only advance accumulator on actual physics steps, not on
+        # partial-reset re-evaluations (which would double-count).
+        if self._can_advance_accumulators:
+            self._can_advance_accumulators = False
+            self._near_goal_steps = (
+                (self._near_goal_steps + self._cached_near_goal_and_static.long())
+                * self._cached_near_goal_and_static.long()
+            )
 
     def _get_obs_extra(self, info: dict):
         obs = dict(
@@ -400,106 +491,91 @@ class PickCubePandaAllegroV2Env(BaseEnv):
             goal_pos=self.goal_site.pose.p,
         )
         if "state" in self.obs_mode:
+            # Trackers are fresh: updated in evaluate() before this call.
+            # For closest_obj_to_goal_dist, phase-1 envs still have sentinel
+            # -1; substitute with current distance so obs is always valid.
+            obj_to_goal_obs = self._closest_obj_to_goal_dist.clone()
+            phase1 = ~self._lifted_object
+            obj_to_goal_obs[phase1] = self._cached_obj_to_goal_dist[phase1]
+
             obs.update(
                 obj_pose=self.cube.pose.raw_pose,
                 tcp_to_obj_pos=self.cube.pose.p - self.agent.tcp_pose.p,
                 obj_to_goal_pos=self.goal_site.pose.p - self.cube.pose.p,
+                closest_fingertip_dist=self._closest_fingertip_dist,
+                closest_obj_to_goal_dist=obj_to_goal_obs,
+                lifted_object=self._lifted_object.float(),
+                near_goal_progress=self._near_goal_steps.float() / self.success_steps,
             )
         return obs
 
+    def _before_control_step(self):
+        self._trackers_need_update = True
+        self._can_advance_accumulators = True
+
     def evaluate(self):
-        is_obj_placed = (
-            torch.linalg.norm(self.goal_site.pose.p - self.cube.pose.p, axis=1)
-            <= self.goal_thresh
-        )
+        self._update_trackers()
+
         is_grasped = self.agent.is_grasping(self.cube)
-        is_robot_static = self.agent.is_static(0.2)
+        min_tip_dist = self._closest_fingertip_dist.min(dim=-1).values
+
         return {
-            "success": is_obj_placed & is_robot_static,
-            "is_obj_placed": is_obj_placed,
-            "is_robot_static": is_robot_static,
+            "success": self._cached_near_goal & self._cached_is_robot_static,
+            "is_obj_placed": self._cached_near_goal,
+            "is_robot_static": self._cached_is_robot_static,
             "is_grasped": is_grasped,
+            # Phase indicators (for logging / debugging)
+            "reached": min_tip_dist < 0.05,
+            "lifted": self._lifted_object,
+            "near_goal": self._cached_near_goal,
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # === Phase 1: Fingertip delta reward (before lifting) ===
-        # Per-finger distance to object center
-        tip_positions = torch.stack(
-            [link.pose.p for link in self.agent.tip_links], dim=1
-        )  # (n_envs, 4, 3)
-        tip_to_obj = tip_positions - self.cube.pose.p.unsqueeze(1)
-        curr_fingertip_dist = torch.linalg.norm(tip_to_obj, dim=-1)  # (n_envs, 4)
+        # Reads cached values from _update_trackers() (called in evaluate()).
+        # Must only be called within the step() path; partial-reset
+        # re-evaluations overwrite _cached_was_lifted / _cached_just_lifted
+        # with stale (zero-delta) values.
 
-        # On first step after reset, initialize closest to current (no free reward)
-        first_step_mask = self._closest_fingertip_dist[:, 0] < 0
-        self._closest_fingertip_dist[first_step_mask] = curr_fingertip_dist[first_step_mask]
-
-        # Delta = improvement from historical closest distance per finger
-        fingertip_deltas = self._closest_fingertip_dist - curr_fingertip_dist
-        self._closest_fingertip_dist = torch.minimum(
-            self._closest_fingertip_dist, curr_fingertip_dist
+        # Phase 1: fingertip approach (disabled after lift)
+        fingertip_delta_rew = (
+            self._cached_fingertip_deltas.sum(dim=-1)
+            * (~self._cached_was_lifted).float()
+            * self.fingertip_delta_rew_scale
         )
-        # Only reward positive improvement, clip to prevent explosion
-        fingertip_deltas = torch.clamp(fingertip_deltas, 0, 10)
-        fingertip_delta_rew = fingertip_deltas.sum(dim=-1)  # sum across 4 fingers
-        # Disable after lifting
-        fingertip_delta_rew = fingertip_delta_rew * (~self._lifted_object)
-        fingertip_delta_rew = fingertip_delta_rew * self.fingertip_delta_rew_scale
 
-        # === Phase 1: Lifting reward ===
-        cube_z = self.cube.pose.p[:, 2]
-        # +0.05 offset (from SimToolReal): gives small positive reward at rest,
-        # so the agent gets a gradient signal toward "up" from the start.
-        # Effective lift threshold = lifting_bonus_threshold - 0.05 = 0.10m actual rise.
-        z_lift = 0.05 + cube_z - self._object_init_z
-        lifting_rew = torch.clamp(z_lift, 0, 0.5)
-
-        # Check if object crossed lifting threshold
-        lifted_object = (z_lift > self.lifting_bonus_threshold) | self._lifted_object
-        just_lifted = lifted_object & (~self._lifted_object)
-        lift_bonus_rew = self.lifting_bonus * just_lifted.float()
-
-        # Stop lifting reward once lifted
-        lifting_rew = lifting_rew * (~lifted_object)
-        lifting_rew = lifting_rew * self.lifting_rew_scale
-
-        # Update lifted state
-        self._lifted_object = lifted_object
-
-        # === Phase 2: Place reward (after lifting) ===
-        obj_to_goal_dist = torch.linalg.norm(
-            self.goal_site.pose.p - self.cube.pose.p, axis=1
+        # Phase 1: lifting
+        lifting_rew = (
+            torch.clamp(self._cached_z_lift, 0, 0.5)
+            * (~self._lifted_object).float()
+            * self.lifting_rew_scale
         )
-        # Initialize closest distance on the step when object is first lifted
-        just_entered_phase2 = lifted_object & (self._closest_obj_to_goal_dist < 0)
-        self._closest_obj_to_goal_dist[just_entered_phase2] = obj_to_goal_dist[just_entered_phase2]
+        lift_bonus_rew = self.lifting_bonus * self._cached_just_lifted.float()
 
-        # Delta-based: reward for getting closer to goal
-        place_deltas = self._closest_obj_to_goal_dist - obj_to_goal_dist
-        # Only update closest distance AFTER lift (preserve Phase 2 improvement room)
-        lifted_mask = lifted_object
-        self._closest_obj_to_goal_dist[lifted_mask] = torch.minimum(
-            self._closest_obj_to_goal_dist[lifted_mask], obj_to_goal_dist[lifted_mask]
+        # Phase 2: place (after lift)
+        place_rew = (
+            self._cached_place_deltas
+            * self._lifted_object.float()
+            * self.place_rew_scale
         )
-        place_deltas = torch.clamp(place_deltas, 0, 100)
-        place_rew = place_deltas * lifted_object.float()
-        place_rew = place_rew * self.place_rew_scale
 
-        # === Success bonus (distributed over success_steps) ===
-        near_goal = obj_to_goal_dist <= self.goal_thresh
-        is_robot_static = self.agent.is_static(0.2)
-        near_goal_and_static = near_goal & is_robot_static
-        # Consecutive near-goal tracking
-        self._near_goal_steps = (self._near_goal_steps + near_goal_and_static.long()) * near_goal_and_static.long()
-        bonus_rew = near_goal_and_static.float() * (self.reach_goal_bonus / self.success_steps)
+        # Success bonus (distributed over success_steps)
+        bonus_rew = (
+            self._cached_near_goal_and_static.float()
+            * (self.reach_goal_bonus / self.success_steps)
+        )
 
-        # === Action penalties ===
+        # Action penalties
         qvel = self.agent.robot.get_qvel()
-        arm_penalty = -torch.sum(torch.abs(qvel[..., :7]), dim=-1) * self.arm_actions_penalty_scale
-        hand_penalty = -torch.sum(torch.abs(qvel[..., 7:23]), dim=-1) * self.hand_actions_penalty_scale
+        arm_penalty = (
+            -torch.sum(torch.abs(qvel[..., :7]), dim=-1)
+            * self.arm_actions_penalty_scale
+        )
+        hand_penalty = (
+            -torch.sum(torch.abs(qvel[..., 7:23]), dim=-1)
+            * self.hand_actions_penalty_scale
+        )
 
-        # === Total reward ===
-        reward = (
+        return (
             fingertip_delta_rew
             + lifting_rew
             + lift_bonus_rew
@@ -508,11 +584,9 @@ class PickCubePandaAllegroV2Env(BaseEnv):
             + arm_penalty
             + hand_penalty
         )
-        return reward
 
     def compute_normalized_dense_reward(
         self, obs: Any, action: torch.Tensor, info: dict
     ):
-        # SimToolReal-style delta rewards don't have a fixed max, so no normalization.
-        # Return raw dense reward directly.
-        return self.compute_dense_reward(obs=obs, action=action, info=info)
+        max_reward = 300.0  # lift_bonus dominates; keeps most steps in [-1, 1]
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / max_reward

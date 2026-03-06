@@ -8,7 +8,7 @@
 #
 # Hyperparameters aligned with SimToolReal (rl_games PPO):
 #   num_envs=8192, horizon=16, gamma=0.99, lr=1e-4, ent=0.0, clip=0.1
-#   reward_scale=0.01, vf_coef=4.0, grad_norm=1.0
+#   reward_scale=1.0 (env normalizes /300), vf_coef=4.0, grad_norm=1.0
 #   network=[1024,1024,512,512] ELU
 #
 # Usage:
@@ -32,16 +32,16 @@ NUM_MINIBATCHES=4           # batch=8192*16=131072, minibatch=32768 (SimToolReal
 GAMMA=0.99                  # SimToolReal: 0.99
 GAE_LAMBDA=0.95             # SimToolReal: 0.95
 ENT_COEF=0.0                # SimToolReal: 0.0
-LR=1e-4                     # SimToolReal: 1e-4
+LR=1e-4                     # SimToolReal: 1e-4 (restored; obs Markov fix should stabilize KL)
 CLIP_COEF=0.1               # SimToolReal: e_clip=0.1
 VF_COEF=4.0                 # SimToolReal: critic_coef=4.0
 MAX_GRAD_NORM=1.0           # SimToolReal: grad_norm=1.0
-REWARD_SCALE=0.01           # SimToolReal: reward_shaper scale=0.01
+REWARD_SCALE=1.0            # normalized_dense now divides by 300, no extra scaling needed
 
 # --- Network (SimToolReal: [1024,1024,512,512] ELU) ---
 ACTIVATION="elu"
 
-CUDA_VISIBLE_DEVICES=0 python ppo.py \
+CUDA_VISIBLE_DEVICES=5 python ppo.py \
   --env_id="${ENV}" \
   --seed=${seed} \
   --num_envs=${NUM_ENVS} \

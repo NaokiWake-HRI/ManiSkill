@@ -67,6 +67,7 @@ from env_contracts import validate_env_setup
 from ppo_common import (
     layer_init, Agent, Logger,
     crop_tiled_frame, extract_frames_from_video, build_vlm_prompt,
+    extract_categorized_frames, build_vlm_prompt_categorized, categorize_env_outcomes,
     generate_reward_plot_html, append_html_to_file, generate_random_weights,
 )
 from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
@@ -157,6 +158,8 @@ class Args:
     """max frames to send to VLM"""
     vlm_num_envs: int = 1
     """number of eval envs to show in VLM frames"""
+    vlm_episode_selection: str = "random"
+    """VLM episode selection mode: 'random' (current behavior, show env 0) or 'categorized' (show success/near_miss/failure side-by-side)"""
     vlm_reward_plot: bool = False
     """if toggled, append per-step reward plot to VLM debug HTML"""
     rl_project_path: str = "/home/nwake/codes/RL_project"
@@ -245,7 +248,9 @@ def _run_worker_mode(task_path: str):
             "learning_curve": result["learning_curve"],
             "reward_stats": reward_stats,
             "eval_video_dir": result["eval_video_dir"],
+            "vlm_eval_video": result.get("vlm_eval_video"),
             "final_global_step": result["final_global_step"],
+            "env_last_outcomes": result.get("env_last_outcomes", {}),
         }
 
     except Exception as e:
@@ -360,6 +365,8 @@ def _train_candidates_parallel(
                         "learning_curve": result["learning_curve"],
                         "reward_statistics": result["reward_stats"],
                         "eval_video_dir": result["eval_video_dir"],
+                        "vlm_eval_video": result.get("vlm_eval_video"),
+                        "env_last_outcomes": result.get("env_last_outcomes", {}),
                     })
                     print(f"    Candidate {cand['id']+1} OK (fitness={fitness:.4f})")
                 else:
@@ -488,6 +495,8 @@ def _train_candidates_parallel(
                                     "learning_curve": retry_result["learning_curve"],
                                     "reward_statistics": retry_result["reward_stats"],
                                     "eval_video_dir": retry_result["eval_video_dir"],
+                                    "vlm_eval_video": retry_result.get("vlm_eval_video"),
+                                    "env_last_outcomes": retry_result.get("env_last_outcomes", {}),
                                 })
                                 print(f"    Retry OK (fitness={fitness:.4f})")
                                 break  # Success, stop retrying this candidate
@@ -607,15 +616,17 @@ def run_ppo_training(
 
     # Video recording for eval
     eval_output_dir = f"runs/{run_dir}/videos/iter_{outer_iter+1:02d}"
+    eval_recorder = None  # reference to RecordEpisode for output_dir switching
     if args.capture_video:
         print(f"  Saving eval videos to {eval_output_dir}")
-        eval_envs = RecordEpisode(
+        eval_recorder = RecordEpisode(
             eval_envs,
             output_dir=eval_output_dir,
             save_trajectory=False,
             max_steps_per_video=args.num_eval_steps,
             video_fps=30,
         )
+        eval_envs = eval_recorder
 
     envs = ManiSkillVectorEnv(envs, args.num_envs, ignore_terminations=not args.partial_reset, record_metrics=True)
     eval_envs = ManiSkillVectorEnv(eval_envs, args.num_eval_envs, ignore_terminations=not args.eval_partial_reset, record_metrics=True)
@@ -660,12 +671,25 @@ def run_ppo_training(
         # --- Evaluation ---
         is_last_iter = (iteration == args.num_iterations)
         if iteration % args.eval_freq == 1 or is_last_iter:
+            # On the final eval, redirect video recording to a dedicated directory
+            # so the VLM video is guaranteed to match env_last_outcomes.
+            vlm_final_video_dir = None
+            if is_last_iter and eval_recorder is not None:
+                eval_recorder.flush_video()  # flush any pending frames to old dir
+                vlm_final_video_dir = f"runs/{run_dir}/videos/iter_{outer_iter+1:02d}_vlm_final"
+                Path(vlm_final_video_dir).mkdir(parents=True, exist_ok=True)
+                eval_recorder.output_dir = Path(vlm_final_video_dir)
+                # Disable auto-flush so frames accumulate until our explicit
+                # flush_video(name="vlm_final") after the eval loop.
+                eval_recorder.max_steps_per_video = None
+
             print("  Evaluating")
             eval_obs, _ = eval_envs.reset()
             eval_metrics = defaultdict(list)
             num_episodes = 0
             step_rewards_list = []
             step_breakdowns_list = []
+            env_last_outcomes: Dict[int, Dict[str, bool]] = {}  # per-env-index success tracking
             for _ in range(args.num_eval_steps):
                 with torch.no_grad():
                     eval_obs, eval_rew, eval_terminations, eval_truncations, eval_infos = eval_envs.step(
@@ -676,8 +700,21 @@ def run_ppo_training(
                     if "final_info" in eval_infos:
                         mask = eval_infos["_final_info"]
                         num_episodes += mask.sum()
-                        for k, v in eval_infos["final_info"]["episode"].items():
+                        # Track per-env-index outcomes (last completed episode wins)
+                        ep = eval_infos["final_info"]["episode"]
+                        for env_idx in range(args.num_eval_envs):
+                            if mask[env_idx]:
+                                env_last_outcomes[env_idx] = {
+                                    "success_once": float(ep.get("success_once", torch.zeros(args.num_eval_envs))[env_idx]) > 0.5,
+                                    "success_at_end": float(ep.get("success_at_end", torch.zeros(args.num_eval_envs))[env_idx]) > 0.5,
+                                }
+                        for k, v in ep.items():
                             eval_metrics[k].append(v)
+            # On the final eval, explicitly flush the video with a known name
+            # so we can return the exact file path (no glob needed).
+            if is_last_iter and eval_recorder is not None and vlm_final_video_dir is not None:
+                eval_recorder.flush_video(name="vlm_final")
+
             print(f"  Evaluated {args.num_eval_steps * args.num_eval_envs} steps, {num_episodes} episodes")
             for k, v in eval_metrics.items():
                 mean = torch.stack(v).float().mean()
@@ -878,13 +915,24 @@ def run_ppo_training(
     envs.close()
     eval_envs.close()
 
+    # The final eval video was flushed with name="vlm_final" to a dedicated dir.
+    # Path is fully deterministic — no glob needed.
+    if vlm_final_video_dir:
+        vlm_eval_video = str(Path(vlm_final_video_dir) / "vlm_final.mp4")
+        if not Path(vlm_eval_video).exists():
+            vlm_eval_video = None  # recorder was empty or capture_video was off
+    else:
+        vlm_eval_video = None
+
     return {
         "eval_metrics": latest_eval_metrics,
         "step_rewards": latest_eval_step_rewards,
         "reward_breakdowns": latest_eval_reward_breakdowns,
         "eval_video_dir": eval_output_dir,
+        "vlm_eval_video": vlm_eval_video,
         "final_global_step": global_step,
         "learning_curve": learning_curve,
+        "env_last_outcomes": env_last_outcomes,
     }
 
 
@@ -1677,6 +1725,8 @@ if __name__ == "__main__":
                             "learning_curve": result["learning_curve"],
                             "reward_statistics": reward_stats,
                             "eval_video_dir": result["eval_video_dir"],
+                            "vlm_eval_video": result.get("vlm_eval_video"),
+                            "env_last_outcomes": result.get("env_last_outcomes", {}),
                         })
 
                         print(f"\n[Candidate {cand['id']+1}] Results:")
@@ -1852,18 +1902,59 @@ if __name__ == "__main__":
         vlm_comment = None
         if vlm is not None:
             print(f"\n[VLM] Analyzing best candidate's video (iteration {outer_iter+1})...")
+            print(f"  Episode selection mode: {args.vlm_episode_selection}")
 
-            video_dir = Path(best["eval_video_dir"])
-            video_files = sorted(video_dir.glob("*.mp4"))
+            # Use the dedicated VLM video from the final eval pass.
+            # This directory contains ONLY the final eval's recording,
+            # guaranteeing 1:1 alignment with env_last_outcomes.
+            # Fallback: pick highest-numbered .mp4 in the general video dir.
+            _vlm_video = best.get("vlm_eval_video")
+            if _vlm_video and Path(_vlm_video).exists():
+                latest_video = Path(_vlm_video)
+            else:
+                video_dir = Path(best["eval_video_dir"])
+                _vfiles = list(video_dir.glob("*.mp4"))
+                latest_video = max(_vfiles, key=lambda p: int(p.stem)) if _vfiles else None
+                if latest_video:
+                    print("  [warn] vlm_eval_video not available, using fallback from general video dir")
 
-            if video_files:
-                latest_video = video_files[-1]
-                frames = extract_frames_from_video(
-                    latest_video,
-                    max_frames=args.vlm_max_frames,
-                    num_total_envs=args.num_eval_envs,
-                    num_show_envs=args.vlm_num_envs,
-                )
+            if latest_video is not None:
+                frames = None
+                vlm_prompt = None
+                selected_envs = {}  # populated only when categorized mode succeeds
+
+                if args.vlm_episode_selection == "categorized":
+                    # --- Categorized mode: show success/near_miss/failure side-by-side ---
+                    env_outcomes = best.get("env_last_outcomes", {})
+                    if env_outcomes:
+                        categories = categorize_env_outcomes(env_outcomes)
+                        cat_summary = {k: len(v) for k, v in categories.items()}
+                        print(f"  Env categories: {cat_summary}")
+
+                        frames, categories_shown, selected_envs = extract_categorized_frames(
+                            latest_video,
+                            env_categories=categories,
+                            num_total_envs=args.num_eval_envs,
+                            max_frames=args.vlm_max_frames,
+                        )
+                        if frames and categories_shown:
+                            vlm_prompt = build_vlm_prompt_categorized(args.env_id, categories_shown)
+                            print(f"  Showing categories: {categories_shown} (envs: {selected_envs})")
+                        else:
+                            print("  [warn] Categorized extraction failed, falling back to random")
+                    else:
+                        print("  [warn] No env_last_outcomes available, falling back to random")
+
+                if frames is None:
+                    # --- Random mode (default / fallback) ---
+                    frames = extract_frames_from_video(
+                        latest_video,
+                        max_frames=args.vlm_max_frames,
+                        num_total_envs=args.num_eval_envs,
+                        num_show_envs=args.vlm_num_envs,
+                    )
+                    vlm_prompt = build_vlm_prompt(args.env_id)
+
                 if frames:
                     episode_info = {
                         "return": best["eval_metrics"].get("return", 0.0),
@@ -1872,8 +1963,33 @@ if __name__ == "__main__":
                         "success_once": best["eval_metrics"].get("success_once", 0.0),
                         "length": args.num_eval_steps,
                     }
+                    # In categorized mode, add per-panel info so VLM sees which
+                    # env belongs to which category (matches the labeled frames).
+                    if selected_envs:
+                        env_outcomes = best.get("env_last_outcomes", {})
+                        panel_info = {}
+                        for cat, env_idx in selected_envs.items():
+                            eo = env_outcomes.get(env_idx, {})
+                            panel_info[cat] = {
+                                "env_idx": env_idx,
+                                "success_at_end": eo.get("success_at_end", False),
+                                "success_once": eo.get("success_once", False),
+                            }
+                        episode_info["panels"] = panel_info
 
-                    vlm_score, vlm_comment, _ = vlm.evaluate(frames, episode_info)
+                    # Use a temporary VLM evaluator if prompt differs from default
+                    # (the default VLM's prompt is baked into its eval_fn closure)
+                    vlm_to_use = vlm
+                    if vlm_prompt != build_vlm_prompt(args.env_id):
+                        vlm_to_use = VLMEvaluator.from_openai(
+                            api_key=api_key,
+                            model=args.vlm_model,
+                            prompt=vlm_prompt,
+                            max_frames=args.vlm_max_frames,
+                            cache_results=False,
+                        )
+
+                    vlm_score, vlm_comment, _ = vlm_to_use.evaluate(frames, episode_info)
                     print(f"[VLM] Analysis:\n{vlm_comment}")
                     best["vlm_comment"] = vlm_comment
                     best["vlm_score"] = vlm_score
@@ -1883,7 +1999,7 @@ if __name__ == "__main__":
                     vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
                     save_vlm_debug_html(
                         frames=frames,
-                        prompt=build_vlm_prompt(args.env_id),
+                        prompt=vlm_prompt,
                         episode_info=episode_info,
                         vlm_score=vlm_score,
                         vlm_comment=vlm_comment,

@@ -30,27 +30,37 @@ the loop with a vision-language model (VLM) that observes rollout videos of the
 best candidate policy and provides behavioral diagnosis to the LLM before each
 reward revision.
 
-We evaluate the VLM+LLM method against an LLM-only (Eureka-style) baseline on
-four ManiSkill manipulation tasks spanning a range of difficulty: PushCube
-(easy), PickCube (easy), PushT (medium), and UnitreeG1PlaceAppleInBowl (hard,
-6-stage humanoid bimanual). Our main findings are:
-(1)~On tasks that the LLM already solves at Iteration~0 (PushCube, PickCube),
-VLM feedback is unnecessary and can even cause temporary regression by
-prompting over-engineered reward designs.
-(2)~On unsolved tasks (PushT, UnitreeG1), VLM feedback provides actionable
-behavioral diagnosis---identifying specific failure modes such as
-``press-and-freeze'' or stage-specific bottlenecks, and inferring behavioral
-causes such as contact geometry and push direction from visual
-observation---information that scalar metrics alone cannot reveal, leading to large performance gains (0\%$\to$56\% for PushT;
-0\%$\to$87.5\% for UnitreeG1) compared to the LLM-only baseline (6.25\% and
-12.5\%, respectively).
-(3)~The value of VLM feedback scales with task difficulty and the number of
-behavioral stages: multi-stage tasks yield qualitatively new VLM observations
-each iteration, while single-stage tasks produce repetitive diagnoses.
+We evaluate the VLM+LLM method on an 8-task ManiSkill suite spanning solved,
+partially solved, unsolved, and ceiling regimes: PushCube, PickCube, PushT,
+UnitreeG1PlaceAppleInBowl, OpenCabinetDoor, OpenCabinetDrawer,
+AnymalC-Reach (3 VLM+LLM runs), and PegInsertionSide. Direct Eureka-style
+LLM-only baselines are available for PushT, UnitreeG1, and PegInsertionSide;
+the remaining tasks are used to characterize how VLM utility changes across
+solution phases. Our main findings are:
+(1)~On already-solved tasks (PushCube, PickCube), VLM feedback is unnecessary
+and can even cause temporary regression by prompting over-engineered reward
+designs.
+(2)~On reward-actionable unsolved tasks (PushT, UnitreeG1), VLM feedback provides
+high-value behavioral diagnosis---``press-and-freeze'' in PushT and
+stage-specific bottlenecks in UnitreeG1---that scalar metrics alone cannot
+reveal, leading to strong gains over Eureka (PushT: 37.5\% SE / 56.25\% SO vs
+6.25\%; UnitreeG1: 87.5\% SE vs 12.5\%).
+(3)~On partially solved tasks, VLM is mixed but still informative. Cabinet
+tasks gain early and then plateau (Door: 75.0\%$\to$87.5\%; Drawer:
+62.5\%$\to$75.0\%), while AnymalC improves sharply in early iterations but can
+later regress through over-regularization (across 3 runs: Iter~0 SE
+31.25--56.25\%, best run reaches 100\%).
+(4)~PegInsertionSide exposes a diagnosis-actionability gap. VLM feedback
+correctly tracks behavioral progress (reach$\to$hover$\to$grasp-and-hold) and
+raises return (109.5$\to$221.8), yet both VLM+LLM and Eureka remain at 0\%
+success because the binary grasp/alignment cliff is not bridged by reward
+shaping within the current search budget.
 
-These results suggest that VLM-in-the-loop reward design is a powerful tool for
-hard manipulation tasks but should be conditionally activated based on current
-performance to avoid negative transfer on easy tasks.
+These results suggest that VLM-in-the-loop reward design is governed not only
+by the current \emph{solution phase} (solved / partially solved / unsolved) but
+also by whether the diagnosed failure mode is \emph{reward-actionable}, i.e.,
+whether it can be translated into a reward modification that PPO can actually
+exploit under the available optimization budget.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -93,11 +103,12 @@ Our contributions are:
   \item A VLM-in-the-loop extension of Eureka-style reward generation that adds
     visual behavioral feedback to the LLM's iterative refinement process
     (Section~\ref{sec:method}).
-  \item An empirical evaluation on four manipulation tasks of varying difficulty,
-    revealing that VLM feedback is most valuable on hard, multi-stage tasks
-    and can be counterproductive on already-solved tasks
+  \item An empirical evaluation across eight tasks and multiple solution
+    regimes, revealing that VLM feedback is most valuable when failures are both
+    unresolved and reward-actionable, and can be counterproductive on
+    already-solved tasks
     (Section~\ref{sec:results}).
-  \item Analysis of VLM feedback quality across task difficulty levels,
+  \item Analysis of VLM feedback quality across solution phases,
     identifying failure modes of the VLM itself (severity miscalibration,
     repetitive diagnosis) and design guidelines for when to activate the visual
     feedback loop (Section~\ref{sec:analysis}).
@@ -242,7 +253,7 @@ identical hyperparameters ($K=4$, $N=5$, same PPO configuration and seed).
 
 \subsection{Tasks}
 
-We evaluate on four ManiSkill~\cite{gu2023maniskill2} manipulation tasks:
+We evaluate on eight ManiSkill~\cite{gu2023maniskill2} tasks:
 
 \begin{table}[htbp]
 \caption{Task characteristics}
@@ -255,10 +266,23 @@ Task & Stages & Robot & Difficulty \\
 PushCube-v1 & 1 & Panda & Easy \\
 PickCube-v1 & 2 & Panda & Easy \\
 PushT-v1 & 1 & Panda & Medium \\
+OpenCabinetDoor-v1 & 1 & Panda & Medium \\
+OpenCabinetDrawer-v1 & 1 & Panda & Medium \\
+AnymalC-Reach-v1 & 1 & AnymalC & Medium \\
 UnitreeG1PlaceApple & 6 & G1 humanoid & Hard \\
+PegInsertionSide-v1 & 5 & Panda & Very Hard \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\subsection{Comparison Coverage}
+
+Direct VLM+LLM vs Eureka comparisons are available for PushT-v1,
+UnitreeG1PlaceAppleInBowl-v1, and PegInsertionSide-v1. PushCube-v1,
+PickCube-v1, OpenCabinetDoor-v1, and OpenCabinetDrawer-v1 currently serve as
+VLM+LLM runs for phase characterization. For AnymalC-Reach-v1, we analyze
+three independent VLM+LLM runs to characterize variability in a partially
+solved regime; no clean Eureka counterpart is available there.
 
 \subsection{Hyperparameters}
 
@@ -277,49 +301,60 @@ Seed is fixed at 9351 for all runs.
 \subsection{Main Results}
 
 \begin{table}[htbp]
-\caption{Best success\_at\_end (\%) across methods}
+\caption{Eight-task evaluation summary}
 \label{tab:main}
 \centering
-\begin{tabular}{lccc}
+\begin{tabular}{lcccc}
 \toprule
-Task & VLM+LLM & Eureka & Improvement \\
+Task & Iter 0 SE & Best VLM SE & Comparator & Outcome \\
 \midrule
-PushCube-v1 & 93.75 & --- & N/A \\
-PickCube-v1 & 100.0 & --- & N/A \\
-PushT-v1 & \textbf{56.25} & 6.25 & 9$\times$ \\
-UnitreeG1PlaceApple & \textbf{87.50} & 12.50 & 7$\times$ \\
+PushCube & 100.0 & 100.0 & --- & Solved at Iter~0 \\
+PickCube & 100.0 & 100.0 & --- & Solved at Iter~0 \\
+PushT & 0.0 & 37.5 & Eur. 6.25 & Actionable unsolved \\
+UnitreeG1 & 0.0 & 87.5 & Eur. 12.5 & Actionable multi-stage \\
+Door$^\dagger$ & 75.0 & 87.5 & --- & Early gain, then plateau \\
+Drawer$^\dagger$ & 62.5 & 75.0 & --- & Early gain, then plateau \\
+AnymalC$^a$ & 31.25--56.25 & 100.0 & 3 VLM runs & Early gain, then instability \\
+PegInsertion$^b$ & 0.0 & 0.0 & Eur. 0.0 & Diagnosis without solve \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-% NOTE: PushCube and PickCube have no Eureka baseline runs yet.
-% The reported VLM+LLM numbers are from the latest runs (2026-03-04).
-% PushT and UnitreeG1 Eureka baselines had a VLM leak bug in Iter 0
-% (stale VLM comment from the resumed VLM+LLM run). This has been fixed
-% in code but the Eureka runs have not been re-executed yet.
+\noindent{\footnotesize $^\dagger$Cabinet tasks are VLM+LLM-only phase-probing runs; both improve at Iter~1 and then plateau.}
+\noindent{\footnotesize $^a$AnymalC summarizes three VLM+LLM runs; the latest run peaks at 87.5\% SE, while the best run reaches 100\%.}
+\noindent{\footnotesize $^b$PegInsertionSide has a paired Eureka baseline but both methods remain at 0\% success.}
 
-On the two hard tasks, VLM+LLM achieves 7--9$\times$ higher success than the
-Eureka baseline. On easy tasks, VLM+LLM achieves near-perfect performance from
-Iteration~0, making VLM feedback unnecessary.
+Across the full suite, four regimes emerge. Easy tasks (PushCube, PickCube) are
+already solved at Iter~0 and do not need VLM feedback. Actionable unsolved
+tasks (PushT, UnitreeG1) show the clearest benefit over Eureka. Partially
+solved tasks split into an articulated plateau regime (Door, Drawer) and a
+last-mile unstable regime (AnymalC). PegInsertionSide forms a ceiling regime:
+VLM changes diagnosis quality and return, but not success.
+
+On paired tasks, VLM+LLM beats Eureka strongly when the failure mode is
+reward-actionable (PushT: 37.5\% SE / 56.25\% SO vs 6.25\%; UnitreeG1:
+87.5\% SE vs 12.5\%), but not when the task is dominated by a hard binary and
+precision cliff (PegInsertionSide: both 0\%, though VLM+LLM reaches 221.8 best
+return vs Eureka's 113.7).
 
 \subsection{Per-Iteration Trajectories}
-
-% TODO: Figure showing SE over iterations for all 4 tasks, VLM+LLM vs Eureka
 
 \textbf{UnitreeG1PlaceAppleInBowl} (hardest task): VLM+LLM progresses from 0\%
 (Iter~0) to 100\% success\_once at Iter~2 and 87.5\% success\_at\_end at
 Iter~3. Each VLM observation identifies a new stage-specific bottleneck:
 ``grasps but fails to transport'' (Iter~0), ``nudge-and-abandon'' regression
 (Iter~1), ``near-bowl freeze'' (Iter~2--3). The Eureka baseline plateaus at
-6.25--12.5\%.
+6.25--12.5\% SE.
 
-\textbf{PushT-v1}: VLM+LLM reaches 56.25\% success\_once at Iter~4 after VLM
-identifies a ``press-and-freeze'' failure pattern. Eureka achieves only 6.25\%.
+\textbf{PushT-v1}: VLM+LLM reaches 37.5\% success\_at\_end and 56.25\%
+success\_once at Iter~4 after VLM identifies a ``press-and-freeze'' failure
+pattern. Eureka reaches only 6.25\% on both SE and SO.
 
 \textbf{PushCube-v1}: Achieves 100\% SE at Iter~0. Subsequent VLM feedback
 identifies ``overshoot / over-pushing'' every iteration, prompting complex
-geometric strategies that perform worse. Best SE after 5 iterations: 93.75\%.
-The apparent regression from 100\% may not be VLM-induced: the same Iter~0
+geometric strategies that often re-evaluate lower. The best observed SE remains
+100\% at Iter~0; later selected elites drop to 81.25--93.75\%. The apparent
+regression may not be purely VLM-induced: the same Iter~0
 policy re-evaluated at only 43.75\% in a later iteration, indicating that the
 initial 100\% was likely inflated by N=16 evaluation noise rather than
 representing true performance.
@@ -329,6 +364,28 @@ correctly reports ``no clear failure'' in 3/5 iterations, overreacts once
 (``near-failure / brittle strategy'' on a 100\% SE episode). The final best
 candidate's anti-stall code originated from VLM's one useful diagnosis.
 
+\textbf{OpenCabinetDoor / OpenCabinetDrawer}: Both tasks begin partially solved
+and improve immediately at Iter~1 (Door: 75.0\%$\to$87.5\%; Drawer:
+62.5\%$\to$75.0\%), then plateau. In Drawer, repeated candidate timeouts reduce
+effective search width to $K=2$ throughout; in Door, candidate attrition lowers
+effective $K$ in later iterations. VLM remains descriptively correct, but
+improvement saturates once the residual diagnosis stops changing.
+
+\textbf{AnymalC-Reach-v1} (3 runs): This task starts partially solved from
+Iter~0 with a large SO-SE gap. Iter~0 SE ranges from 31.25\% to 56.25\%, while
+SO is already 81.25--100\%. The best run reaches 100\% SE at Iter~2, but the
+latest run follows 31.25\%$\to$87.5\%$\to$18.75\%$\to$75.0\%$\to$6.25\%,
+showing that VLM-guided fixes can help early and then over-regularize terminal
+behavior once the task is mostly solved.
+
+\textbf{PegInsertionSide-v1}: Neither VLM+LLM nor Eureka achieves any success
+across 5 iterations (SE=SO=0 throughout). However, VLM+LLM nearly doubles best
+return (221.8 vs 113.7) and the VLM diagnosis evolves from
+reach-and-hover near the box to grasp-and-hold local optima. This indicates
+behavioral progress that scalar success metrics do not show, while also exposing
+an expressivity/budget ceiling for reward shaping on hard binary grasp plus
+precision alignment tasks.
+
 
 % =============================================================
 \section{Analysis}\label{sec:analysis}
@@ -336,7 +393,7 @@ candidate's anti-stall code originated from VLM's one useful diagnosis.
 \subsection{When Does VLM Feedback Help?}
 
 \begin{table}[htbp]
-\caption{VLM effectiveness by task difficulty}
+\caption{VLM effectiveness by task and solution phase}
 \label{tab:vlm_effectiveness}
 \centering
 \begin{tabular}{lccl}
@@ -347,18 +404,44 @@ PushCube & 100\% & Regression$^*$ & Stylistic (non-blocking) \\
 PickCube & 100\% & Neutral & Mostly ``no failure'' \\
 PushT & 0\% & Improvement & Blocking failure mode \\
 UnitreeG1 & 0\% & Major gain & Stage bottleneck \\
+OpenCabinetDoor$^\dagger$ & 75\% & Early gain, then plateau & Partial-open stall / contact drift \\
+OpenCabinetDrawer$^\dagger$ & 62.5\% & Early gain, then plateau$^\ddagger$ & Partial-open retreat / disengagement \\
+AnymalC$^a$ & 31--56\% & Mixed: early gain, later instability & Terminal hold / overshoot / posture \\
+PegInsertion$^b$ & 0\% & Informative diagnosis, no solve & Binary grasp / alignment cliff \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \noindent{\footnotesize $^*$Observed regression is confounded with N=16 evaluation noise (same policy re-evaluated $\pm$56pp).}
+\noindent{\footnotesize $^\dagger$Supplementary VLM+LLM-only analysis (no clean Eureka counterpart).}
+\noindent{\footnotesize $^\ddagger$Drawer had effective $K=2$ due repeated candidate timeouts; Door also had candidate attrition in late iterations.}
+\noindent{\footnotesize $^a$AnymalC summarizes three VLM+LLM runs with materially different post-breakthrough behavior.}
+\noindent{\footnotesize $^b$PegInsertion has a paired Eureka baseline, but neither method reaches non-zero success.}
 
-The value of VLM feedback is strongly correlated with task difficulty, measured
-by whether the LLM can solve the task at Iteration~0 without visual feedback.
+The value of VLM feedback is better explained by the policy's \emph{solution
+phase} than by task label alone. We define progress as:
+\begin{itemize}
+  \item \textbf{Unsolved phase:} low SE and low SO (policy rarely reaches the goal).
+  \item \textbf{Partially solved phase:} SO high but SE clearly lower (policy reaches but does not reliably hold/finish).
+  \item \textbf{Solved phase:} high SE with stable re-evaluation across iterations.
+\end{itemize}
+Under this definition, VLM feedback is typically most useful in unsolved and
+partially solved phases, and often less useful (or harmful) in the solved phase.
+However, the full 8-task suite shows that phase alone is not sufficient. By
+\emph{reward-actionable}, we mean that the VLM diagnosis can be mapped to a
+concrete reward change and that PPO can actually learn from that change within
+the available compute budget. PegInsertionSide is unsolved, yet VLM does not
+improve success because the diagnosed failure is not reward-actionable under the
+current setup. Thus, VLM value depends on two conditions jointly: the policy
+must still be failing, and the failure must be addressable by reward shaping
+within the available optimization horizon. The cabinet runs and AnymalC further
+refine the partially solved regime: some tasks plateau after one useful
+diagnosis, while others become unstable when repeated VLM-guided fixes
+over-regularize the terminal behavior.
 
 \subsection{VLM Failure Modes}
 
-We identify three failure modes of the VLM feedback loop:
+We identify several recurring failure modes and limits of the VLM feedback loop:
 
 \textbf{Severity miscalibration.} The VLM is prompted to find ``failure modes''
 and produces diagnoses with similar urgency regardless of success rate. On
@@ -377,6 +460,25 @@ the LLM to generate complex reward strategies (explicit geometric staging,
 curriculum gates, behind-pose requirements) that perform worse than the simple
 potential-based reward that already works. On PushCube, every iteration produced
 at least one 0\% SE candidate inspired by VLM-suggested complexity.
+
+\textbf{Search-width confound in plateau regimes.} In cabinet runs, multiple
+candidates failed to complete training (timeouts/runtime failures), reducing
+effective $K$ and lowering the chance of finding improvements in later
+iterations. Thus, late-iteration plateau should be interpreted as a joint effect
+of diagnosis saturation and reduced search width, not solely as a VLM failure.
+
+\textbf{Over-regularization in last-mile tasks.} AnymalC shows that repeated
+failure-focused feedback can become harmful after the task is mostly solved.
+Across three runs, early VLM-guided edits improve SE substantially, but later
+penalty accumulation can destabilize the terminal hold behavior and drive
+regression (e.g., the latest run peaks at 87.5\% and ends at 6.25\%).
+
+\textbf{Diagnosis-actionability gap.} PegInsertionSide demonstrates that a VLM
+can be descriptively correct yet practically ineffective. The diagnosis evolves
+meaningfully (hover near box $\to$ no insertion push $\to$ grasp-and-hold local
+optimum), but the LLM cannot convert these observations into a reward function
+that overcomes the binary grasp and precision alignment cliff within the current
+training budget.
 
 \subsection{Reward-Task Misalignment vs Reward Hacking}
 
@@ -401,20 +503,36 @@ noise affects both methods equally but complicates iteration-level comparisons.
 
 The elite mechanism acts as a critical safety net against VLM-induced regression
 on easy tasks. Without it, the best PushCube solution (100\% SE at Iter~0) would
-have been permanently lost when VLM-guided candidates underperformed. On hard
-tasks, the elite preserves gains between breakthrough iterations.
+have been permanently lost when VLM-guided candidates underperformed. In cabinet
+runs, elite carry-over preserved the Iter~1 breakthroughs (Door 87.5\%, Drawer
+75\%) during post-breakthrough plateau. In AnymalC Run~A, elite carry-over also
+preserved the Iter~2 100\% solution against later VLM-induced over-design. On
+hard tasks, the elite preserves gains between breakthrough iterations.
 
 
 % =============================================================
 \section{Discussion and Limitations}
 
 \textbf{When to use VLM feedback.}
-Our results suggest that VLM feedback should be conditionally activated: when
-the best candidate already achieves high success rates, VLM feedback risks
-over-engineering; when performance is low, VLM provides actionable behavioral
-diagnosis. The appropriate threshold is task-dependent and warrants further
-investigation. An adaptive system could also terminate the VLM loop when the
-same diagnosis repeats for 2+ consecutive iterations.
+Our results suggest phase-aware and actionability-aware activation of VLM
+feedback. Here, \emph{actionability-aware} means distinguishing between
+diagnoses that merely describe the failure and diagnoses that can be turned into
+reward modifications from which PPO can actually learn. In reward-actionable
+unsolved tasks (PushT, UnitreeG1), VLM diagnosis can substantially improve
+intervention targeting. In partially solved tasks, VLM is often best used
+early: cabinet tasks benefit once and then saturate, while AnymalC can regress
+if failure-focused edits keep accumulating after a breakthrough. In solved
+phases (PushCube, PickCube), VLM more often emphasizes non-blocking issues and
+induces over-engineering. An adaptive system should therefore gate VLM usage by
+phase, monitor whether diagnoses are still changing, and stop once SE is stable
+or repeated feedback no longer yields gains.
+
+\textbf{Reward-shaping ceiling.}
+PegInsertionSide shows that informative diagnosis is not enough. Some failures
+are bottlenecked by hard binary prerequisites or precision requirements that are
+poorly served by reward shaping alone under a fixed training budget. In such
+cases, curriculum learning, privileged intermediate labels, demonstrations, or
+more training may be necessary before VLM feedback can translate into success.
 
 \textbf{Single-seed evaluation.}
 All experiments use a single seed (9351). While K=4 candidates per iteration
@@ -452,26 +570,34 @@ design. By closing the loop between policy behavior observation (VLM) and reward
 code generation (LLM), we enable the system to diagnose and fix failure modes
 that scalar training statistics alone cannot reveal.
 
-Our main finding is that \textbf{VLM feedback value scales with task
-difficulty}:
+Our main finding is that \textbf{VLM feedback value is phase-dependent but not
+phase-determined}:
 \begin{itemize}
   \item On hard, multi-stage tasks (UnitreeG1: 6 stages), VLM provides
     stage-specific bottleneck identification that drives 7$\times$ performance
     improvement over the LLM-only baseline (87.5\% vs 12.5\%).
   \item On medium tasks (PushT), VLM identifies behavioral failure modes
-    invisible to scalar metrics, enabling 9$\times$ improvement (56.25\% vs
-    6.25\%).
+    invisible to scalar metrics, enabling a large gain over Eureka
+    (37.5\% SE / 56.25\% SO vs 6.25\%).
+  \item On partially solved articulated tasks (OpenCabinetDoor/Drawer), VLM
+    provides early gains (+12.5pp at Iter~1) but then plateaus; repetitive
+    diagnoses and reduced effective search width limit further improvement.
+  \item On partially solved last-mile tasks (AnymalC), VLM can still produce
+    sharp early gains, but repeated feedback may over-regularize terminal
+    behavior and destabilize later iterations.
   \item On easy, already-solved tasks (PushCube, PickCube), VLM feedback is
     unnecessary and may cause regression through over-engineering induction,
     though observed regressions are confounded with N=16 evaluation noise.
+  \item On very hard precision tasks (PegInsertionSide), VLM remains
+    diagnostically informative but does not improve success; this exposes a
+    diagnosis-actionability gap rather than a simple lack of visual signal.
 \end{itemize}
 
 These results point to a design principle for VLM-in-the-loop systems:
-\textbf{visual feedback should be conditionally activated} based on current
-task performance level, with early stopping when the VLM has no new
-observations to offer.
-The VLM excels at answering ``how is the robot failing?''---a question that only
-matters when the robot \emph{is} failing.
+\textbf{visual feedback should be conditionally activated by both solution
+phase and reward-actionability}. The VLM excels at answering ``how is the robot
+failing?'', but this only improves performance when the answer can be converted
+into an optimizable reward modification under the available budget.
 
 % Future work: (1) VLM_full_RewardPlot extension combining rollout images with
 % reward component plots for richer VLM diagnosis; (2) severity-aware VLM

@@ -41,10 +41,10 @@ fi
 
 # --- Configuration ---
 seeds=(9351) # 4796 1788
-OUTER_ITERS=5
+OUTER_ITERS=4
 WSEED=42
 GPUS="0,1,0,1"
-CROSS_RESUME=0  # Set to 1 to auto-resume from counterpart's iter 0
+CROSS_RESUME=1  # Set to 1 to auto-resume from counterpart's iter 0
 EARLY_STOP_SUCCESS=0  # Set to 1 to stop when success_rate >= 1.0
 VLM_REWARD_PLOT=0     # Set to 1 to send per-step reward plot to VLM
 
@@ -82,7 +82,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
+    for ENV in  "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1" "PushT-v1" "AnymalC-Reach-v1" "PegInsertionSide-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).

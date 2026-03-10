@@ -146,6 +146,147 @@ def extract_frames_from_video(
     return frames
 
 
+def extract_single_env_tile(frame: np.ndarray, env_idx: int, num_total_envs: int) -> np.ndarray:
+    """Extract a single environment's tile from a tiled frame.
+
+    Args:
+        frame: Tiled frame (H, W, 3) containing all envs in a grid.
+        env_idx: Index of the environment to extract (0-based).
+        num_total_envs: Total number of environments in the tile grid.
+
+    Returns:
+        Cropped frame showing only the specified environment.
+    """
+    h, w = frame.shape[:2]
+    nrows = int(np.sqrt(num_total_envs))
+    ncols = int(np.ceil(num_total_envs / nrows))
+    env_h = h // nrows
+    env_w = w // ncols
+    row = env_idx // ncols
+    col = env_idx % ncols
+    return frame[row * env_h : (row + 1) * env_h, col * env_w : (col + 1) * env_w].copy()
+
+
+def categorize_env_outcomes(
+    env_last_outcomes: Dict[int, Dict[str, bool]],
+) -> Dict[str, List[int]]:
+    """Categorize env indices into success / near_miss / failure.
+
+    Args:
+        env_last_outcomes: {env_idx: {"success_once": bool, "success_at_end": bool}}
+
+    Returns:
+        {"success": [env_indices], "near_miss": [env_indices], "failure": [env_indices]}
+    """
+    categories: Dict[str, List[int]] = {"success": [], "near_miss": [], "failure": []}
+    for env_idx, outcome in sorted(env_last_outcomes.items()):
+        if outcome.get("success_at_end", False):
+            categories["success"].append(env_idx)
+        elif outcome.get("success_once", False):
+            categories["near_miss"].append(env_idx)
+        else:
+            categories["failure"].append(env_idx)
+    return categories
+
+
+def extract_categorized_frames(
+    video_path: Path,
+    env_categories: Dict[str, List[int]],
+    num_total_envs: int,
+    max_frames: int = 8,
+) -> tuple:
+    """Create composite frames showing one representative env per category.
+
+    For each timestep, extracts tiles for one env per non-empty category,
+    adds a text label, and concatenates them horizontally.
+
+    Args:
+        video_path: Path to the tiled MP4 video.
+        env_categories: {"success": [env_indices], "near_miss": [...], "failure": [...]}
+        num_total_envs: Total envs in the tile grid.
+        max_frames: Maximum number of timestep frames to extract.
+
+    Returns:
+        (composite_frames, categories_shown, selected_envs)
+        - composite_frames: list of composite RGB frames
+        - categories_shown: list of category names included (e.g. ["failure", "near_miss"])
+        - selected_envs: dict {category: env_idx} for the representative envs
+    """
+    # Pick one representative env per non-empty category
+    # Priority order: failure > near_miss > success (most informative first)
+    selected: Dict[str, int] = {}
+    for cat in ["failure", "near_miss", "success"]:
+        indices = env_categories.get(cat, [])
+        if indices:
+            selected[cat] = indices[0]
+
+    if not selected:
+        return [], [], {}
+
+    # Label styling
+    _LABEL_MAP = {
+        "success": "SUCCESS",
+        "near_miss": "NEAR_MISS (success_once but lost)",
+        "failure": "FAILURE",
+    }
+    _COLOR_MAP = {
+        "success": (0, 180, 0),      # green
+        "near_miss": (220, 180, 0),   # yellow
+        "failure": (220, 0, 0),       # red
+    }
+
+    cap = cv2.VideoCapture(str(video_path))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total_frames == 0:
+        cap.release()
+        return [], [], {}
+
+    if total_frames <= max_frames:
+        frame_indices = list(range(total_frames))
+    else:
+        frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
+
+    composite_frames = []
+    for fidx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        tiles = []
+        for cat, env_idx in selected.items():
+            tile = extract_single_env_tile(frame, env_idx, num_total_envs)
+            # Add label banner at the top
+            label = f"{_LABEL_MAP[cat]} (env {env_idx})"
+            banner_h = 28
+            banner = np.zeros((banner_h, tile.shape[1], 3), dtype=np.uint8)
+            color = _COLOR_MAP[cat]
+            # OpenCV putText uses BGR but we're in RGB; convert color for putText
+            cv2.putText(
+                banner, label, (4, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA,
+            )
+            tile = np.concatenate([banner, tile], axis=0)
+            tiles.append(tile)
+
+        # Concatenate tiles horizontally
+        if tiles:
+            # Pad to same height if needed
+            max_h = max(t.shape[0] for t in tiles)
+            padded = []
+            for t in tiles:
+                if t.shape[0] < max_h:
+                    pad = np.zeros((max_h - t.shape[0], t.shape[1], 3), dtype=np.uint8)
+                    t = np.concatenate([t, pad], axis=0)
+                padded.append(t)
+            composite_frames.append(np.concatenate(padded, axis=1))
+
+    cap.release()
+    categories_shown = list(selected.keys())
+    return composite_frames, categories_shown, selected
+
+
 def build_vlm_prompt(env_id: str) -> str:
     """Build a VLM prompt focused on failure analysis."""
     return f"""Analyze this robot manipulation video for the task: {env_id}.
@@ -161,6 +302,45 @@ Focus on FAILURE ANALYSIS:
 
 Be concise and specific. Focus on actionable observations.
 Do NOT provide a numerical score - focus on qualitative analysis.
+
+After your English analysis, provide a brief summary in Japanese (日本語での簡潔な要約も追加してください)."""
+
+
+def build_vlm_prompt_categorized(env_id: str, categories_shown: List[str]) -> str:
+    """Build a VLM prompt for comparing success / near_miss / failure episodes.
+
+    Args:
+        env_id: Environment ID string.
+        categories_shown: List of categories visible in the frames
+            (e.g. ["failure", "near_miss", "success"]).
+    """
+    panel_desc = " | ".join(cat.upper() for cat in categories_shown)
+    cat_bullets = "\n".join(
+        f"   - {cat.upper()}: "
+        + {
+            "success": "Episode where the robot completed the task and held success at the end.",
+            "near_miss": "Episode where the robot achieved success_once but LOST it before the end.",
+            "failure": "Episode where the robot never achieved success at all.",
+        }[cat]
+        for cat in categories_shown
+    )
+
+    return f"""Analyze these side-by-side robot manipulation episodes for the task: {env_id}.
+
+Each frame shows panels left-to-right: {panel_desc}
+{cat_bullets}
+
+COMPARATIVE ANALYSIS:
+1. Describe what each panel's robot is doing. How do their behaviors differ?
+2. For FAILURE / NEAR_MISS panels: What specific behavior prevents success?
+   - Reaching errors, grasping failures, object slippage, wrong direction, etc.
+3. For NEAR_MISS (if present): What causes the robot to LOSE the success it once achieved?
+   - This is especially valuable — it reveals instability in the current policy.
+4. What reward signal adjustments could fix the observed failure modes?
+   - Be specific: which reward component should increase/decrease and why.
+
+Be concise and specific. Focus on actionable observations.
+Do NOT provide a numerical score — focus on qualitative analysis.
 
 After your English analysis, provide a brief summary in Japanese (日本語での簡潔な要約も追加してください)."""
 

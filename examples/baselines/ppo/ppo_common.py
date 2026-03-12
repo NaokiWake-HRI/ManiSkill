@@ -189,11 +189,31 @@ def categorize_env_outcomes(
     return categories
 
 
+def resolve_vlm_categories_to_show(
+    env_categories: Dict[str, List[int]],
+    focus: str = "all",
+) -> List[str]:
+    """Resolve which categorized outcome panels should be shown to VLM."""
+    focus = focus.lower()
+    if focus == "all":
+        requested = ["failure", "near_miss", "success"]
+    elif focus in {"failure", "near_miss", "success"}:
+        requested = [focus]
+    else:
+        raise ValueError(
+            f"Unsupported vlm_category_focus={focus!r}. "
+            "Expected one of: all, failure, near_miss, success."
+        )
+
+    return [cat for cat in requested if env_categories.get(cat)]
+
+
 def extract_categorized_frames(
     video_path: Path,
     env_categories: Dict[str, List[int]],
     num_total_envs: int,
     max_frames: int = 8,
+    categories_to_show: Optional[List[str]] = None,
 ) -> tuple:
     """Create composite frames showing one representative env per category.
 
@@ -205,6 +225,8 @@ def extract_categorized_frames(
         env_categories: {"success": [env_indices], "near_miss": [...], "failure": [...]}
         num_total_envs: Total envs in the tile grid.
         max_frames: Maximum number of timestep frames to extract.
+        categories_to_show: Ordered subset of categories to include. If None,
+            show all non-empty categories in failure > near_miss > success order.
 
     Returns:
         (composite_frames, categories_shown, selected_envs)
@@ -212,10 +234,10 @@ def extract_categorized_frames(
         - categories_shown: list of category names included (e.g. ["failure", "near_miss"])
         - selected_envs: dict {category: env_idx} for the representative envs
     """
-    # Pick one representative env per non-empty category
-    # Priority order: failure > near_miss > success (most informative first)
+    # Pick one representative env per non-empty category.
     selected: Dict[str, int] = {}
-    for cat in ["failure", "near_miss", "success"]:
+    ordered_categories = categories_to_show or ["failure", "near_miss", "success"]
+    for cat in ordered_categories:
         indices = env_categories.get(cat, [])
         if indices:
             selected[cat] = indices[0]
@@ -314,6 +336,44 @@ def build_vlm_prompt_categorized(env_id: str, categories_shown: List[str]) -> st
         categories_shown: List of categories visible in the frames
             (e.g. ["failure", "near_miss", "success"]).
     """
+    if not categories_shown:
+        raise ValueError("categories_shown must not be empty")
+
+    if categories_shown == ["failure"]:
+        return build_vlm_prompt(env_id)
+
+    if categories_shown == ["near_miss"]:
+        return f"""Analyze this robot manipulation video for the task: {env_id}.
+
+This episode is labeled NEAR_MISS.
+- NEAR_MISS: Episode where the robot achieved success_once but LOST it before the end.
+
+Focus on INSTABILITY ANALYSIS:
+1. What is the robot doing before, during, and after first reaching success?
+2. What causes it to LOSE the success it once achieved?
+3. What reward signal adjustments might help it achieve and maintain success?
+
+Be concise and specific. Focus on actionable observations.
+Do NOT provide a numerical score - focus on qualitative analysis.
+
+After your English analysis, provide a brief summary in Japanese (日本語での簡潔な要約も追加してください)."""
+
+    if categories_shown == ["success"]:
+        return f"""Analyze this robot manipulation video for the task: {env_id}.
+
+This episode is labeled SUCCESS.
+- SUCCESS: Episode where the robot completed the task and held success at the end.
+
+Focus on SUCCESS ANALYSIS:
+1. What is the robot doing that makes this episode successful?
+2. Which approach direction, contact pattern, or stopping behavior seems important?
+3. What reward signal adjustments would preserve this behavior while avoiding regressions?
+
+Be concise and specific. Focus on actionable observations.
+Do NOT provide a numerical score - focus on qualitative analysis.
+
+After your English analysis, provide a brief summary in Japanese (日本語での簡潔な要約も追加してください)."""
+
     panel_desc = " | ".join(cat.upper() for cat in categories_shown)
     cat_bullets = "\n".join(
         f"   - {cat.upper()}: "

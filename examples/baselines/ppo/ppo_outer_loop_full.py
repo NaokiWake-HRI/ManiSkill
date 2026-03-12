@@ -68,6 +68,7 @@ from ppo_common import (
     layer_init, Agent, Logger,
     crop_tiled_frame, extract_frames_from_video, build_vlm_prompt,
     extract_categorized_frames, build_vlm_prompt_categorized, categorize_env_outcomes,
+    resolve_vlm_categories_to_show,
     generate_reward_plot_html, append_html_to_file, generate_random_weights,
 )
 from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
@@ -160,6 +161,8 @@ class Args:
     """number of eval envs to show in VLM frames"""
     vlm_episode_selection: str = "random"
     """VLM episode selection mode: 'random' (current behavior, show env 0) or 'categorized' (show success/near_miss/failure side-by-side)"""
+    vlm_category_focus: str = "all"
+    """When vlm_episode_selection='categorized', choose 'all', 'failure', 'near_miss', or 'success'."""
     vlm_reward_plot: bool = False
     """if toggled, append per-step reward plot to VLM debug HTML"""
     rl_project_path: str = "/home/nwake/codes/RL_project"
@@ -185,6 +188,165 @@ class Args:
     batch_size: int = 0
     minibatch_size: int = 0
     num_iterations: int = 0
+
+
+def _normalize_env_outcomes_keys(
+    env_last_outcomes: Optional[Dict[Any, Dict[str, bool]]],
+) -> Dict[int, Dict[str, bool]]:
+    """Restore integer env indices after JSON round-trips."""
+    normalized: Dict[int, Dict[str, bool]] = {}
+    if not isinstance(env_last_outcomes, dict):
+        return normalized
+
+    for env_idx, outcome in env_last_outcomes.items():
+        try:
+            env_idx_int = int(env_idx)
+        except (TypeError, ValueError):
+            continue
+        normalized[env_idx_int] = outcome
+    return normalized
+
+
+def _normalize_history_env_outcomes(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize env_last_outcomes keys inside resumed outer-loop history."""
+
+    def _normalize_candidate(candidate: Any):
+        if isinstance(candidate, dict) and "env_last_outcomes" in candidate:
+            candidate["env_last_outcomes"] = _normalize_env_outcomes_keys(
+                candidate.get("env_last_outcomes")
+            )
+
+    for record in history:
+        if not isinstance(record, dict):
+            continue
+        _normalize_candidate(record.get("best_candidate"))
+        for candidate in record.get("all_candidates", []):
+            _normalize_candidate(candidate)
+        reflection_history = record.get("reflection_history")
+        if isinstance(reflection_history, dict):
+            _normalize_candidate(reflection_history.get("best_candidate"))
+            for candidate in reflection_history.get("all_candidates", []):
+                _normalize_candidate(candidate)
+    return history
+
+
+def _resolve_saved_path_candidates(path_str: Optional[str]) -> List[Path]:
+    """Resolve history-stored paths against this script's directory."""
+    if not path_str:
+        return []
+
+    raw_path = Path(path_str)
+    script_dir = Path(__file__).resolve().parent
+    candidates: List[Path] = []
+    if raw_path.is_absolute():
+        candidates.append(raw_path)
+    else:
+        candidates.append(raw_path)
+        candidates.append(script_dir / raw_path)
+        if raw_path.parts[:1] != ("runs",):
+            candidates.append(script_dir / "runs" / raw_path)
+
+    resolved: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        candidate_key = str(candidate)
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        resolved.append(candidate)
+    existing = [candidate for candidate in resolved if candidate.exists()]
+    missing = [candidate for candidate in resolved if not candidate.exists()]
+    return existing + missing
+
+
+def _resolve_saved_path(path_str: Optional[str]) -> Optional[Path]:
+    for candidate in _resolve_saved_path_candidates(path_str):
+        if candidate.exists():
+            return candidate
+    candidates = _resolve_saved_path_candidates(path_str)
+    return candidates[0] if candidates else None
+
+
+def _load_outer_loop_history(run_dir: Path) -> Optional[List[Dict[str, Any]]]:
+    hist_path = run_dir / "outer_loop_history.json"
+    if not hist_path.exists():
+        return None
+    try:
+        with open(hist_path) as f:
+            return _normalize_history_env_outcomes(json.load(f))
+    except Exception:
+        return None
+
+
+def _get_outer_loop_record(
+    history: Optional[List[Dict[str, Any]]],
+    outer_iter_idx: int,
+) -> Optional[Dict[str, Any]]:
+    if not history:
+        return None
+
+    for idx, record in enumerate(history):
+        if not isinstance(record, dict):
+            continue
+        try:
+            record_outer_iter = int(record.get("outer_iter", idx))
+        except (TypeError, ValueError):
+            record_outer_iter = idx
+        if record_outer_iter == outer_iter_idx:
+            return record
+
+    if 0 <= outer_iter_idx < len(history) and isinstance(history[outer_iter_idx], dict):
+        return history[outer_iter_idx]
+    return None
+
+
+def _collect_resume_provenance_records(
+    record: Optional[Dict[str, Any]],
+    outer_iter_idx: int,
+) -> List[Dict[str, Any]]:
+    """Follow resume provenance recursively for a specific iteration."""
+    collected: List[Dict[str, Any]] = []
+    visited_run_dirs = set()
+
+    def _visit(cur_record: Optional[Dict[str, Any]]):
+        if not isinstance(cur_record, dict):
+            return
+        resumed_from = cur_record.get("resumed_from")
+        if not isinstance(resumed_from, dict):
+            return
+        src_dir = _resolve_saved_path(resumed_from.get("source_dir"))
+        if src_dir is None:
+            return
+        src_key = str(src_dir)
+        if src_key in visited_run_dirs:
+            return
+        visited_run_dirs.add(src_key)
+        src_history = _load_outer_loop_history(src_dir)
+        src_record = _get_outer_loop_record(src_history, outer_iter_idx)
+        if not isinstance(src_record, dict):
+            return
+        collected.append(src_record)
+        _visit(src_record)
+
+    _visit(record)
+    return collected
+
+
+def _find_candidate_run_dir_from_artifact_path(path_str: Optional[str]) -> Optional[Path]:
+    """Infer candidate run dir from a saved artifact path."""
+    for path in _resolve_saved_path_candidates(path_str):
+        for candidate in [path, *path.parents]:
+            if candidate.name.startswith("cand_"):
+                return candidate
+    return None
+
+
+def _is_failureselection_mode(args: "Args") -> bool:
+    """Whether failure-selection-specific resume/VLM behavior should be enabled."""
+    return (
+        args.vlm_episode_selection == "categorized"
+        and args.vlm_category_focus == "failure"
+    )
 
 
 # ============================================================================
@@ -659,6 +821,7 @@ def run_ppo_training(
     latest_eval_metrics: Dict[str, Any] = {}
     latest_eval_step_rewards: List[torch.Tensor] = []
     latest_eval_reward_breakdowns: List[Dict[str, float]] = []
+    vlm_final_video_dir = None  # set during final eval if capture_video is on
 
     # Collect learning curve: eval metrics at each eval point (Eureka-style)
     learning_curve: List[Dict[str, Any]] = []
@@ -958,6 +1121,8 @@ if __name__ == "__main__":
         experiment_type = "eureka_full"
     elif args.vlm_reward_plot:
         experiment_type = "outer-loop_full_reward_plot"
+    elif _is_failureselection_mode(args):
+        experiment_type = "outer-loop_full_failureselection"
     else:
         experiment_type = "outer-loop_full"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
@@ -968,6 +1133,8 @@ if __name__ == "__main__":
             raise ValueError("Cannot use both --resume_dir and --resume_from_counterpart")
         # Determine counterpart experiment type
         if args.eureka_mode:
+            counterpart_type = "outer-loop_full"
+        elif _is_failureselection_mode(args):
             counterpart_type = "outer-loop_full"
         elif args.vlm_reward_plot:
             counterpart_type = "outer-loop_full"
@@ -1008,7 +1175,7 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"No outer_loop_history.json in {_src_dir}")
 
         with open(_hist_path) as f:
-            _resumed_history = json.load(f)
+            _resumed_history = _normalize_history_env_outcomes(json.load(f))
 
         # --resume_first_iter_only: keep only iter 0 from the source run.
         # This enables cross-experiment comparison (e.g., eureka iter0 → vlm iter1+).
@@ -1017,7 +1184,12 @@ if __name__ == "__main__":
                 raise ValueError("Source run has no completed iterations to resume from")
             _resumed_history = [_resumed_history[0]]
             # Tag the copied iteration with provenance metadata
-            _src_experiment_type = "eureka_full" if "eureka_full" in str(_src_dir) else "outer-loop_full"
+            if "eureka_full" in str(_src_dir):
+                _src_experiment_type = "eureka_full"
+            elif "outer-loop_full_failureselection" in str(_src_dir):
+                _src_experiment_type = "outer-loop_full_failureselection"
+            else:
+                _src_experiment_type = "outer-loop_full"
             _resumed_history[0]["resumed_from"] = {
                 "source_dir": str(_src_dir),
                 "source_experiment_type": _src_experiment_type,
@@ -1125,6 +1297,8 @@ if __name__ == "__main__":
     logger = Logger(log_wandb=args.track, tensorboard=writer)
 
     # --- VLM/LLM setup (once) ---
+    api_key = None
+    VLMEvaluator = None
     vlm = None
     llm = None
     save_vlm_debug_html = None
@@ -1185,6 +1359,354 @@ if __name__ == "__main__":
     else:
         print("[info] VLM/LLM disabled (--skip_vlm_llm)")
 
+    def analyze_candidate_video_with_vlm(
+        best_candidate: Dict[str, Any],
+        *,
+        outer_iter_idx: int,
+        debug_dir: Path,
+        context_label: str,
+        source_run_dir: Optional[Path] = None,
+        provenance_record: Optional[Dict[str, Any]] = None,
+        force_regeneration: bool = False,
+    ) -> Optional[str]:
+        """Run VLM analysis for a candidate using the current selection mode."""
+        if vlm is None or save_vlm_debug_html is None:
+            return None
+
+        provenance_records = _collect_resume_provenance_records(provenance_record, outer_iter_idx)
+        candidate_snapshots: List[Dict[str, Any]] = [best_candidate]
+        for record in provenance_records:
+            candidate = record.get("best_candidate")
+            if isinstance(candidate, dict):
+                candidate_snapshots.append(candidate)
+
+        candidate_ids = []
+        seen_candidate_ids = set()
+        for candidate in candidate_snapshots:
+            candidate_id = candidate.get("candidate_id")
+            if candidate_id is None or candidate_id in seen_candidate_ids:
+                continue
+            seen_candidate_ids.add(candidate_id)
+            candidate_ids.append(candidate_id)
+
+        provenance_run_dirs: List[Path] = []
+        if source_run_dir is not None:
+            resolved_source_run_dir = _resolve_saved_path(str(source_run_dir))
+            if resolved_source_run_dir is not None:
+                provenance_run_dirs.append(resolved_source_run_dir)
+        for record in provenance_records:
+            resumed_from = record.get("resumed_from")
+            if not isinstance(resumed_from, dict):
+                continue
+            src_dir = _resolve_saved_path(resumed_from.get("source_dir"))
+            if src_dir is not None:
+                provenance_run_dirs.append(src_dir)
+        deduped_provenance_run_dirs: List[Path] = []
+        seen_provenance_dirs = set()
+        for path in provenance_run_dirs:
+            path_key = str(path)
+            if path_key in seen_provenance_dirs:
+                continue
+            seen_provenance_dirs.add(path_key)
+            deduped_provenance_run_dirs.append(path)
+        provenance_run_dirs = deduped_provenance_run_dirs
+
+        def resolve_checkpoint_path() -> Optional[Path]:
+            iter_ckpt_name = f"iter_{outer_iter_idx+1:02d}_final.pt"
+            candidate_dirs: List[Path] = []
+            searched_ckpt_paths: List[Path] = []
+
+            for candidate in candidate_snapshots:
+                for artifact_path in (
+                    candidate.get("vlm_eval_video"),
+                    candidate.get("eval_video_dir"),
+                ):
+                    cand_dir = _find_candidate_run_dir_from_artifact_path(artifact_path)
+                    if cand_dir is not None:
+                        candidate_dirs.append(cand_dir)
+
+            for run_dir_candidate in provenance_run_dirs:
+                for candidate_id in candidate_ids:
+                    for cand_dir in sorted(run_dir_candidate.glob(f"cand_{candidate_id}*")):
+                        if cand_dir.is_dir():
+                            candidate_dirs.append(cand_dir)
+
+            seen = set()
+            for cand_dir in candidate_dirs:
+                cand_dir_key = str(cand_dir)
+                if cand_dir_key in seen:
+                    continue
+                seen.add(cand_dir_key)
+                ckpt_path = cand_dir / iter_ckpt_name
+                searched_ckpt_paths.append(ckpt_path)
+                if ckpt_path.exists():
+                    return ckpt_path
+
+            if searched_ckpt_paths:
+                print(
+                    f"  [warn] No checkpoint found for rollout regeneration "
+                    f"(searched {len(searched_ckpt_paths)} candidate paths for {iter_ckpt_name})"
+                )
+                for ckpt_path in searched_ckpt_paths[:8]:
+                    print(f"    - {ckpt_path}")
+                if len(searched_ckpt_paths) > 8:
+                    print(f"    ... {len(searched_ckpt_paths) - 8} more")
+            else:
+                print("  [warn] No candidate directories found for rollout regeneration")
+            return None
+
+        def regenerate_rollout_from_checkpoint() -> Optional[Path]:
+            checkpoint_path = resolve_checkpoint_path()
+            if checkpoint_path is None:
+                return None
+
+            print(f"  Regenerating eval rollout from checkpoint: {checkpoint_path}")
+
+            env_kwargs = dict(
+                obs_mode="state",
+                render_mode="rgb_array",
+                sim_backend="physx_cuda",
+                reward_mode="none",
+            )
+            if args.control_mode is not None:
+                env_kwargs["control_mode"] = args.control_mode
+            elif "PandaAllegro" in args.env_id:
+                env_kwargs["control_mode"] = "pd_ee_delta_pose"
+            else:
+                env_kwargs["control_mode"] = "pd_joint_delta_pos"
+
+            eval_envs = gym.make(
+                args.env_id,
+                num_envs=args.num_eval_envs,
+                reconfiguration_freq=args.eval_reconfiguration_freq,
+                **env_kwargs,
+            )
+
+            if "PandaAllegro" in args.env_id:
+                eval_envs = CoupledAllegroActionWrapper(eval_envs)
+            elif isinstance(eval_envs.action_space, gym.spaces.Dict):
+                eval_envs = FlattenActionSpaceWrapper(eval_envs)
+            validate_env_setup(args.env_id, env_kwargs["control_mode"], eval_envs)
+
+            reward_wrapper_eval = RewardWrapperDynamic(
+                eval_envs,
+                env_id=args.env_id,
+                weights=None,
+                raise_on_custom_fn_error=False,
+            )
+            eval_envs = reward_wrapper_eval
+
+            custom_code = best_candidate.get("code")
+            if custom_code is not None:
+                reward_wrapper_eval.set_custom_function(custom_fn=None, code=custom_code)
+
+            regen_video_dir = Path(f"runs/{run_dir}/videos/iter_{outer_iter_idx+1:02d}_resume_regen")
+            regen_video_dir.mkdir(parents=True, exist_ok=True)
+            eval_recorder = RecordEpisode(
+                eval_envs,
+                output_dir=regen_video_dir,
+                save_trajectory=False,
+                max_steps_per_video=args.num_eval_steps,
+                video_fps=30,
+            )
+            eval_recorder.max_steps_per_video = None
+            eval_envs = ManiSkillVectorEnv(
+                eval_recorder,
+                args.num_eval_envs,
+                ignore_terminations=not args.eval_partial_reset,
+                record_metrics=True,
+            )
+
+            agent = Agent(eval_envs).to(device)
+            try:
+                state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(checkpoint_path, map_location=device)
+            agent.load_state_dict(state_dict)
+            agent.eval()
+
+            env_last_outcomes: Dict[int, Dict[str, bool]] = {}
+            try:
+                eval_obs, _ = eval_envs.reset(seed=args.seed)
+                for _ in range(args.num_eval_steps):
+                    with torch.no_grad():
+                        eval_obs, _, _, _, eval_infos = eval_envs.step(
+                            agent.get_action(eval_obs, deterministic=True)
+                        )
+                        if "final_info" in eval_infos:
+                            mask = eval_infos["_final_info"]
+                            ep = eval_infos["final_info"]["episode"]
+                            for env_idx in range(args.num_eval_envs):
+                                if mask[env_idx]:
+                                    env_last_outcomes[env_idx] = {
+                                        "success_once": float(
+                                            ep.get("success_once", torch.zeros(args.num_eval_envs))[env_idx]
+                                        ) > 0.5,
+                                        "success_at_end": float(
+                                            ep.get("success_at_end", torch.zeros(args.num_eval_envs))[env_idx]
+                                        ) > 0.5,
+                                    }
+                eval_recorder.flush_video(name="vlm_final")
+            finally:
+                eval_envs.close()
+
+            regenerated_video = regen_video_dir / "vlm_final.mp4"
+            if not regenerated_video.exists():
+                print("  [warn] Rollout regeneration finished but no video was produced")
+                return None
+
+            best_candidate["env_last_outcomes"] = env_last_outcomes
+            best_candidate["eval_video_dir"] = str(regen_video_dir)
+            best_candidate["vlm_eval_video"] = str(regenerated_video)
+            best_candidate["regenerated_from_checkpoint"] = str(checkpoint_path)
+            print(f"  Regenerated video saved to: {regenerated_video}")
+            return regenerated_video
+
+        print(f"\n[VLM] Analyzing {context_label} video (iteration {outer_iter_idx+1})...")
+        print(f"  Episode selection mode: {args.vlm_episode_selection}")
+
+        latest_video = None
+        searched_video_dirs: List[Path] = []
+        for candidate in candidate_snapshots:
+            vlm_video = _resolve_saved_path(candidate.get("vlm_eval_video"))
+            if vlm_video is not None and vlm_video.exists():
+                latest_video = vlm_video
+                break
+
+            eval_video_dir = _resolve_saved_path(candidate.get("eval_video_dir"))
+            if eval_video_dir is not None:
+                searched_video_dirs.append(eval_video_dir)
+                if eval_video_dir.exists():
+                    video_files = list(eval_video_dir.glob("*.mp4"))
+                    if video_files:
+                        latest_video = max(video_files, key=lambda p: int(p.stem))
+                        print("  [warn] vlm_eval_video not available, using fallback from general video dir")
+                        break
+
+        frames = None
+        vlm_prompt = None
+        selected_envs = {}
+
+        env_outcomes = _normalize_env_outcomes_keys(best_candidate.get("env_last_outcomes", {}))
+        best_candidate["env_last_outcomes"] = env_outcomes
+
+        failureselection_mode = _is_failureselection_mode(args)
+        needs_regeneration = force_regeneration or latest_video is None
+        if failureselection_mode and not env_outcomes:
+            needs_regeneration = True
+
+        if needs_regeneration:
+            regenerated_video = regenerate_rollout_from_checkpoint()
+            if regenerated_video is not None:
+                latest_video = regenerated_video
+                env_outcomes = _normalize_env_outcomes_keys(best_candidate.get("env_last_outcomes", {}))
+                best_candidate["env_last_outcomes"] = env_outcomes
+
+        if latest_video is None:
+            print("[warn] No eval videos found")
+            if searched_video_dirs:
+                print(f"  Searched {len(searched_video_dirs)} video directories:")
+                seen_video_dirs = set()
+                for video_dir in searched_video_dirs:
+                    video_dir_key = str(video_dir)
+                    if video_dir_key in seen_video_dirs:
+                        continue
+                    seen_video_dirs.add(video_dir_key)
+                    print(f"    - {video_dir}")
+            return None
+
+        if args.vlm_episode_selection == "categorized":
+            if env_outcomes:
+                categories = categorize_env_outcomes(env_outcomes)
+                cat_summary = {k: len(v) for k, v in categories.items()}
+                print(f"  Env categories: {cat_summary}")
+                categories_to_show = resolve_vlm_categories_to_show(
+                    categories,
+                    focus=args.vlm_category_focus,
+                )
+                if categories_to_show:
+                    frames, categories_shown, selected_envs = extract_categorized_frames(
+                        latest_video,
+                        env_categories=categories,
+                        num_total_envs=args.num_eval_envs,
+                        max_frames=args.vlm_max_frames,
+                        categories_to_show=categories_to_show,
+                    )
+                    vlm_prompt = build_vlm_prompt_categorized(args.env_id, categories_shown)
+                    print(f"  Showing categories: {categories_shown} (envs: {selected_envs})")
+                else:
+                    frames, categories_shown, selected_envs = [], [], {}
+                    vlm_prompt = build_vlm_prompt_categorized(
+                        args.env_id,
+                        [args.vlm_category_focus],
+                    )
+                    print(
+                        "  [warn] No categorized frames matched "
+                        f"vlm_category_focus={args.vlm_category_focus!r}; "
+                        "running VLM without images"
+                    )
+            else:
+                print("  [warn] No env_last_outcomes available, falling back to random")
+
+        if frames is None:
+            frames = extract_frames_from_video(
+                latest_video,
+                max_frames=args.vlm_max_frames,
+                num_total_envs=args.num_eval_envs,
+                num_show_envs=args.vlm_num_envs,
+            )
+            vlm_prompt = build_vlm_prompt(args.env_id)
+
+        if frames is None:
+            print("[warn] No frames extracted from video")
+            return None
+
+        episode_info = {
+            "return": best_candidate.get("eval_metrics", {}).get("return", 0.0),
+            "success": best_candidate.get("eval_metrics", {}).get("success_at_end", best_candidate.get("fitness", 0.0)),
+            "success_at_end": best_candidate.get("fitness", best_candidate.get("eval_metrics", {}).get("success_at_end", 0.0)),
+            "success_once": best_candidate.get("eval_metrics", {}).get("success_once", 0.0),
+            "length": best_candidate.get("eval_metrics", {}).get("episode_len", args.num_eval_steps),
+        }
+        if selected_envs:
+            panel_info = {}
+            for cat, env_idx in selected_envs.items():
+                eo = env_outcomes.get(env_idx, {})
+                panel_info[cat] = {
+                    "env_idx": env_idx,
+                    "success_at_end": eo.get("success_at_end", False),
+                    "success_once": eo.get("success_once", False),
+                }
+            episode_info["panels"] = panel_info
+
+        vlm_to_use = vlm
+        if vlm_prompt != build_vlm_prompt(args.env_id):
+            vlm_to_use = VLMEvaluator.from_openai(
+                api_key=api_key,
+                model=args.vlm_model,
+                prompt=vlm_prompt,
+                max_frames=args.vlm_max_frames,
+                cache_results=False,
+            )
+
+        vlm_score, vlm_comment, _ = vlm_to_use.evaluate(frames, episode_info)
+        print(f"[VLM] Analysis:\n{vlm_comment}")
+        best_candidate["vlm_comment"] = vlm_comment
+        best_candidate["vlm_score"] = vlm_score
+
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        vlm_html_path = debug_dir / f"iter_{outer_iter_idx+1:02d}_vlm.html"
+        save_vlm_debug_html(
+            frames=frames,
+            prompt=vlm_prompt,
+            episode_info=episode_info,
+            vlm_score=vlm_score,
+            vlm_comment=vlm_comment,
+            save_path=vlm_html_path,
+            max_frames=args.vlm_max_frames,
+        )
+        return vlm_comment
+
     print(f"\n{'='*60}")
     print(f"PPO Outer Loop: {args.num_outer_iters} iterations x {args.total_timesteps_per_iter} steps")
     print(f"Initial weights: {current_weights}")
@@ -1210,6 +1732,32 @@ if __name__ == "__main__":
         with open(_hist_save_path, "w") as f:
             json.dump(outer_loop_history, f, indent=2, default=str)
         print(f"[Resume] Saved resumed history to {_hist_save_path}")
+
+        if vlm is not None and _is_failureselection_mode(args):
+            resumed_record = outer_loop_history[-1]
+            resumed_outer_iter = int(resumed_record.get("outer_iter", len(outer_loop_history) - 1))
+            resumed_debug_dir = Path(f"runs/{run_dir}/debug_html")
+            resumed_best = resumed_record.get("best_candidate", {})
+            resumed_vlm_comment = analyze_candidate_video_with_vlm(
+                resumed_best,
+                outer_iter_idx=resumed_outer_iter,
+                debug_dir=resumed_debug_dir,
+                context_label="resumed best candidate",
+                source_run_dir=Path(resumed_record.get("resumed_from", {}).get("source_dir", "")) if resumed_record.get("resumed_from") else None,
+                provenance_record=resumed_record,
+                force_regeneration=True,
+            )
+            if resumed_vlm_comment is not None:
+                reflection_history = resumed_record.get("reflection_history")
+                if isinstance(reflection_history, dict):
+                    reflection_history["vlm_feedback"] = resumed_vlm_comment
+                    reflection_best = reflection_history.get("best_candidate")
+                    if isinstance(reflection_best, dict):
+                        reflection_best["vlm_comment"] = resumed_best.get("vlm_comment")
+                        reflection_best["vlm_score"] = resumed_best.get("vlm_score")
+                with open(_hist_save_path, "w") as f:
+                    json.dump(outer_loop_history, f, indent=2, default=str)
+                print(f"[Resume] Added VLM feedback for resumed iteration {resumed_outer_iter+1}")
 
     for outer_iter in range(_resume_start_iter, args.num_outer_iters):
         print(f"\n{'='*60}")
@@ -1901,115 +2449,12 @@ if __name__ == "__main__":
         # ========== STEP 4: VLM analysis ==========
         vlm_comment = None
         if vlm is not None:
-            print(f"\n[VLM] Analyzing best candidate's video (iteration {outer_iter+1})...")
-            print(f"  Episode selection mode: {args.vlm_episode_selection}")
-
-            # Use the dedicated VLM video from the final eval pass.
-            # This directory contains ONLY the final eval's recording,
-            # guaranteeing 1:1 alignment with env_last_outcomes.
-            # Fallback: pick highest-numbered .mp4 in the general video dir.
-            _vlm_video = best.get("vlm_eval_video")
-            if _vlm_video and Path(_vlm_video).exists():
-                latest_video = Path(_vlm_video)
-            else:
-                video_dir = Path(best["eval_video_dir"])
-                _vfiles = list(video_dir.glob("*.mp4"))
-                latest_video = max(_vfiles, key=lambda p: int(p.stem)) if _vfiles else None
-                if latest_video:
-                    print("  [warn] vlm_eval_video not available, using fallback from general video dir")
-
-            if latest_video is not None:
-                frames = None
-                vlm_prompt = None
-                selected_envs = {}  # populated only when categorized mode succeeds
-
-                if args.vlm_episode_selection == "categorized":
-                    # --- Categorized mode: show success/near_miss/failure side-by-side ---
-                    env_outcomes = best.get("env_last_outcomes", {})
-                    if env_outcomes:
-                        categories = categorize_env_outcomes(env_outcomes)
-                        cat_summary = {k: len(v) for k, v in categories.items()}
-                        print(f"  Env categories: {cat_summary}")
-
-                        frames, categories_shown, selected_envs = extract_categorized_frames(
-                            latest_video,
-                            env_categories=categories,
-                            num_total_envs=args.num_eval_envs,
-                            max_frames=args.vlm_max_frames,
-                        )
-                        if frames and categories_shown:
-                            vlm_prompt = build_vlm_prompt_categorized(args.env_id, categories_shown)
-                            print(f"  Showing categories: {categories_shown} (envs: {selected_envs})")
-                        else:
-                            print("  [warn] Categorized extraction failed, falling back to random")
-                    else:
-                        print("  [warn] No env_last_outcomes available, falling back to random")
-
-                if frames is None:
-                    # --- Random mode (default / fallback) ---
-                    frames = extract_frames_from_video(
-                        latest_video,
-                        max_frames=args.vlm_max_frames,
-                        num_total_envs=args.num_eval_envs,
-                        num_show_envs=args.vlm_num_envs,
-                    )
-                    vlm_prompt = build_vlm_prompt(args.env_id)
-
-                if frames:
-                    episode_info = {
-                        "return": best["eval_metrics"].get("return", 0.0),
-                        "success": best["eval_metrics"].get("success_at_end", best["fitness"]),
-                        "success_at_end": best["fitness"],
-                        "success_once": best["eval_metrics"].get("success_once", 0.0),
-                        "length": args.num_eval_steps,
-                    }
-                    # In categorized mode, add per-panel info so VLM sees which
-                    # env belongs to which category (matches the labeled frames).
-                    if selected_envs:
-                        env_outcomes = best.get("env_last_outcomes", {})
-                        panel_info = {}
-                        for cat, env_idx in selected_envs.items():
-                            eo = env_outcomes.get(env_idx, {})
-                            panel_info[cat] = {
-                                "env_idx": env_idx,
-                                "success_at_end": eo.get("success_at_end", False),
-                                "success_once": eo.get("success_once", False),
-                            }
-                        episode_info["panels"] = panel_info
-
-                    # Use a temporary VLM evaluator if prompt differs from default
-                    # (the default VLM's prompt is baked into its eval_fn closure)
-                    vlm_to_use = vlm
-                    if vlm_prompt != build_vlm_prompt(args.env_id):
-                        vlm_to_use = VLMEvaluator.from_openai(
-                            api_key=api_key,
-                            model=args.vlm_model,
-                            prompt=vlm_prompt,
-                            max_frames=args.vlm_max_frames,
-                            cache_results=False,
-                        )
-
-                    vlm_score, vlm_comment, _ = vlm_to_use.evaluate(frames, episode_info)
-                    print(f"[VLM] Analysis:\n{vlm_comment}")
-                    best["vlm_comment"] = vlm_comment
-                    best["vlm_score"] = vlm_score
-
-                    # Save VLM debug HTML
-                    debug_dir = Path(f"runs/{run_dir}/debug_html")
-                    vlm_html_path = debug_dir / f"iter_{outer_iter+1:02d}_vlm.html"
-                    save_vlm_debug_html(
-                        frames=frames,
-                        prompt=vlm_prompt,
-                        episode_info=episode_info,
-                        vlm_score=vlm_score,
-                        vlm_comment=vlm_comment,
-                        save_path=vlm_html_path,
-                        max_frames=args.vlm_max_frames,
-                    )
-                else:
-                    print("[warn] No frames extracted from video")
-            else:
-                print("[warn] No eval videos found")
+            vlm_comment = analyze_candidate_video_with_vlm(
+                best,
+                outer_iter_idx=outer_iter,
+                debug_dir=debug_dir,
+                context_label="best candidate",
+            )
 
         # ========== STEP 5: Reward Reflection ==========
         reflection_summary = None

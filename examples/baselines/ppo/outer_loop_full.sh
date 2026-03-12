@@ -82,7 +82,7 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in  "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1" "PushT-v1" "AnymalC-Reach-v1" "PegInsertionSide-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
+    for ENV in "AnymalC-Reach-v1" "OpenCabinetDoor-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).

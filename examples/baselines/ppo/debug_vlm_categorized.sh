@@ -27,6 +27,8 @@ echo "=== Debug VLM Categorized Episode Selection ==="
 echo "VLM episode selection: ${VLM_MODE}"
 echo ""
 
+mkdir -p logs
+
 for ENV in "PushCube-v1" "PickCube-v1"; do
     echo "----------------------------------------"
     echo "[${ENV}] Starting (K=2, N=2, 5M steps)"

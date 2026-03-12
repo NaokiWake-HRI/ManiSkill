@@ -2,10 +2,10 @@
 # PPO Outer Loop: Unified script for VLM+LLM and Eureka (LLM-only) modes
 #
 # Modes:
-#   vlm    - VLM+LLM Full Replacement: VLM analyzes robot behavior from videos,
-#            LLM rewrites entire reward function using VLM feedback.
-#   eureka - Eureka Full Replacement: LLM-only, no VLM video analysis.
-#            Ablation counterpart of vlm mode for fair comparison.
+#   vlm                  - VLM+LLM Full Replacement: default VLM mode.
+#   vlm_failureselection - VLM+LLM Full Replacement with failure-focused episode selection.
+#   eureka               - Eureka Full Replacement: LLM-only, no VLM video analysis.
+#                          Ablation counterpart of vlm mode for fair comparison.
 #
 # Common behavior:
 # - Generates K=4 reward function candidates per iteration
@@ -28,14 +28,16 @@
 #
 # Usage:
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh vlm
+#   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh vlm_failureselection
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh eureka
 
 # --- Mode selection ---
 MODE="${1:-vlm}"
-if [ "${MODE}" != "vlm" ] && [ "${MODE}" != "eureka" ]; then
-    echo "Usage: bash outer_loop_full.sh [vlm|eureka]"
-    echo "  vlm    : VLM+LLM mode (default)"
-    echo "  eureka : LLM-only mode (no VLM)"
+if [ "${MODE}" != "vlm" ] && [ "${MODE}" != "vlm_failureselection" ] && [ "${MODE}" != "eureka" ]; then
+    echo "Usage: bash outer_loop_full.sh [vlm|vlm_failureselection|eureka]"
+    echo "  vlm                  : VLM+LLM mode (default)"
+    echo "  vlm_failureselection : VLM+LLM mode with categorized failure episode selection"
+    echo "  eureka               : LLM-only mode (no VLM)"
     exit 1
 fi
 
@@ -53,11 +55,22 @@ if [ "${MODE}" == "eureka" ]; then
     EXP_PREFIX="ppo-eureka-full"
     MODE_LABEL="Eureka Full Replacement (NO VLM)"
     WANDB_TAG="eureka-full"
+    VLM_SELECTION_ARG=""
+    VLM_CATEGORY_ARG=""
+elif [ "${MODE}" == "vlm_failureselection" ]; then
+    EUREKA_ARG=""
+    EXP_PREFIX="ppo-vlm-full-failureselection"
+    MODE_LABEL="VLM+LLM Full Replacement (failure selection)"
+    WANDB_TAG="vlm-full-failureselection"
+    VLM_SELECTION_ARG="--vlm_episode_selection=categorized"
+    VLM_CATEGORY_ARG="--vlm_category_focus=failure"
 else
     EUREKA_ARG=""
     EXP_PREFIX="ppo-vlm-full"
     MODE_LABEL="VLM+LLM Full Replacement"
     WANDB_TAG="vlm-full"
+    VLM_SELECTION_ARG=""
+    VLM_CATEGORY_ARG=""
 fi
 
 LOG_DIR="logs/${MODE}_full_$(date +%Y%m%d_%H%M%S)"
@@ -77,12 +90,16 @@ echo "Weight seed: ${WSEED}"
 echo "Seeds: ${seeds[@]}"
 echo "GPUs: ${GPUS}"
 echo "Cross-resume: ${CROSS_RESUME}"
+if [ -n "${VLM_SELECTION_ARG}" ]; then
+    echo "VLM episode selection: categorized"
+    echo "VLM category focus: failure"
+fi
 echo "Logs: ${LOG_DIR}"
 echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in  "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "UnitreeG1PlaceAppleInBowl-v1" "PushT-v1" "AnymalC-Reach-v1" "PegInsertionSide-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
+    for ENV in "AnymalC-Reach-v1" "OpenCabinetDoor-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
     do
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
@@ -196,6 +213,8 @@ for seed in "${seeds[@]}"; do
           ${GAMMA_ARG} \
           ${GAE_LAMBDA_ARG} \
           ${EUREKA_ARG} \
+          ${VLM_SELECTION_ARG} \
+          ${VLM_CATEGORY_ARG} \
           --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \

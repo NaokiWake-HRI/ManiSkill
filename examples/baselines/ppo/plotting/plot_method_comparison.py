@@ -62,6 +62,17 @@ def _extract_seed(name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _history_length(run_dir: Path) -> int:
+    history_path = run_dir / "outer_loop_history.json"
+    if not history_path.exists():
+        return 0
+    try:
+        with open(history_path) as f:
+            return len(json.load(f))
+    except (json.JSONDecodeError, ValueError):
+        return 0
+
+
 def latest_run(method: str, task: str, seed: str) -> Path | None:
     task_dir = BASE_DIR / method / task
     if not task_dir.exists():
@@ -69,7 +80,8 @@ def latest_run(method: str, task: str, seed: str) -> Path | None:
     runs = [r for r in task_dir.iterdir() if _extract_seed(r.name) == seed]
     if not runs:
         return None
-    runs.sort(key=lambda p: _extract_timestamp(p.name))
+    # Prefer runs with the most history entries, then by timestamp
+    runs.sort(key=lambda p: (_history_length(p), _extract_timestamp(p.name)))
     return runs[-1]
 
 

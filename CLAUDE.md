@@ -245,3 +245,9 @@ success : 5 (bonus)
 - `_resolve_task_id()` は substring matching（longest match first）。`PickCubePandaAllegro` が `PickCube` より先にマッチするよう key 長降順ソート済み
 - `ppo_outer_loop_full.py` の `_state_access_docs["PickCubePandaAllegro"]` を環境実装と同期させること
 - TouchLab センサーの接触インパルスは `get_tl_impulse()` / `get_tl_obj_impulse(obj)` で取得。現在の報酬関数では未使用（将来の Eureka 生成コード用）
+
+---
+
+## Work Style
+
+- **確認を求めるな**: ファイル削除・コード変更・コマンド実行など、ユーザーが指示した操作はいちいち確認せず即実行すること。自律的に判断して進める。

@@ -26,7 +26,8 @@ METHODS_STANDARD = {
 
 METHODS_FULL = {
     "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
-    "outer-loop_full": {"label": "Outer-Loop Full", "color": "#e67e22", "marker": "o"},
+    "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
+    "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
 }
 
 TASKS_STANDARD = [
@@ -109,14 +110,17 @@ def main():
     tasks = TASKS_FULL if is_full else TASKS_STANDARD
     seeds = args.seeds
 
-    # Filter to tasks that have data for ALL methods
+    # Filter to tasks that have data for at least one method
     filtered_tasks = []
     for task in tasks:
-        if all(any(latest_run(m, task, s) is not None for s in seeds) for m in methods):
+        has_any = any(any(latest_run(m, task, s) is not None for s in seeds) for m in methods)
+        if has_any:
             filtered_tasks.append(task)
-        else:
             missing = [m for m in methods if not any(latest_run(m, task, s) is not None for s in seeds)]
-            print(f"Skipping {task}: no data for {missing}")
+            if missing:
+                print(f"Note: {task} missing data for {missing} (plotting available methods only)")
+        else:
+            print(f"Skipping {task}: no data for any method")
     tasks = filtered_tasks
 
     n_tasks = len(tasks)

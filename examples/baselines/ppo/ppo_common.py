@@ -179,7 +179,8 @@ def categorize_env_outcomes(
         {"success": [env_indices], "near_miss": [env_indices], "failure": [env_indices]}
     """
     categories: Dict[str, List[int]] = {"success": [], "near_miss": [], "failure": []}
-    for env_idx, outcome in sorted(env_last_outcomes.items()):
+    for env_idx, outcome in sorted(env_last_outcomes.items(), key=lambda x: int(x[0])):
+        env_idx = int(env_idx)  # JSON round-trip converts int keys to str
         if outcome.get("success_at_end", False):
             categories["success"].append(env_idx)
         elif outcome.get("success_once", False):

@@ -162,8 +162,9 @@ def extract_single_env_tile(frame: np.ndarray, env_idx: int, num_total_envs: int
     ncols = int(np.ceil(num_total_envs / nrows))
     env_h = h // nrows
     env_w = w // ncols
-    row = env_idx // ncols
-    col = env_idx % ncols
+    # ManiSkill tile_images fills column-major: top-to-bottom, then left-to-right
+    col = env_idx // nrows
+    row = env_idx % nrows
     return frame[row * env_h : (row + 1) * env_h, col * env_w : (col + 1) * env_w].copy()
 
 
@@ -280,17 +281,6 @@ def extract_categorized_frames(
         tiles = []
         for cat, env_idx in selected.items():
             tile = extract_single_env_tile(frame, env_idx, num_total_envs)
-            # Add label banner at the top
-            label = f"{_LABEL_MAP[cat]} (env {env_idx})"
-            banner_h = 28
-            banner = np.zeros((banner_h, tile.shape[1], 3), dtype=np.uint8)
-            color = _COLOR_MAP[cat]
-            # OpenCV putText uses BGR but we're in RGB; convert color for putText
-            cv2.putText(
-                banner, label, (4, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA,
-            )
-            tile = np.concatenate([banner, tile], axis=0)
             tiles.append(tile)
 
         # Concatenate tiles horizontally

@@ -180,6 +180,11 @@ class Logger:
         self.writer.close()
 
 if __name__ == "__main__":
+    # Workaround for PyTorch 2.10 + CUDA 12.8 + H200: cublasSgemmStridedBatched
+    # crashes on batched matmul. Switching to cublasLt avoids the bug.
+    import torch
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)

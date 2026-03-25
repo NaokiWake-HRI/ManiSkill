@@ -37,6 +37,7 @@ import inspect
 import json
 import os
 import pickle
+import shutil
 import subprocess
 import random as py_random
 import sys
@@ -73,6 +74,59 @@ from ppo_common import (
 )
 from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
 from task_descriptions import get_llm_task_descs, STATE_ACCESS_DOCS
+
+# ---------------------------------------------------------------------------
+# Disk-space safety
+# ---------------------------------------------------------------------------
+_DISK_MIN_FREE_MB = 2048  # 2 GB minimum free space
+
+
+def _get_quota_free_mb() -> Optional[int]:
+    """Return free MB under user disk quota, or None if quota is not set."""
+    try:
+        result = subprocess.run(
+            ["quota", "-s"], capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "/dev/" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    used_str, limit_str = parts[1], parts[3]  # space, limit
+                    def _parse_mb(s):
+                        s = s.strip("*")
+                        if s.endswith("G"):
+                            return int(float(s[:-1]) * 1024)
+                        if s.endswith("M"):
+                            return int(float(s[:-1]))
+                        if s.endswith("K"):
+                            return max(0, int(float(s[:-1]) / 1024))
+                        return int(s) // 1024  # assume KB
+                    used_mb = _parse_mb(used_str)
+                    limit_mb = _parse_mb(limit_str)
+                    if limit_mb > 0:
+                        return max(0, limit_mb - used_mb)
+    except Exception:
+        pass
+    return None
+
+
+def _check_disk_space(path: str, required_mb: int = _DISK_MIN_FREE_MB) -> None:
+    """Raise RuntimeError if free disk space at *path* is below *required_mb*.
+
+    Checks user quota first; falls back to filesystem free space.
+    """
+    quota_free = _get_quota_free_mb()
+    if quota_free is not None:
+        free_mb = quota_free
+    else:
+        usage = shutil.disk_usage(os.path.dirname(os.path.abspath(path)))
+        free_mb = usage.free // (1024 * 1024)
+    if free_mb < required_mb:
+        raise RuntimeError(
+            f"Disk space too low to save {path}: "
+            f"{free_mb}MB free < {required_mb}MB required. "
+            f"Free disk space and retry."
+        )
 
 
 @dataclass
@@ -151,9 +205,9 @@ class Args:
     """automatically find the counterpart experiment's latest run for this env_id and resume from its iter 0. eureka_mode searches outer-loop_full runs; non-eureka searches eureka_full runs."""
 
     # VLM/LLM arguments
-    vlm_model: str = "gpt-5.2"
+    vlm_model: str = "gpt-5.4"
     """VLM model for video analysis"""
-    llm_model: str = "gpt-5.2"
+    llm_model: str = "gpt-5.4"
     """LLM model for reward tuning"""
     vlm_max_frames: int = 8
     """max frames to send to VLM"""
@@ -173,7 +227,7 @@ class Args:
     """pure Eureka mode: use LLM only without VLM (learning curve based optimization)"""
     enable_function_code: bool = True
     """allow LLM to generate custom reward code (Eureka-style). When False, params-only mode."""
-    num_reward_candidates: int = 4
+    num_reward_candidates: int = 16
     """number of reward function candidates to generate per iteration (K in Eureka paper)"""
     enable_reward_reflection: bool = True
     """enable Reward Reflection: analyze learning curves and provide feedback to LLM"""
@@ -540,10 +594,28 @@ def _train_candidates_parallel(
                         result.get("traceback", ""),
                     ))
             else:
-                # Process-level failure
-                print(f"    Candidate {cand['id']+1} FAILED (exit code: {proc.returncode})")
-                print(f"    See log: {log_path}")
-                failed_candidates.append((cand, f"Process exited with code {proc.returncode}", ""))
+                # Process-level failure — check for CUDA OOM
+                is_oom = False
+                try:
+                    with open(log_path) as lf:
+                        log_tail = lf.read()[-2000:]
+                    if "CUDA out of memory" in log_tail or "OutOfMemoryError" in log_tail:
+                        is_oom = True
+                except OSError:
+                    pass
+
+                if is_oom:
+                    print(f"    Candidate {cand['id']+1} FAILED: CUDA OOM detected!")
+                    print(f"    See log: {log_path}")
+                    print(f"\n{'='*60}")
+                    print(f"FATAL: CUDA OOM — PROCS_PER_GPU is too high for this task.")
+                    print(f"Reduce PROCS_PER_GPU and re-run.")
+                    print(f"{'='*60}")
+                    sys.exit(137)
+                else:
+                    print(f"    Candidate {cand['id']+1} FAILED (exit code: {proc.returncode})")
+                    print(f"    See log: {log_path}")
+                    failed_candidates.append((cand, f"Process exited with code {proc.returncode}", ""))
 
     # --- Phase 2: Sequential LLM retry for failed candidates ---
     if failed_candidates and llm is not None:
@@ -780,11 +852,14 @@ def run_ppo_training(
     eval_output_dir = f"runs/{run_dir}/videos/iter_{outer_iter+1:02d}"
     eval_recorder = None  # reference to RecordEpisode for output_dir switching
     if args.capture_video:
-        print(f"  Saving eval videos to {eval_output_dir}")
+        # Only record the final eval (vlm_final) to save disk space.
+        # Start with save_video=False; enable before the last iteration.
+        print(f"  Video recording: vlm_final only (saving disk)")
         eval_recorder = RecordEpisode(
             eval_envs,
             output_dir=eval_output_dir,
             save_trajectory=False,
+            save_video=False,
             max_steps_per_video=args.num_eval_steps,
             video_fps=30,
         )
@@ -838,6 +913,7 @@ def run_ppo_training(
             # so the VLM video is guaranteed to match env_last_outcomes.
             vlm_final_video_dir = None
             if is_last_iter and eval_recorder is not None:
+                eval_recorder._save_video = True  # enable recording for final eval
                 eval_recorder.flush_video()  # flush any pending frames to old dir
                 vlm_final_video_dir = f"runs/{run_dir}/videos/iter_{outer_iter+1:02d}_vlm_final"
                 Path(vlm_final_video_dir).mkdir(parents=True, exist_ok=True)
@@ -918,6 +994,7 @@ def run_ppo_training(
 
         if args.save_model and iteration % args.eval_freq == 1:
             model_path = f"runs/{run_dir}/iter_{outer_iter+1:02d}_ckpt_{iteration}.pt"
+            _check_disk_space(model_path)
             torch.save(agent.state_dict(), model_path)
 
         # LR annealing
@@ -1071,6 +1148,7 @@ def run_ppo_training(
     # Save final model for this iteration
     if args.save_model:
         model_path = f"runs/{run_dir}/iter_{outer_iter+1:02d}_final.pt"
+        _check_disk_space(model_path)
         torch.save(agent.state_dict(), model_path)
         print(f"  Model saved to {model_path}")
 
@@ -1107,24 +1185,42 @@ if __name__ == "__main__":
     # Internal worker mode for parallel K-candidate training.
     # Invoked as: python ppo_outer_loop_full.py _worker <task_pickle_path>
     # CUDA_VISIBLE_DEVICES is set by the parent process.
+    # Workaround for PyTorch 2.10 + CUDA 12.8 + H200: cublasSgemmStridedBatched
+    # crashes on batched matmul. Switching to cublasLt avoids the bug.
+    import torch
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+
     if len(sys.argv) >= 3 and sys.argv[1] == "_worker":
         _run_worker_mode(sys.argv[2])
         sys.exit(0)
 
     args = tyro.cli(Args)
 
+    # Set CUDA_VISIBLE_DEVICES early (before any CUDA init) so the main process
+    # uses one of the specified GPUs instead of defaulting to GPU 0.
+    if args.gpus and "CUDA_VISIBLE_DEVICES" not in os.environ:
+        _first_gpu = args.gpus.split(",")[0]
+        os.environ["CUDA_VISIBLE_DEVICES"] = _first_gpu
+        print(f"[Init] Set CUDA_VISIBLE_DEVICES={_first_gpu} for main process")
+
+    # Workaround for PyTorch 2.10 + CUDA 12.8 + H200: cublasSgemmStridedBatched
+    # crashes on batched matmul. Switching to cublasLt avoids the bug.
+    import torch
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.exp_name}-{args.env_id}-{timestamp}"
+    k_suffix = f"_k_{args.num_reward_candidates}" if args.num_reward_candidates != 4 else ""
     if args.eureka_mode:
-        experiment_type = "eureka_full"
+        experiment_type = f"eureka_full{k_suffix}"
     elif args.vlm_reward_plot:
-        experiment_type = "outer-loop_full_reward_plot"
+        experiment_type = f"outer-loop_full_reward_plot{k_suffix}"
     elif _is_failureselection_mode(args):
-        experiment_type = "outer-loop_full_failureselection"
+        experiment_type = f"outer-loop_full_failureselection{k_suffix}"
     else:
-        experiment_type = "outer-loop_full"
+        experiment_type = f"outer-loop_full{k_suffix}"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
 
     # --- Auto-discover counterpart experiment's run directory ---
@@ -1353,7 +1449,15 @@ if __name__ == "__main__":
                 max_param_change=2.0,
                 temperature=0,  # Deterministic: diversity comes from batch multi-perspective prompting
             )
-            print(f"[VLM/LLM] Initialized LLM: {args.llm_model} (temperature=0, batch diverse)")
+            # Retry LLM with slightly higher temperature to avoid identical failures
+            llm_retry = LLMRewardTuner.from_openai(
+                api_key=api_key,
+                model=args.llm_model,
+                enable_function_code=args.enable_function_code,
+                max_param_change=2.0,
+                temperature=0.3,
+            )
+            print(f"[VLM/LLM] Initialized LLM: {args.llm_model} (temperature=0, retry=0.3)")
         else:
             print("[warn] OPENAI_API_KEY not set, skipping VLM/LLM")
     else:
@@ -1689,10 +1793,9 @@ if __name__ == "__main__":
                 cache_results=False,
             )
 
-        vlm_score, vlm_comment, _ = vlm_to_use.evaluate(frames, episode_info)
+        _vlm_score, vlm_comment, _ = vlm_to_use.evaluate(frames, episode_info)
         print(f"[VLM] Analysis:\n{vlm_comment}")
         best_candidate["vlm_comment"] = vlm_comment
-        best_candidate["vlm_score"] = vlm_score
 
         debug_dir.mkdir(parents=True, exist_ok=True)
         vlm_html_path = debug_dir / f"iter_{outer_iter_idx+1:02d}_vlm.html"
@@ -1700,7 +1803,7 @@ if __name__ == "__main__":
             frames=frames,
             prompt=vlm_prompt,
             episode_info=episode_info,
-            vlm_score=vlm_score,
+            vlm_score=0.0,  # score is unused; kept for save_vlm_debug_html signature
             vlm_comment=vlm_comment,
             save_path=vlm_html_path,
             max_frames=args.vlm_max_frames,
@@ -1754,7 +1857,6 @@ if __name__ == "__main__":
                     reflection_best = reflection_history.get("best_candidate")
                     if isinstance(reflection_best, dict):
                         reflection_best["vlm_comment"] = resumed_best.get("vlm_comment")
-                        reflection_best["vlm_score"] = resumed_best.get("vlm_score")
                 with open(_hist_save_path, "w") as f:
                     json.dump(outer_loop_history, f, indent=2, default=str)
                 print(f"[Resume] Added VLM feedback for resumed iteration {resumed_outer_iter+1}")
@@ -2052,108 +2154,53 @@ if __name__ == "__main__":
                     print(f"    ✗ Batch candidate {cand_id+1}: not in batch response")
                     failed_slots.append((k, cand_id, None))
 
-            # --- STEP 1c: Individual retry for failed candidates ---
-            for _k, cand_id, error_context in failed_slots:
-                print(f"\n  Retrying candidate {cand_id+1} individually ({MAX_COMPILE_RETRIES} attempts)...")
-                compiled = False
+            # --- STEP 1c: Batch retry to fill missing slots ---
+            MAX_BATCH_RETRIES = 3
+            for batch_retry in range(MAX_BATCH_RETRIES):
+                num_missing = llm_candidate_count - (len(candidates) - elite_count)
+                if num_missing <= 0:
+                    break
+                print(f"\n  [Batch retry {batch_retry+1}/{MAX_BATCH_RETRIES}] Generating {num_missing} replacement candidates...")
+                retry_summary = {**training_summary, "num_reward_candidates": max(num_missing, 2)}
+                try:
+                    retry_suggestions = llm_retry.suggest_parameters_batch(retry_summary, seed=None)
+                except Exception as e:
+                    print(f"  [Batch retry] ✗ Failed: {e}")
+                    continue
 
-                for compile_attempt in range(MAX_COMPILE_RETRIES):
-                    if compile_attempt > 0:
-                        print(f"    Compile retry {compile_attempt}/{MAX_COMPILE_RETRIES-1}...")
-
-                    # Build summary with error context, single-candidate mode
-                    retry_summary = {**training_summary, "num_reward_candidates": 1}
-                    if error_context is not None:
-                        retry_summary["previous_code_error"] = error_context
-
-                    try:
-                        suggestions = llm.suggest_parameters(retry_summary, seed=None)
-                    except (ValueError, SyntaxError, TypeError) as e:
-                        print(f"    ✗ suggest_parameters failed (attempt {compile_attempt+1}): {e}")
-                        retry_query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                        retry_prompt = retry_query_info.get("prompt", "(no prompt)") if retry_query_info else "(no query info)"
-                        retry_response = retry_query_info.get("response_text", "(no response)") if retry_query_info else "(no query info)"
-                        suffix = f"_retry{compile_attempt}"
-                        save_llm_debug_html(
-                            iteration=outer_iter,
-                            prompt=retry_prompt,
-                            response_text=retry_response,
-                            suggestions=None,
-                            summary_for_llm=retry_summary,
-                            save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}{suffix}_llm.html",
-                        )
-                        error_context = {
-                            "code": "N/A",
-                            "error": str(e),
-                            "instruction": (
-                                "前回のコードでエラーが発生しました。\n"
-                                "エラーを修正した新しいコードを生成してください。\n"
-                                "Pythonとして正しい構文の完全な関数を返してください。\n\n"
-                                f"エラー内容: {e}"
-                            )
-                        }
-                        continue
-
-                    # Save retry debug HTML
-                    retry_query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
-                    retry_prompt = retry_query_info.get("prompt", "(no prompt)") if retry_query_info else "(no query info)"
-                    retry_response = retry_query_info.get("response_text", "(no response)") if retry_query_info else "(no query info)"
-                    suffix = f"_retry{compile_attempt}"
+                retry_query_info = llm.get_last_query_info() if hasattr(llm, 'get_last_query_info') else None
+                if retry_query_info:
                     save_llm_debug_html(
                         iteration=outer_iter,
-                        prompt=retry_prompt,
-                        response_text=retry_response,
-                        suggestions=suggestions,
+                        prompt=retry_query_info.get("prompt", "(no prompt)"),
+                        response_text=retry_query_info.get("response_text", "(no response)"),
+                        suggestions={"batch_retry": batch_retry + 1, "count": len(retry_suggestions)},
                         summary_for_llm=retry_summary,
-                        save_path=debug_dir / f"iter_{outer_iter+1:02d}_cand_{cand_id}{suffix}_llm.html",
+                        save_path=debug_dir / f"iter_{outer_iter+1:02d}_batch_retry{batch_retry+1}_llm.html",
                     )
 
-                    if suggestions and suggestions.get("type") == "function_code":
-                        custom_code = suggestions["custom_code"]
-                        rationale = suggestions.get("rationale", "No rationale")
-
+                for sug in retry_suggestions:
+                    if len(candidates) - elite_count >= llm_candidate_count:
+                        break
+                    if sug and sug.get("type") == "function_code" and sug.get("custom_code"):
+                        custom_code = sug["custom_code"]
+                        rationale = sug.get("rationale", "No rationale")
                         test_fn, compile_error = RewardWrapperDynamic._compile_custom_function_with_error(custom_code)
-
                         if test_fn is not None:
+                            cand_id = len(candidates)
                             candidates.append({
                                 "code": custom_code,
                                 "rationale": rationale,
                                 "id": cand_id,
                                 "is_elite": False,
                             })
-                            print(f"    ✓ Candidate {cand_id+1} compiled (retry attempt {compile_attempt+1})")
-                            compiled = True
-                            break
+                            print(f"    ✓ Retry candidate {cand_id+1} compiled OK")
                         else:
-                            print(f"    ✗ Compile failed (retry attempt {compile_attempt+1}): {compile_error[:200]}")
-                            error_context = {
-                                "code": custom_code,
-                                "error": compile_error,
-                                "instruction": (
-                                    "前回のコードでコンパイルエラーが発生しました。\n"
-                                    "エラーを修正した新しいコードを生成してください。\n\n"
-                                    "よくあるエラー:\n"
-                                    "1. 関数名が 'compute_reward' でない\n"
-                                    "2. インデントエラー\n"
-                                    "3. torch/npのインポート忘れ\n"
-                                    "4. 戻り値がtorch.Tensorでない\n"
-                                    "5. batch_size次元の処理ミス"
-                                )
-                            }
-                    else:
-                        sug_type = suggestions.get("type", "N/A") if suggestions else "None"
-                        print(f"    ✗ Wrong response type (retry attempt {compile_attempt+1}): {sug_type}")
-                        error_context = {
-                            "code": "N/A",
-                            "error": f"LLM did not return function_code type (got: {sug_type})",
-                            "instruction": (
-                                "function_code形式で報酬関数を返してください。\n"
-                                "type: 'function_code', custom_code: 'def compute_reward(info, base): ...'"
-                            )
-                        }
+                            print(f"    ✗ Retry candidate compile failed: {compile_error[:200]}")
 
-                if not compiled:
-                    print(f"    ✗ Candidate slot {cand_id+1} exhausted {MAX_COMPILE_RETRIES} retry attempts")
+            num_missing = llm_candidate_count - (len(candidates) - elite_count)
+            if num_missing > 0:
+                print(f"  [warn] Could not fill {num_missing} candidate slot(s) after {MAX_BATCH_RETRIES} batch retries")
 
             if len(candidates) == 0:
                 print("\n[ERROR] No valid candidates generated. Terminating experiment.")

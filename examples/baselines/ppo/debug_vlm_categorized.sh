@@ -16,6 +16,7 @@
 set -euo pipefail
 
 VLM_MODE="${1:-categorized}"  # "categorized" or "random"
+export CUDA_VISIBLE_DEVICES=5
 
 if [ -z "${OPENAI_API_KEY:-}" ]; then
     echo "ERROR: OPENAI_API_KEY is not set."
@@ -48,7 +49,7 @@ for ENV in "PushCube-v1" "PickCube-v1"; do
       --num_reward_candidates=2 \
       --enable_reward_reflection \
       --vlm_episode_selection="${VLM_MODE}" \
-      --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
+      --rl_project_path="/home/nwake/codes/RL_project" \
       --exp-name="debug-vlm-${VLM_MODE}-${ENV}" \
       2>&1 | tee "logs/debug_vlm_${VLM_MODE}_${ENV}_$(date +%Y%m%d_%H%M%S).log"
 

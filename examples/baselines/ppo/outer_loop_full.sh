@@ -43,11 +43,25 @@ fi
 
 # --- Configuration ---
 seeds=(9351) # 4796 1788
-OUTER_ITERS=4
+OUTER_ITERS=5
 WSEED=42
-GPUS="0,1,0,1"
-CROSS_RESUME=1  # Set to 1 to auto-resume from counterpart's iter 0
-EARLY_STOP_SUCCESS=0  # Set to 1 to stop when success_rate >= 1.0
+NUM_CANDIDATES=16
+PROCS_PER_GPU=3  # Number of concurrent candidates per GPU
+# Auto-detect free GPUs (memory usage < 1GB = idle), repeat each GPU PROCS_PER_GPU times
+detect_free_gpus() {
+    local raw_gpus=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
+        | awk -F', ' '$2 < 1024 {printf sep $1; sep=","}')
+    if [ -z "${raw_gpus}" ]; then
+        echo "ERROR: No free GPUs detected (all have >1GB memory usage)."
+        return 1
+    fi
+    # Expand: e.g. "0,1,2" with PROCS_PER_GPU=2 -> "0,0,1,1,2,2"
+    GPUS=$(echo "${raw_gpus}" | tr ',' '\n' | awk -v n="${PROCS_PER_GPU}" '{for(i=0;i<n;i++) print}' | paste -sd,)
+    echo "[GPU] Free GPUs: ${raw_gpus} (x${PROCS_PER_GPU} = ${GPUS})"
+}
+detect_free_gpus || exit 1
+CROSS_RESUME=0  # Set to 1 to auto-resume from counterpart's iter 0
+EARLY_STOP_SUCCESS=1 # Set to 1 to stop when success_rate >= 1.0
 VLM_REWARD_PLOT=0     # Set to 1 to send per-step reward plot to VLM
 
 if [ "${MODE}" == "eureka" ]; then
@@ -99,8 +113,11 @@ echo ""
 
 any_failed=0
 for seed in "${seeds[@]}"; do
-    for ENV in "AnymalC-Reach-v1" "OpenCabinetDoor-v1" #  "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" # "PickCube-v1" "PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" # "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "PegInsertionSide-v1" #"PushCube-v1" "OpenCabinetDrawer-v1" "OpenCabinetDoor-v1" "PushT-v1" #
+    for ENV in "PegInsertionSide-v1" "PushT-v1" "UnitreeG1PlaceAppleInBowl-v1" "OpenCabinetDoor-v1" "RotateValveLevel0-v1" "UnitreeG1TransportBox-v1" # "PushCube-v1" "PickCube-v1" "AnymalC-Reach-v1" "OpenCabinetDrawer-v1" 
     do
+        # Re-detect free GPUs before each task
+        detect_free_gpus || { echo "SKIP ${ENV}: no free GPUs"; any_failed=1; continue; }
+
         # Hyperparameters per task
         # NUM_ENVS scaled up for RTX PRO 6000 (96GB) / RTX 5090 (32GB).
         # TOTAL timesteps kept the same as before for quick outer-loop iteration.
@@ -120,7 +137,7 @@ for seed in "${seeds[@]}"; do
         GAMMA_ARG=""
         GAE_LAMBDA_ARG=""
         if [ "${ENV}" == "PushCube-v1" ] || [ "${ENV}" == "PickCube-v1" ]; then
-            TOTAL=50_000_000         # Baseline: 50M
+            TOTAL=500_000         # Baseline: 50M
             EVAL_STEPS=50
             NUM_ENVS=4096            # Baseline: 4096
             NUM_STEPS=4              # Baseline: 4  (batch: 4096*4=16,384)
@@ -207,7 +224,7 @@ for seed in "${seeds[@]}"; do
           --num_outer_iters=${OUTER_ITERS} \
           --total_timesteps_per_iter=${TOTAL} \
           --weight_seed=${WSEED} \
-          --num_reward_candidates=4 \
+          --num_reward_candidates=${NUM_CANDIDATES} \
           --enable_reward_reflection \
           --gpus="${GPUS}" \
           ${GAMMA_ARG} \
@@ -215,7 +232,7 @@ for seed in "${seeds[@]}"; do
           ${EUREKA_ARG} \
           ${VLM_SELECTION_ARG} \
           ${VLM_CATEGORY_ARG} \
-          --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
+          --rl_project_path="/home/nwake/codes/RL_project" \
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \

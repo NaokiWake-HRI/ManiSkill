@@ -75,6 +75,18 @@ TASK_DEFAULTS = {
         "w_static": 1.0,
         "w_success": 5.0,
     },
+    "RotateValve": {
+        "w_tip_distance": 1.0,
+        "w_directed_velocity": 4.0,
+        "w_rotation_progress": 1.0,
+    },
+    "UnitreeG1TransportBox": {
+        "w_face_table": 1.0,
+        "w_grasp": 2.0,
+        "w_transport": 1.0,
+        "w_release": 1.0,
+        "w_success": 5.0,
+    },
 }
 
 

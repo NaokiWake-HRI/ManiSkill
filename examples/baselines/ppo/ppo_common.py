@@ -54,7 +54,7 @@ class Agent(nn.Module):
             nn.Tanh(),
             layer_init(nn.Linear(256, act_dim), std=0.01 * np.sqrt(2)),
         )
-        self.actor_logstd = nn.Parameter(torch.ones(1, act_dim) * -0.5)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, act_dim))
 
     def get_value(self, x):
         return self.critic(x)

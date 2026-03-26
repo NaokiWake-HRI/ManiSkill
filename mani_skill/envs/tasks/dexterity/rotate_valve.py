@@ -74,6 +74,9 @@ class RotateValveEnv(BaseEnv):
         )
         self.table_scene.build()
         self._load_articulations()
+        # Pre-allocate full-size tensors so partial resets can index into them
+        self.rotate_direction = torch.ones(self.num_envs, device=self.device)
+        self.rest_qpos = torch.zeros(self.num_envs, 1, device=self.device)
 
     def _load_articulations(self):
         # Robel valve
@@ -147,9 +150,9 @@ class RotateValveEnv(BaseEnv):
 
             # Initialize task related information
             if self.difficulty_level <= 3:
-                self.rotate_direction = torch.ones(b)
+                self.rotate_direction[env_idx] = 1
             else:
-                self.rotate_direction = 1 - torch.randint(0, 2, (b,)) * 2
+                self.rotate_direction[env_idx] = 1 - torch.randint(0, 2, (b,)) * 2
 
             # Initialize the valve
             xyz = torch.zeros((b, 3))
@@ -161,7 +164,7 @@ class RotateValveEnv(BaseEnv):
 
             qpos = torch.rand((b, 1)) * torch.pi * 2 - torch.pi
             self.valve.set_qpos(qpos)
-            self.rest_qpos = qpos
+            self.rest_qpos[env_idx] = qpos
 
     def _initialize_agent(self, env_idx: torch.Tensor):
         with torch.device(self.device):

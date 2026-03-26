@@ -28,6 +28,7 @@ METHODS_FULL = {
     "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
     "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
     "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
+    "outer-loop_full_failureselection_k_16": {"label": "VLM+LLM FailSel K=16", "color": "#8e44ad", "marker": "D"},
 }
 
 TASKS_STANDARD = [
@@ -46,7 +47,9 @@ TASKS_FULL = [
     "OpenCabinetDrawer-v1",
     "PegInsertionSide-v1",
     "PushT-v1",
+    "RotateValveLevel0-v1",
     "UnitreeG1PlaceAppleInBowl-v1",
+    "UnitreeG1TransportBox-v1",
     "AnymalC-Reach-v1",
 ]
 

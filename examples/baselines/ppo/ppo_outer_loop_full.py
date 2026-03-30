@@ -1228,15 +1228,25 @@ if __name__ == "__main__":
         if args.resume_dir is not None:
             raise ValueError("Cannot use both --resume_dir and --resume_from_counterpart")
         # Determine counterpart experiment type
+        # Eureka ↔ VLM+LLM (failureselection preferred, fallback to plain)
+        # k_suffix ensures K=16 eureka finds K=16 counterpart, not K=4
         if args.eureka_mode:
-            counterpart_type = "outer-loop_full"
+            counterpart_types = [f"outer-loop_full_failureselection{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif _is_failureselection_mode(args):
-            counterpart_type = "outer-loop_full"
+            counterpart_types = [f"eureka_full{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif args.vlm_reward_plot:
-            counterpart_type = "outer-loop_full"
+            counterpart_types = [f"outer-loop_full{k_suffix}"]
         else:
-            counterpart_type = "eureka_full"
-        counterpart_base = Path("runs") / counterpart_type / args.env_id
+            counterpart_types = [f"eureka_full{k_suffix}"]
+        # Try each counterpart type in order of preference
+        counterpart_base = None
+        for _ct in counterpart_types:
+            _cb = Path("runs") / _ct / args.env_id
+            if _cb.exists():
+                counterpart_base = _cb
+                break
+        if counterpart_base is None:
+            counterpart_base = Path("runs") / counterpart_types[0] / args.env_id
         if counterpart_base.exists():
             # Find all run directories that have a completed outer_loop_history.json
             _candidates = []
@@ -1244,8 +1254,11 @@ if __name__ == "__main__":
                 if _d.is_dir() and (_d / "outer_loop_history.json").exists():
                     _candidates.append(_d)
             if _candidates:
-                # Pick the latest by modification time of outer_loop_history.json
-                _candidates.sort(key=lambda d: (d / "outer_loop_history.json").stat().st_mtime)
+                # Pick the latest run by timestamp (early-stopped runs have fewer iters but are still valid)
+                def _cand_sort_key(d):
+                    m = re.search(r"(\d{8}_\d{6})$", d.name)
+                    return m.group(1) if m else "00000000_000000"
+                _candidates.sort(key=_cand_sort_key)
                 args.resume_dir = str(_candidates[-1])
                 args.resume_first_iter_only = True
                 print(f"[Auto-discover] Found counterpart run: {args.resume_dir}")

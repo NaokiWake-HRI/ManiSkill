@@ -26,8 +26,8 @@ METHODS_STANDARD = {
 
 METHODS_FULL = {
     "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
-    "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
-    "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
+    # "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
+    # "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
     "outer-loop_full_failureselection_k_16": {"label": "VLM+LLM FailSel K=16", "color": "#8e44ad", "marker": "D"},
 }
 
@@ -84,21 +84,21 @@ def latest_run(method: str, task: str, seed: str) -> Path | None:
     runs = [r for r in task_dir.iterdir() if _extract_seed(r.name) == seed]
     if not runs:
         return None
-    # Prefer runs with the most history entries, then by timestamp
-    runs.sort(key=lambda p: (_history_length(p), _extract_timestamp(p.name)))
+    # Prefer latest run by timestamp (early-stopped runs have fewer iters but are still valid)
+    runs.sort(key=lambda p: _extract_timestamp(p.name))
     return runs[-1]
 
 
-def load_success(run_dir: Path, is_full: bool) -> list[float] | None:
+def load_success(run_dir: Path, is_full: bool, metric: str = "success_once") -> list[float] | None:
     history_path = run_dir / "outer_loop_history.json"
     if not history_path.exists():
         return None
     with open(history_path) as f:
         history = json.load(f)
     if is_full:
-        return [e["best_candidate"]["eval_metrics"].get("success_once", 0.0) for e in history]
+        return [e["best_candidate"]["eval_metrics"].get(metric, 0.0) for e in history]
     else:
-        return [e["success_once"] for e in history]
+        return [e.get(metric, 0.0) for e in history]
 
 
 def main():
@@ -132,62 +132,65 @@ def main():
         return
     n_cols = 4
     n_rows = (n_tasks + n_cols - 1) // n_cols
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4 * n_rows), sharey=True)
-    axes_flat = axes.flatten() if n_rows > 1 else axes
+    metrics = [("success_once", "Success Once"), ("success_at_end", "Success At End")]
 
-    for ax, task in zip(axes_flat, tasks):
-        for method, style in methods.items():
-            all_success = []
-            for seed in seeds:
-                run_dir = latest_run(method, task, seed)
-                if run_dir is None:
+    for metric_key, metric_label in metrics:
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.5 * n_cols, 4 * n_rows), sharey=True)
+        axes_flat = axes.flatten() if n_rows > 1 else axes
+
+        for ax, task in zip(axes_flat, tasks):
+            for method, style in methods.items():
+                all_success = []
+                for seed in seeds:
+                    run_dir = latest_run(method, task, seed)
+                    if run_dir is None:
+                        continue
+                    success = load_success(run_dir, is_full, metric=metric_key)
+                    if success is not None:
+                        all_success.append(success)
+
+                if not all_success:
                     continue
-                success = load_success(run_dir, is_full)
-                if success is not None:
-                    all_success.append(success)
 
-            if not all_success:
-                continue
+                n_iters = len(all_success[0])
+                iters = np.arange(1, n_iters + 1)
 
-            n_iters = len(all_success[0])
-            iters = np.arange(1, n_iters + 1)
+                # Individual seeds as faint scatter
+                for s in all_success:
+                    ax.plot(iters, s, style["marker"], alpha=0.3, markersize=5,
+                            color=style["color"], zorder=1)
 
-            # Individual seeds as faint scatter
-            for s in all_success:
-                ax.plot(iters, s, style["marker"], alpha=0.3, markersize=5,
-                        color=style["color"], zorder=1)
+                # Mean line
+                arr = np.array(all_success)
+                mean = np.mean(arr, axis=0)
+                ax.plot(iters, mean, f'{style["marker"]}-', color=style["color"],
+                        linewidth=2.5, markersize=8,
+                        label=style["label"] if (is_full and len(all_success) == 1) else f'{style["label"]} (n={len(all_success)})', zorder=2)
 
-            # Mean line
-            arr = np.array(all_success)
-            mean = np.mean(arr, axis=0)
-            ax.plot(iters, mean, f'{style["marker"]}-', color=style["color"],
-                    linewidth=2.5, markersize=8,
-                    label=style["label"] if (is_full and len(all_success) == 1) else f'{style["label"]} (n={len(all_success)})', zorder=2)
+            ax.set_xlabel("Outer iteration")
+            ax.set_xticks(np.arange(1, 6))
+            ax.set_ylim(-0.05, 1.05)
+            ax.grid(True, alpha=0.3)
+            ax.set_title(task, fontweight="bold")
+            ax.legend(loc="lower right", fontsize=10)
 
-        ax.set_xlabel("Outer iteration")
-        ax.set_xticks(np.arange(1, 6))
-        ax.set_ylim(-0.05, 1.05)
-        ax.grid(True, alpha=0.3)
-        ax.set_title(task, fontweight="bold")
-        ax.legend(loc="upper left", fontsize=10)
+        # Hide unused axes
+        for ax in axes_flat[n_tasks:]:
+            ax.set_visible(False)
 
-    # Hide unused axes
-    for ax in axes_flat[n_tasks:]:
-        ax.set_visible(False)
+        # y-label on leftmost column only
+        for row in range(n_rows):
+            axes_flat[row * n_cols].set_ylabel(metric_key)
 
-    # y-label on leftmost column only
-    for row in range(n_rows):
-        axes_flat[row * n_cols].set_ylabel("success_once")
+        title = f"Outer-Loop vs Eureka — {metric_label}" + (" [Full]" if is_full else "")
+        fig.suptitle(title, fontsize=15, fontweight="bold")
+        plt.tight_layout()
 
-    title = "Outer-Loop vs Eureka (LLM-only)" + (" [Full]" if is_full else "")
-    fig.suptitle(title, fontsize=15, fontweight="bold")
-    plt.tight_layout()
-
-    out_filename = f"method_comparison{'_full' if is_full else ''}.png"
-    out_path = BASE_DIR / out_filename
-    fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    print(f"Saved to {out_path.resolve()}")
-    plt.close()
+        out_filename = f"method_comparison{'_full' if is_full else ''}_{metric_key}.png"
+        out_path = BASE_DIR / out_filename
+        fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
+        print(f"Saved to {out_path.resolve()}")
+        plt.close()
 
 
 if __name__ == "__main__":

@@ -65,7 +65,7 @@ if [ -n "${GPUS_OVERRIDE}" ]; then
 else
     detect_free_gpus || exit 1
 fi
-CROSS_RESUME=0  # Set to 1 to auto-resume from counterpart's iter 0
+CROSS_RESUME=${CROSS_RESUME_OVERRIDE:-0}  # Set to 1 to auto-resume from counterpart's iter 0
 EARLY_STOP_SUCCESS=1 # Set to 1 to stop when success_rate >= 1.0
 VLM_REWARD_PLOT=0     # Set to 1 to send per-step reward plot to VLM
 

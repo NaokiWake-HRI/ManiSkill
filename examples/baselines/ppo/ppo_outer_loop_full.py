@@ -514,109 +514,128 @@ def _train_candidates_parallel(
     candidate_results = []
     failed_candidates = []  # (cand, error, traceback)
 
-    # --- Phase 1: Parallel training ---
-    for batch_start in range(0, len(candidates), len(gpu_list)):
-        batch = candidates[batch_start:batch_start + len(gpu_list)]
-        procs = []
+    # --- Phase 1: Pool-style parallel training ---
+    # Launch up to len(gpu_list) processes at a time. When one finishes,
+    # immediately start the next candidate on the freed GPU slot.
+    candidate_queue = list(candidates)  # shallow copy
+    # active: list of (proc, cand, result_path, log_file, log_path, gpu_id)
+    active = []
+    gpu_slots = list(range(len(gpu_list)))  # available slot indices
+    free_slots = list(gpu_slots)  # slots not currently in use
 
-        print(f"\n  [Parallel] Batch: candidates {[c['id']+1 for c in batch]} "
-              f"on GPUs {gpu_list[:len(batch)]}")
+    def _launch_candidate(cand, slot_idx):
+        gpu_id = gpu_list[slot_idx]
+        cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+        Path(f"runs/{cand_run_dir}").mkdir(parents=True, exist_ok=True)
 
-        for i, cand in enumerate(batch):
-            gpu_id = gpu_list[i]
-            cand_run_dir = f"{run_dir}/cand_{cand['id']}"
+        task_path = f"runs/{run_dir}/_cand_{cand['id']}_task.pkl"
+        result_path = f"runs/{run_dir}/_cand_{cand['id']}_result.json"
+        task = {
+            "args": args,
+            "cand": cand,
+            "outer_iter": outer_iter,
+            "run_dir": cand_run_dir,
+            "global_step_offset": global_step_offset,
+            "result_path": result_path,
+        }
+        with open(task_path, "wb") as f:
+            pickle.dump(task, f)
 
-            Path(f"runs/{cand_run_dir}").mkdir(parents=True, exist_ok=True)
+        proc_env = os.environ.copy()
+        proc_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        log_path = f"runs/{run_dir}/_cand_{cand['id']}_stdout.log"
+        log_file = open(log_path, "w")
+        cmd = [sys.executable, "-u", os.path.abspath(__file__), "_worker", task_path]
+        proc = subprocess.Popen(cmd, env=proc_env, stdout=log_file, stderr=subprocess.STDOUT)
+        print(f"    Candidate {cand['id']+1} -> GPU {gpu_id} slot {slot_idx} (PID: {proc.pid})")
+        return (proc, cand, result_path, log_file, log_path, slot_idx)
 
-            task_path = f"runs/{run_dir}/_cand_{cand['id']}_task.pkl"
-            result_path = f"runs/{run_dir}/_cand_{cand['id']}_result.json"
-
-            task = {
-                "args": args,
-                "cand": cand,
-                "outer_iter": outer_iter,
-                "run_dir": cand_run_dir,
-                "global_step_offset": global_step_offset,
-                "result_path": result_path,
-            }
-            with open(task_path, "wb") as f:
-                pickle.dump(task, f)
-
-            env = os.environ.copy()
-            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-            log_path = f"runs/{run_dir}/_cand_{cand['id']}_stdout.log"
-            log_file = open(log_path, "w")
-
-            cmd = [sys.executable, "-u", os.path.abspath(__file__), "_worker", task_path]
-            proc = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-            procs.append((proc, cand, result_path, log_file, log_path))
-            print(f"    Candidate {cand['id']+1} -> GPU {gpu_id} (PID: {proc.pid})")
-
-        # Wait for all processes in this batch
-        for proc, cand, result_path, log_file, log_path in procs:
-            proc.wait()
-            log_file.close()
-
-            if proc.returncode == 0 and Path(result_path).exists():
-                with open(result_path) as f:
-                    result = json.load(f)
-
-                if result.get("success", False):
-                    fitness = result["eval_metrics"].get("success_at_end", 0.0)
-                    _lc = result.get("learning_curve", [])
-                    _peak_success_once = max(
-                        (lc.get("success_once", 0.0) for lc in _lc),
-                        default=result["eval_metrics"].get("success_once", 0.0),
-                    )
-                    candidate_results.append({
-                        "candidate_id": result["candidate_id"],
-                        "code": result["code"],
-                        "rationale": result["rationale"],
-                        "is_elite": result["is_elite"],
-                        "fitness": fitness,
-                        "fitness_success_at_end": fitness,
-                        "fitness_success_once": _peak_success_once,
-                        "fitness_return": result["eval_metrics"].get("return", float("-inf")),
-                        "eval_metrics": result["eval_metrics"],
-                        "learning_curve": result["learning_curve"],
-                        "reward_statistics": result["reward_stats"],
-                        "eval_video_dir": result["eval_video_dir"],
-                        "vlm_eval_video": result.get("vlm_eval_video"),
-                        "env_last_outcomes": result.get("env_last_outcomes", {}),
-                    })
-                    print(f"    Candidate {cand['id']+1} OK (fitness={fitness:.4f})")
-                else:
-                    # Runtime error captured by worker
-                    print(f"    Candidate {cand['id']+1} FAILED (runtime error)")
-                    failed_candidates.append((
-                        cand,
-                        result.get("error", "Unknown error"),
-                        result.get("traceback", ""),
-                    ))
+    def _collect_result(proc, cand, result_path, log_file, log_path):
+        log_file.close()
+        if proc.returncode == 0 and Path(result_path).exists():
+            with open(result_path) as f:
+                result = json.load(f)
+            if result.get("success", False):
+                fitness = result["eval_metrics"].get("success_at_end", 0.0)
+                _lc = result.get("learning_curve", [])
+                _peak_success_once = max(
+                    (lc.get("success_once", 0.0) for lc in _lc),
+                    default=result["eval_metrics"].get("success_once", 0.0),
+                )
+                candidate_results.append({
+                    "candidate_id": result["candidate_id"],
+                    "code": result["code"],
+                    "rationale": result["rationale"],
+                    "is_elite": result["is_elite"],
+                    "fitness": fitness,
+                    "fitness_success_at_end": fitness,
+                    "fitness_success_once": _peak_success_once,
+                    "fitness_return": result["eval_metrics"].get("return", float("-inf")),
+                    "eval_metrics": result["eval_metrics"],
+                    "learning_curve": result["learning_curve"],
+                    "reward_statistics": result["reward_stats"],
+                    "eval_video_dir": result["eval_video_dir"],
+                    "vlm_eval_video": result.get("vlm_eval_video"),
+                    "env_last_outcomes": result.get("env_last_outcomes", {}),
+                })
+                print(f"    Candidate {cand['id']+1} OK (fitness={fitness:.4f})")
             else:
-                # Process-level failure — check for CUDA OOM
-                is_oom = False
-                try:
-                    with open(log_path) as lf:
-                        log_tail = lf.read()[-2000:]
-                    if "CUDA out of memory" in log_tail or "OutOfMemoryError" in log_tail:
-                        is_oom = True
-                except OSError:
-                    pass
+                print(f"    Candidate {cand['id']+1} FAILED (runtime error)")
+                failed_candidates.append((
+                    cand,
+                    result.get("error", "Unknown error"),
+                    result.get("traceback", ""),
+                ))
+        else:
+            is_oom = False
+            try:
+                with open(log_path) as lf:
+                    log_tail = lf.read()[-2000:]
+                if "CUDA out of memory" in log_tail or "OutOfMemoryError" in log_tail:
+                    is_oom = True
+            except OSError:
+                pass
+            if is_oom:
+                print(f"    Candidate {cand['id']+1} FAILED: CUDA OOM detected!")
+                print(f"    See log: {log_path}")
+                print(f"\n{'='*60}")
+                print(f"FATAL: CUDA OOM — PROCS_PER_GPU is too high for this task.")
+                print(f"Reduce PROCS_PER_GPU and re-run.")
+                print(f"{'='*60}")
+                sys.exit(137)
+            else:
+                print(f"    Candidate {cand['id']+1} FAILED (exit code: {proc.returncode})")
+                print(f"    See log: {log_path}")
+                failed_candidates.append((cand, f"Process exited with code {proc.returncode}", ""))
 
-                if is_oom:
-                    print(f"    Candidate {cand['id']+1} FAILED: CUDA OOM detected!")
-                    print(f"    See log: {log_path}")
-                    print(f"\n{'='*60}")
-                    print(f"FATAL: CUDA OOM — PROCS_PER_GPU is too high for this task.")
-                    print(f"Reduce PROCS_PER_GPU and re-run.")
-                    print(f"{'='*60}")
-                    sys.exit(137)
-                else:
-                    print(f"    Candidate {cand['id']+1} FAILED (exit code: {proc.returncode})")
-                    print(f"    See log: {log_path}")
-                    failed_candidates.append((cand, f"Process exited with code {proc.returncode}", ""))
+    print(f"\n  [Pool] {len(candidates)} candidates, {len(gpu_list)} slots")
+
+    # Fill initial slots
+    while free_slots and candidate_queue:
+        slot = free_slots.pop(0)
+        cand = candidate_queue.pop(0)
+        active.append(_launch_candidate(cand, slot))
+
+    # Poll until all done
+    while active:
+        import time as _time
+        _time.sleep(2)
+        still_active = []
+        for entry in active:
+            proc, cand, result_path, log_file, log_path, slot_idx = entry
+            ret = proc.poll()
+            if ret is not None:
+                # Process finished — collect result and free slot
+                _collect_result(proc, cand, result_path, log_file, log_path)
+                free_slots.append(slot_idx)
+                # Launch next candidate if any
+                if candidate_queue and free_slots:
+                    next_slot = free_slots.pop(0)
+                    next_cand = candidate_queue.pop(0)
+                    still_active.append(_launch_candidate(next_cand, next_slot))
+            else:
+                still_active.append(entry)
+        active = still_active
 
     # --- Phase 2: Sequential LLM retry for failed candidates ---
     if failed_candidates and llm is not None:

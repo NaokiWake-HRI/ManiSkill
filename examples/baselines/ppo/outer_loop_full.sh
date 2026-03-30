@@ -31,6 +31,16 @@
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh vlm_failureselection
 #   export OPENAI_API_KEY=sk-... && bash outer_loop_full.sh eureka
 
+# --- Ensure NVIDIA MPS is running (speeds up multi-process GPU sharing) ---
+if ! pgrep -x nvidia-cuda-mps >/dev/null 2>&1 && ! pgrep -f "nvidia-cuda-mps-control -d" >/dev/null 2>&1; then
+    echo "[MPS] Starting NVIDIA MPS daemon..."
+    nvidia-cuda-mps-control -d 2>/dev/null
+    sleep 1
+    echo "[MPS] Daemon started."
+else
+    echo "[MPS] Already running."
+fi
+
 # --- Mode selection ---
 MODE="${1:-vlm_failureselection}"
 if [ "${MODE}" != "vlm_failureselection" ] && [ "${MODE}" != "eureka" ]; then
@@ -185,10 +195,10 @@ for seed in "${seeds[@]}"; do
             GAMMA_ARG="--gamma=0.99"
             GAE_LAMBDA_ARG="--gae_lambda=0.95"
         elif [ "${ENV}" == "RotateValveLevel0-v1" ]; then
-            TOTAL=50_000_000         # Ref: TriFingerRotateCube 50M
+            TOTAL=10_000_000         # Validated: 2M+ で eval/success_once 安定
             EVAL_STEPS=80            # max_episode_steps=80
-            NUM_ENVS=128             # Dexterity tasks: smaller envs
-            NUM_STEPS=250            # Ref: TriFingerRotateCube 250
+            NUM_ENVS=512             # Validated: envs=512 が学習品質最良
+            NUM_STEPS=80             # = max_episode_steps (250は不要)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "UnitreeG1TransportBox-v1" ]; then
             TOTAL=100_000_000        # Baseline: 100M
@@ -207,6 +217,9 @@ for seed in "${seeds[@]}"; do
         # Allow overriding TOTAL timesteps (e.g. for smoke tests)
         if [ -n "${TOTAL_OVERRIDE}" ]; then
             TOTAL=${TOTAL_OVERRIDE}
+        fi
+        if [ -n "${NUM_ENVS_OVERRIDE}" ]; then
+            NUM_ENVS=${NUM_ENVS_OVERRIDE}
         fi
 
         log_file="${LOG_DIR}/seed_${seed}_${ENV}.log"
@@ -244,7 +257,7 @@ for seed in "${seeds[@]}"; do
           ${EUREKA_ARG} \
           ${VLM_SELECTION_ARG} \
           ${VLM_CATEGORY_ARG} \
-          --rl_project_path="/home/nwake/codes/RL_project" \
+          --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \

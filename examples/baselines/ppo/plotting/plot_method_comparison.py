@@ -25,7 +25,8 @@ METHODS_STANDARD = {
 }
 
 METHODS_FULL = {
-    "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
+    # "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
+    "eureka_full_k_16": {"label": "Eureka Full K=16 (LLM-only)", "color": "#1a5276", "marker": "s"},
     # "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
     # "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
     "outer-loop_full_failureselection_k_16": {"label": "VLM+LLM FailSel K=16", "color": "#8e44ad", "marker": "D"},

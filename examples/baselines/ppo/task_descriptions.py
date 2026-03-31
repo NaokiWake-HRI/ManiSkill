@@ -93,7 +93,6 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
-- ALWAYS use full 3D Euclidean distances (not just XY) for reach/approach components.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -111,6 +110,7 @@ info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool
 - info["is_grasped"]: torch.Tensor (batch_size,) bool
 - info["is_obj_placed"]: torch.Tensor (batch_size,) bool
+- info["is_robot_static"]: torch.Tensor (batch_size,) bool
 
 Success condition (from environment):
 - Cube within 0.025m (3D Euclidean) of goal AND robot is static (joint velocities <= 0.2 rad/s).
@@ -118,7 +118,7 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
-- ALWAYS use full 3D Euclidean distances for reach/approach components.
+
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -140,12 +140,8 @@ info dict keys:
 
 Success condition (from environment):
 - Door joint opened >= 75% of max range (min_open_frac=0.75) AND door is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
-- Use base.target_qpos to compute opening progress: amount_to_open_left = (target_qpos - joint_qpos) / target_qpos.
-
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
-- ALWAYS use full 3D Euclidean distances for reaching the handle.
-- Reward door opening progress as a continuous value using (1 - amount_to_open_left).
 - Note: The handle is attached to the door. As the door opens, the handle position changes accordingly.
 
 Required function signature:
@@ -168,12 +164,8 @@ info dict keys:
 
 Success condition (from environment):
 - Drawer joint opened >= 75% of max range (min_open_frac=0.75) AND drawer is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
-- Use base.target_qpos to compute opening progress: amount_to_open_left = (target_qpos - joint_qpos) / target_qpos.
-
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
-- ALWAYS use full 3D Euclidean distances for reaching the handle.
-- Reward drawer opening progress as a continuous value using (1 - amount_to_open_left).
 - Note: The handle is attached to the drawer. As the drawer opens, the handle position changes accordingly.
 
 Required function signature:
@@ -206,7 +198,7 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 10] range. On success, override reward to exactly 10.
-- ALWAYS use full 3D Euclidean distances for reach and alignment components.
+
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -230,8 +222,6 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 3] range. On success, override reward to exactly 3.
-- ALWAYS use full 3D Euclidean distances for reach/approach components.
-- Reward both position proximity and rotation alignment toward goal.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -241,6 +231,10 @@ def compute_reward(info: dict, base) -> torch.Tensor:
     "AnymalC": """
 Available state attributes (base = env.unwrapped):
 - base.agent.robot.pose.p: Robot position, torch.Tensor (batch_size, 3)
+- base.agent.robot.root_linear_velocity: Root body linear velocity, torch.Tensor (batch_size, 3)
+- base.agent.robot.root_angular_velocity: Root body angular velocity, torch.Tensor (batch_size, 3)
+- base.agent.robot.qpos: Joint positions, torch.Tensor (batch_size, n_joints)
+- base.default_qpos: Default standing pose joint positions, torch.Tensor (n_joints,)
 - base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
 - base.goal.pose.p: Goal sphere position, torch.Tensor (batch_size, 3)
 
@@ -257,8 +251,6 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 3] range. No explicit success bonus. On failure (fall), override reward to 0.
-- Penalize falling (info["is_fallen"]).
-- Reward progress toward goal (reducing XY distance).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -283,7 +275,7 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 10] range. On success, override reward to exactly 10.
-- ALWAYS use full 3D Euclidean distances for reach/approach components.
+
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -317,7 +309,7 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 6] range. On success, override reward to exactly 6.
-- ALWAYS use full 3D Euclidean distances for reach/approach components.
+
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -378,7 +370,6 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
-- The robot must pick up a box from one table and place it on another table.
 - Torso yaw ~-1.4 rad faces table 1, ~+1.4 rad faces table 2.
 
 Required function signature:

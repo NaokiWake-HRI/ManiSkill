@@ -117,7 +117,7 @@ Success condition (from environment):
 - Key constants: cube_half_size=0.02m, goal_thresh=0.025m.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 
 Required function signature:
@@ -229,7 +229,7 @@ Success condition (from environment):
 - intersection_thresh = 0.90.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 3] range. On success, override reward to exactly 3.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 - Reward both position proximity and rotation alignment toward goal.
 
@@ -256,7 +256,7 @@ Success condition (from environment):
 - Goal is typically 2.0-3.0m away from the start position.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 3] range. No explicit success bonus. On failure (fall), override reward to 0.
 - Penalize falling (info["is_fallen"]).
 - Reward progress toward goal (reducing XY distance).
 
@@ -282,7 +282,7 @@ Success condition (from environment):
 - Apple within 0.05m (3D Euclidean) of bowl position AND right hand Z > bowl Z + 0.125m (hand retracted above bowl).
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 10] range. On success, override reward to exactly 10.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 
 Required function signature:
@@ -316,7 +316,7 @@ Success condition (from environment):
 - Key constants: cube_half_size=[0.02, 0.04, 0.02], goal_thresh=0.025m.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
+- Total reward MUST be in [0, 6] range. On success, override reward to exactly 6.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
 
 Required function signature:

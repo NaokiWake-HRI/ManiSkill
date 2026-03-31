@@ -189,6 +189,7 @@ Available state attributes (base = env.unwrapped):
 - base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
 - base.handle_link.pose.p: Door handle link position, torch.Tensor (batch_size, 3)
 - base.handle_link.joint.qpos: Door joint position (angle), torch.Tensor (batch_size, 1)
+- base.target_qpos: Target joint position (75% of max range), torch.Tensor (batch_size, 1)
 - base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
 
 info dict keys:
@@ -198,11 +199,12 @@ info dict keys:
 
 Success condition (from environment):
 - Door joint opened >= 75% of max range (min_open_frac=0.75) AND door is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
+- Use base.target_qpos to compute opening progress: amount_to_open_left = (target_qpos - joint_qpos) / target_qpos.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reaching the handle.
-- Reward door opening progress (joint position increase) after reaching the handle.
+- Reward door opening progress as a continuous value using (1 - amount_to_open_left).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -214,6 +216,7 @@ Available state attributes (base = env.unwrapped):
 - base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
 - base.handle_link.pose.p: Drawer handle link position, torch.Tensor (batch_size, 3)
 - base.handle_link.joint.qpos: Drawer joint position (distance), torch.Tensor (batch_size, 1)
+- base.target_qpos: Target joint position (75% of max range), torch.Tensor (batch_size, 1)
 - base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
 
 info dict keys:
@@ -223,11 +226,12 @@ info dict keys:
 
 Success condition (from environment):
 - Drawer joint opened >= 75% of max range (min_open_frac=0.75) AND drawer is static (angular velocity <= 1 rad/s, linear velocity <= 0.1 m/s).
+- Use base.target_qpos to compute opening progress: amount_to_open_left = (target_qpos - joint_qpos) / target_qpos.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reaching the handle.
-- Reward drawer opening progress (joint position increase) after reaching the handle.
+- Reward drawer opening progress as a continuous value using (1 - amount_to_open_left).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:

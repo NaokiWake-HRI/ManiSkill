@@ -240,23 +240,30 @@ def compute_reward(info: dict, base) -> torch.Tensor:
 """,
     "PegInsertionSide": """
 Available state attributes (base = env.unwrapped):
-- base.peg.pose.p: Peg position, torch.Tensor (batch_size, 3)
+- base.peg.pose: Peg Pose object (has .p for position (batch_size, 3) and .inv() for inverse transform)
 - base.agent.tcp.pose.p: End effector position, torch.Tensor (batch_size, 3)
-- base.box_hole_pose.p: Hole position, torch.Tensor (batch_size, 3)
+- base.peg_head_pose: Peg head (tip) Pose object, property (batch_size,). Computed from peg pose + offset.
+- base.box_hole_pose: Hole Pose object (has .p for position and .inv() for inverse transform)
+- base.goal_pose: Goal Pose object — the target pose for the peg center to achieve insertion. Property (batch_size,).
 - base.agent.robot.get_qvel(): Joint velocities, torch.Tensor (batch_size, n_joints)
+- base.agent.is_grasping(base.peg, max_angle=20): Grasp check, returns torch.Tensor (batch_size,) bool
+
+Pose objects support coordinate transforms:
+- pose_a.inv() * pose_b: transform pose_b into pose_a's local frame, returns a new Pose
+- result.p: position in the local frame, torch.Tensor (batch_size, 3)
+- result.p[:, 0]: X component, result.p[:, 1:]: YZ components
 
 info dict keys:
 - info["success"]: torch.Tensor (batch_size,) bool (peg fully inserted)
-- info["peg_head_pos_at_hole"]: torch.Tensor (batch_size, 3) computed peg head position
+- info["peg_head_pos_at_hole"]: torch.Tensor (batch_size, 3) peg head position in hole's local frame
 
 Success condition (from environment):
 - Peg head inserted >= 15mm into hole (X-axis in hole frame) AND peg head Y,Z within hole radius.
 - Key constants: peg radius 0.015-0.025m (randomized), hole clearance 0.003m, peg half-length 0.085-0.125m.
 
 Reward design guidelines:
-- Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
+- Total reward MUST be in [0, 10] range. On success, override reward to exactly 10.
 - ALWAYS use full 3D Euclidean distances for reach and alignment components.
-- Multi-stage: reach peg -> grasp -> align with hole -> insert.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:

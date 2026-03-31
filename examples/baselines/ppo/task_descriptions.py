@@ -177,7 +177,6 @@ Success condition (from environment):
 Reward design guidelines:
 - Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
-- Use info["is_grasped"] to gate place rewards (only reward placing when grasped).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -205,6 +204,7 @@ Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reaching the handle.
 - Reward door opening progress as a continuous value using (1 - amount_to_open_left).
+- Note: The handle is attached to the door. As the door opens, the handle position changes accordingly.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -232,6 +232,7 @@ Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reaching the handle.
 - Reward drawer opening progress as a continuous value using (1 - amount_to_open_left).
+- Note: The handle is attached to the drawer. As the drawer opens, the handle position changes accordingly.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -341,8 +342,6 @@ Success condition (from environment):
 Reward design guidelines:
 - Total reward MUST be in [0, 4] range. On success, override reward to exactly 4.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
-- Use info["is_grasped"] to gate place rewards.
-- After placing, reward hand retraction (moving hand above bowl).
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -377,8 +376,6 @@ Success condition (from environment):
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
 - ALWAYS use full 3D Euclidean distances for reach/approach components.
-- Use info["is_grasped"] to gate place rewards (only reward placing when grasped).
-- Only use arm joint velocities (first 7) for static penalty, not hand joints.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -407,10 +404,6 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 6] range. No explicit success bonus (reward is continuous).
-- Fingertip contact: compute distance between 3 fingertip XY positions and valve center,
-  compare to desired distance (capsule_lens - capsule_offset).
-- Velocity: reward valve angular velocity in the correct direction.
-- Progress: reward cumulative rotation toward goal.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:
@@ -443,8 +436,7 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 5] range. On success, override reward to exactly 5.
-- 4-stage task: face box -> grasp -> transport -> release.
-- Each stage gates on the previous stage's success (use info dict booleans).
+- The robot must pick up a box from one table and place it on another table.
 - Torso yaw ~-1.4 rad faces table 1, ~+1.4 rad faces table 2.
 
 Required function signature:

@@ -2560,6 +2560,21 @@ if __name__ == "__main__":
             iter_record["reflection_history"] = reflection_summary
         outer_loop_history.append(iter_record)
 
+        # Clean up non-best candidate checkpoints to save disk space
+        best_cand_id = best["candidate_id"]
+        for cand in candidate_results:
+            cand_id = cand["candidate_id"]
+            if cand_id == best_cand_id:
+                continue
+            cand_dir = Path(f"runs/{run_dir}/cand_{cand_id}")
+            if cand_dir.exists():
+                removed = 0
+                for pt_file in cand_dir.glob("*.pt"):
+                    pt_file.unlink()
+                    removed += 1
+                if removed:
+                    print(f"  [Cleanup] Removed {removed} checkpoint(s) from cand_{cand_id}")
+
         # Incremental save after each iteration (enables mid-run visualization)
         history_path = f"runs/{run_dir}/outer_loop_history.json"
         with open(history_path, "w") as f:

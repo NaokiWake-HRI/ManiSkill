@@ -2578,8 +2578,8 @@ if __name__ == "__main__":
                     try:
                         pt_file.unlink()
                         removed += 1
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        print(f"  [Cleanup] Warning: failed to remove {pt_file}: {e}")
                 if removed:
                     print(f"  [Cleanup] Removed {removed} checkpoint(s) from cand_{cand_id}")
 

@@ -2560,6 +2560,11 @@ if __name__ == "__main__":
             iter_record["reflection_history"] = reflection_summary
         outer_loop_history.append(iter_record)
 
+        # Incremental save after each iteration (enables mid-run visualization)
+        history_path = f"runs/{run_dir}/outer_loop_history.json"
+        with open(history_path, "w") as f:
+            json.dump(outer_loop_history, f, indent=2, default=str)
+
         # Clean up non-best candidate checkpoints to save disk space
         best_cand_id = best["candidate_id"]
         for cand in candidate_results:
@@ -2570,15 +2575,13 @@ if __name__ == "__main__":
             if cand_dir.exists():
                 removed = 0
                 for pt_file in cand_dir.glob("*.pt"):
-                    pt_file.unlink()
-                    removed += 1
+                    try:
+                        pt_file.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
                 if removed:
                     print(f"  [Cleanup] Removed {removed} checkpoint(s) from cand_{cand_id}")
-
-        # Incremental save after each iteration (enables mid-run visualization)
-        history_path = f"runs/{run_dir}/outer_loop_history.json"
-        with open(history_path, "w") as f:
-            json.dump(outer_loop_history, f, indent=2, default=str)
 
         # Early stop if success rate reached 1.0
         if args.early_stop_success:

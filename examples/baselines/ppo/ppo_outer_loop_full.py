@@ -400,7 +400,7 @@ def _is_failureselection_mode(args: "Args") -> bool:
     """Whether failure-selection-specific resume/VLM behavior should be enabled."""
     return (
         args.vlm_episode_selection == "categorized"
-        and args.vlm_category_focus == "failure"
+        and args.vlm_category_focus in ("failure", "failure_and_near_miss")
     )
 
 

@@ -2586,6 +2586,19 @@ if __name__ == "__main__":
                 if removed:
                     print(f"  [Cleanup] Removed {removed} checkpoint(s) from cand_{cand_id}")
 
+        # Clean up intermediate checkpoints from best candidate (keep only *_final.pt)
+        best_cand_dir = Path(f"runs/{run_dir}/cand_{best_cand_id}")
+        if best_cand_dir.exists():
+            removed_best = 0
+            for pt_file in best_cand_dir.glob("*_ckpt_*.pt"):
+                try:
+                    pt_file.unlink()
+                    removed_best += 1
+                except OSError as e:
+                    print(f"  [Cleanup] Warning: failed to remove {pt_file}: {e}")
+            if removed_best:
+                print(f"  [Cleanup] Removed {removed_best} intermediate ckpt(s) from best cand_{best_cand_id} (finals kept)")
+
         # Early stop if success rate reached 1.0
         if args.early_stop_success:
             best_fitness = best.get("fitness_success_at_end", best["fitness"])

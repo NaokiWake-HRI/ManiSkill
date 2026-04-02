@@ -27,6 +27,8 @@ METHODS_STANDARD = {
 METHODS_FULL = {
     "eureka_full_k_16": {"label": "Eureka K=16", "color": "#2980b9", "marker": "s"},
     "outer-loop_full_failureselection_k_16": {"label": "VLM+LLM FailSel K=16", "color": "#8e44ad", "marker": "D"},
+    "eureka_full_failure_and_near_miss_k_16": {"label": "Eureka K=16 (F+NM)", "color": "#1a5276", "marker": "s"},
+    "outer-loop_full_failureselection_failure_and_near_miss_k_16": {"label": "VLM+LLM F+NM K=16", "color": "#27ae60", "marker": "^"},
 }
 
 TASKS_STANDARD = [

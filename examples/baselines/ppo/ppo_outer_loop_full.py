@@ -1233,12 +1233,15 @@ if __name__ == "__main__":
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_name = f"{args.exp_name}-{args.env_id}-{timestamp}"
     k_suffix = f"_k_{args.num_reward_candidates}" if args.num_reward_candidates != 4 else ""
+    # Append VLM category focus to distinguish experiment variants
+    _cat_focus = getattr(args, "vlm_category_focus", "failure")
+    _cat_suffix = f"_{_cat_focus}" if _cat_focus not in ("failure", None, "") else ""
     if args.eureka_mode:
-        experiment_type = f"eureka_full{k_suffix}"
+        experiment_type = f"eureka_full{_cat_suffix}{k_suffix}"
     elif args.vlm_reward_plot:
         experiment_type = f"outer-loop_full_reward_plot{k_suffix}"
     elif _is_failureselection_mode(args):
-        experiment_type = f"outer-loop_full_failureselection{k_suffix}"
+        experiment_type = f"outer-loop_full_failureselection{_cat_suffix}{k_suffix}"
     else:
         experiment_type = f"outer-loop_full{k_suffix}"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"
@@ -1251,9 +1254,9 @@ if __name__ == "__main__":
         # Eureka ↔ VLM+LLM (failureselection preferred, fallback to plain)
         # k_suffix ensures K=16 eureka finds K=16 counterpart, not K=4
         if args.eureka_mode:
-            counterpart_types = [f"outer-loop_full_failureselection{k_suffix}", f"outer-loop_full{k_suffix}"]
+            counterpart_types = [f"outer-loop_full_failureselection{_cat_suffix}{k_suffix}", f"outer-loop_full_failureselection{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif _is_failureselection_mode(args):
-            counterpart_types = [f"eureka_full{k_suffix}", f"outer-loop_full{k_suffix}"]
+            counterpart_types = [f"eureka_full{_cat_suffix}{k_suffix}", f"eureka_full{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif args.vlm_reward_plot:
             counterpart_types = [f"outer-loop_full{k_suffix}"]
         else:

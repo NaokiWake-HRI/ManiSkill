@@ -92,7 +92,7 @@ else
     MODE_LABEL="VLM+LLM Full Replacement (failure selection)"
     WANDB_TAG="vlm-full-failureselection"
     VLM_SELECTION_ARG="--vlm_episode_selection=categorized"
-    VLM_CATEGORY_ARG="--vlm_category_focus=failure"
+    VLM_CATEGORY_ARG="--vlm_category_focus=${VLM_CATEGORY_FOCUS_OVERRIDE:-failure}"
 fi
 
 LOG_DIR="logs/${MODE}_full_$(date +%Y%m%d_%H%M%S)"

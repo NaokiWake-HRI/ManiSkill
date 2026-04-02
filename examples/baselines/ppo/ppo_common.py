@@ -339,12 +339,12 @@ def build_vlm_prompt_categorized(env_id: str, categories_shown: List[str]) -> st
         return f"""Analyze this robot manipulation video for the task: {env_id}.
 
 This episode is labeled NEAR_MISS.
-- NEAR_MISS: Episode where the robot achieved success_once but LOST it before the end.
+- NEAR_MISS: success_once=True but success_at_end=False. The robot achieved the success condition at SOME point but LOST it before the episode ended.
 
 Focus on INSTABILITY ANALYSIS:
-1. What is the robot doing before, during, and after first reaching success?
-2. What causes it to LOSE the success it once achieved?
-3. What reward signal adjustments might help it achieve and maintain success?
+1. What is the robot doing before, during, and after first reaching success (success_once)?
+2. What causes it to LOSE the success before the episode ends (success_at_end=False)?
+3. What reward signal adjustments might help it achieve and maintain success (success_at_end=True)?
 
 Be concise and specific. Focus on actionable observations.
 Do NOT provide a numerical score - focus on qualitative analysis.
@@ -355,7 +355,7 @@ After your English analysis, provide a brief summary in Japanese (日本語で�
         return f"""Analyze this robot manipulation video for the task: {env_id}.
 
 This episode is labeled SUCCESS.
-- SUCCESS: Episode where the robot completed the task and held success at the end.
+- SUCCESS: success_at_end=True. The robot satisfied the success condition at the FINAL timestep (reached AND maintained the goal).
 
 Focus on SUCCESS ANALYSIS:
 1. What is the robot doing that makes this episode successful?
@@ -371,9 +371,9 @@ After your English analysis, provide a brief summary in Japanese (日本語で�
     cat_bullets = "\n".join(
         f"   - {cat.upper()}: "
         + {
-            "success": "Episode where the robot completed the task and held success at the end.",
-            "near_miss": "Episode where the robot achieved success_once but LOST it before the end.",
-            "failure": "Episode where the robot never achieved success at all.",
+            "success": "success_at_end=True. The robot satisfied the success condition at the FINAL timestep (reached AND maintained the goal).",
+            "near_miss": "success_once=True but success_at_end=False. The robot achieved the success condition at SOME point but LOST it before the episode ended.",
+            "failure": "success_once=False. The robot never achieved the success condition at any point during the episode.",
         }[cat]
         for cat in categories_shown
     )

@@ -199,12 +199,14 @@ def resolve_vlm_categories_to_show(
     focus = focus.lower()
     if focus == "all":
         requested = ["failure", "near_miss", "success"]
+    elif focus == "failure_and_near_miss":
+        requested = ["failure", "near_miss"]
     elif focus in {"failure", "near_miss", "success"}:
         requested = [focus]
     else:
         raise ValueError(
             f"Unsupported vlm_category_focus={focus!r}. "
-            "Expected one of: all, failure, near_miss, success."
+            "Expected one of: all, failure, near_miss, failure_and_near_miss, success."
         )
 
     return [cat for cat in requested if env_categories.get(cat)]

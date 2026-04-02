@@ -257,7 +257,7 @@ for seed in "${seeds[@]}"; do
           ${EUREKA_ARG} \
           ${VLM_SELECTION_ARG} \
           ${VLM_CATEGORY_ARG} \
-          --rl_project_path="/home/robotics/naoki_workspace/codes/robotics_rl" \
+          --rl_project_path="/home/nwake/codes/RL_project" \
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \

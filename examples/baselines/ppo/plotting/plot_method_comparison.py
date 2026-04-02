@@ -25,10 +25,7 @@ METHODS_STANDARD = {
 }
 
 METHODS_FULL = {
-    # "eureka_full": {"label": "Eureka Full (LLM-only)", "color": "#1a5276", "marker": "s"},
-    "eureka_full_k_16": {"label": "Eureka Full K=16 (LLM-only)", "color": "#1a5276", "marker": "s"},
-    # "outer-loop_full": {"label": "VLM+LLM Full", "color": "#e67e22", "marker": "o"},
-    # "outer-loop_full_failureselection": {"label": "VLM+LLM Failure Selection", "color": "#27ae60", "marker": "^"},
+    "eureka_full_k_16": {"label": "Eureka K=16", "color": "#2980b9", "marker": "s"},
     "outer-loop_full_failureselection_k_16": {"label": "VLM+LLM FailSel K=16", "color": "#8e44ad", "marker": "D"},
 }
 
@@ -78,6 +75,18 @@ def _history_length(run_dir: Path) -> int:
         return 0
 
 
+def _best_success(run_dir: Path) -> float:
+    history_path = run_dir / "outer_loop_history.json"
+    if not history_path.exists():
+        return 0.0
+    try:
+        with open(history_path) as f:
+            history = json.load(f)
+        return max((e["best_candidate"]["eval_metrics"].get("success_once", 0.0) for e in history), default=0.0)
+    except (json.JSONDecodeError, ValueError, KeyError):
+        return 0.0
+
+
 def latest_run(method: str, task: str, seed: str) -> Path | None:
     task_dir = BASE_DIR / method / task
     if not task_dir.exists():
@@ -85,17 +94,23 @@ def latest_run(method: str, task: str, seed: str) -> Path | None:
     runs = [r for r in task_dir.iterdir() if _extract_seed(r.name) == seed]
     if not runs:
         return None
-    # Prefer latest run by timestamp (early-stopped runs have fewer iters but are still valid)
+    # Prefer run with best results; break ties by timestamp
+    runs_with_history = [r for r in runs if _history_length(r) > 0]
+    if runs_with_history:
+        runs_with_history.sort(key=lambda p: (_best_success(p), _extract_timestamp(p.name)))
+        return runs_with_history[-1]
+    # No run has history yet
     runs.sort(key=lambda p: _extract_timestamp(p.name))
     return runs[-1]
 
 
-def load_success(run_dir: Path, is_full: bool, metric: str = "success_once") -> list[float] | None:
+def load_success(run_dir: Path, is_full: bool, metric: str = "success_once", max_iters: int = 5) -> list[float] | None:
     history_path = run_dir / "outer_loop_history.json"
     if not history_path.exists():
         return None
     with open(history_path) as f:
         history = json.load(f)
+    history = history[:max_iters]
     if is_full:
         return [e["best_candidate"]["eval_metrics"].get(metric, 0.0) for e in history]
     else:
@@ -140,7 +155,8 @@ def main():
         axes_flat = axes.flatten() if n_rows > 1 else axes
 
         for ax, task in zip(axes_flat, tasks):
-            for method, style in methods.items():
+            n_methods = len(methods)
+            for mi, (method, style) in enumerate(methods.items()):
                 all_success = []
                 for seed in seeds:
                     run_dir = latest_run(method, task, seed)
@@ -154,7 +170,9 @@ def main():
                     continue
 
                 n_iters = len(all_success[0])
-                iters = np.arange(1, n_iters + 1)
+                # Jitter x-positions to avoid overlap
+                jitter = (mi - (n_methods - 1) / 2) * 0.08
+                iters = np.arange(1, n_iters + 1) + jitter
 
                 # Individual seeds as faint scatter
                 for s in all_success:

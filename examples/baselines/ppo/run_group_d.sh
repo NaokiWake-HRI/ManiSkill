@@ -1,8 +1,18 @@
 #!/bin/bash
-# Group D: GPU 5 — RotateValve smoke test (video export check)
-export GPUS_OVERRIDE="5,5"
-export ENVS_OVERRIDE="RotateValveLevel0-v1"
-export NUM_CANDIDATES_OVERRIDE=2
-export OUTER_ITERS_OVERRIDE=2
-export TOTAL_OVERRIDE=500_000
-exec bash outer_loop_full.sh "$@"
+# Group D: GPU 0 — RotateValve + OpenCabinetDoor + OpenCabinetDrawer
+# Per-task: vlm_failureselection then eureka (cross-resume from vlm iter 0)
+export GPUS_OVERRIDE="0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1"
+
+for ENV in OpenCabinetDrawer-v1; do
+    export ENVS_OVERRIDE="${ENV}"
+
+    # Per-task total_timesteps
+    if [ "${ENV}" == "RotateValveLevel0-v1" ]; then
+        export TOTAL_OVERRIDE=10_000_000
+    else
+        export TOTAL_OVERRIDE=5_000_000
+    fi
+
+    bash outer_loop_full.sh vlm_failureselection "$@"
+    CROSS_RESUME_OVERRIDE=1 bash outer_loop_full.sh eureka "$@"
+done

@@ -1776,10 +1776,8 @@ if __name__ == "__main__":
                     print(f"  Showing categories: {categories_shown} (envs: {selected_envs})")
                 else:
                     frames, categories_shown, selected_envs = [], [], {}
-                    vlm_prompt = build_vlm_prompt_categorized(
-                        args.env_id,
-                        [args.vlm_category_focus],
-                    )
+                    # No matching episodes — fall back to generic failure prompt
+                    vlm_prompt = build_vlm_prompt(args.env_id)
                     print(
                         "  [warn] No categorized frames matched "
                         f"vlm_category_focus={args.vlm_category_focus!r}; "

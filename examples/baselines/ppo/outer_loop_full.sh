@@ -85,7 +85,7 @@ if [ "${MODE}" == "eureka" ]; then
     MODE_LABEL="Eureka Full Replacement (NO VLM)"
     WANDB_TAG="eureka-full"
     VLM_SELECTION_ARG=""
-    VLM_CATEGORY_ARG=""
+    VLM_CATEGORY_ARG="--vlm_category_focus=${VLM_CATEGORY_FOCUS_OVERRIDE:-failure}"
 else
     EUREKA_ARG=""
     EXP_PREFIX="ppo-vlm-full-failureselection"

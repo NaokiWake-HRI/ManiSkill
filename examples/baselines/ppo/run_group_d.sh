@@ -1,18 +1,15 @@
 #!/bin/bash
-# Group D: GPU 0 — RotateValve + OpenCabinetDoor + OpenCabinetDrawer
-# Per-task: vlm_failureselection then eureka (cross-resume from vlm iter 0)
-export GPUS_OVERRIDE="0,0,0,0,0,0,0,0"
+# Group D: GPU 2,3,4,5 — RotateSingleObjectInHand with failure_and_near_miss VLM focus
+export GPUS_OVERRIDE="2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5"
+export VLM_CATEGORY_FOCUS_OVERRIDE="failure_and_near_miss"
 
-for ENV in RotateValveLevel0-v1 OpenCabinetDoor-v1 OpenCabinetDrawer-v1; do
+for ENV in RotateSingleObjectInHandLevel0-v1; do
     export ENVS_OVERRIDE="${ENV}"
 
     # Per-task total_timesteps
-    if [ "${ENV}" == "RotateValveLevel0-v1" ]; then
-        export TOTAL_OVERRIDE=10_000_000
-    else
-        export TOTAL_OVERRIDE=5_000_000
-    fi
+    # Use outer_loop_full.sh defaults (25M for RotateSingleObject)
+    unset TOTAL_OVERRIDE
 
     bash outer_loop_full.sh vlm_failureselection "$@"
-    CROSS_RESUME_OVERRIDE=1 bash outer_loop_full.sh eureka "$@"
+    CROSS_RESUME_OVERRIDE=1 OUTER_ITERS_OVERRIDE=4 bash outer_loop_full.sh eureka "$@"
 done

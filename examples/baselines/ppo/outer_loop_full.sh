@@ -201,10 +201,10 @@ for seed in "${seeds[@]}"; do
             NUM_STEPS=80             # = max_episode_steps (250は不要)
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "RotateSingleObjectInHandLevel0-v1" ]; then
-            TOTAL=50_000_000         # 50M needed for convergence
+            TOTAL=25_000_000         # 25M (half wall-clock of 50M, same grad updates)
             EVAL_STEPS=300           # max_episode_steps=300
             NUM_ENVS=512             # Validated on GPU 1 (32GB)
-            NUM_STEPS=300            # = max_episode_steps
+            NUM_STEPS=150            # batch=76800, iters=325, same grad updates as 50M/300
             UPDATE_EPOCHS=8
         elif [ "${ENV}" == "UnitreeG1TransportBox-v1" ]; then
             TOTAL=100_000_000        # Baseline: 100M

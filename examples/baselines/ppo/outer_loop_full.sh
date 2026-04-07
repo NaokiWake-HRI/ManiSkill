@@ -227,6 +227,10 @@ for seed in "${seeds[@]}"; do
         if [ "${CROSS_RESUME}" -eq 1 ]; then
             CROSS_RESUME_ARG="--resume_from_counterpart"
         fi
+        RESUME_DIR_ARG=""
+        if [ -n "${RESUME_DIR_OVERRIDE}" ]; then
+            RESUME_DIR_ARG="--resume_dir=${RESUME_DIR_OVERRIDE} --resume_first_iter_only"
+        fi
         EARLY_STOP_ARG=""
         if [ "${EARLY_STOP_SUCCESS}" -eq 1 ]; then
             EARLY_STOP_ARG="--early_stop_success"
@@ -261,6 +265,7 @@ for seed in "${seeds[@]}"; do
           --track \
           --exp-name="${EXP_PREFIX}-${ENV}-${seed}" \
           ${CROSS_RESUME_ARG} \
+          ${RESUME_DIR_ARG} \
           ${EARLY_STOP_ARG} \
           ${VLM_REWARD_PLOT_ARG} \
           2>&1 | tee "${log_file}"

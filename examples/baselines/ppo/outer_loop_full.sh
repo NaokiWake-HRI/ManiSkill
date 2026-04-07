@@ -200,6 +200,12 @@ for seed in "${seeds[@]}"; do
             NUM_ENVS=512             # Validated: envs=512 が学習品質最良
             NUM_STEPS=80             # = max_episode_steps (250は不要)
             UPDATE_EPOCHS=8
+        elif [ "${ENV}" == "RotateSingleObjectInHandLevel0-v1" ]; then
+            TOTAL=50_000_000         # Dexterity task
+            EVAL_STEPS=200           # max_episode_steps=200
+            NUM_ENVS=512
+            NUM_STEPS=300            # batch: 512*300=153,600
+            UPDATE_EPOCHS=8
         elif [ "${ENV}" == "UnitreeG1TransportBox-v1" ]; then
             TOTAL=100_000_000        # Baseline: 100M
             EVAL_STEPS=100           # max_episode_steps=100

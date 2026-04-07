@@ -56,6 +56,7 @@ TASKS_FULL = [
     "PegInsertionSide-v1",
     "PushT-v1",
     "RotateValveLevel0-v1",
+    "RotateSingleObjectInHandLevel0-v1",
     "UnitreeG1PlaceAppleInBowl-v1",
     "UnitreeG1TransportBox-v1",
     "AnymalC-Reach-v1",

@@ -68,8 +68,10 @@ def _extract_timestamp(name: str) -> str:
 
 
 def _extract_seed(name: str) -> str | None:
-    # Strip _resumeN_TIMESTAMP suffix if present (e.g. _resume1_20260302_185045)
-    stripped = re.sub(r"_resume\d+_\d{8}_\d{6}$", "", name)
+    # Strip all _resumeN_TIMESTAMP suffixes (may be chained, e.g. _resume1_..._resume1_...)
+    stripped = name
+    while re.search(r"_resume\d+_\d{8}_\d{6}$", stripped):
+        stripped = re.sub(r"_resume\d+_\d{8}_\d{6}$", "", stripped)
     m = re.search(r"-(\d+)-\S+-\d{8}_\d{6}$", stripped)
     return m.group(1) if m else None
 

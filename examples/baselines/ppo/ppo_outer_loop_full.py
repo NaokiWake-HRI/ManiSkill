@@ -1975,6 +1975,7 @@ if __name__ == "__main__":
                     "PegInsertionSide": "_compute_peg_insertion",
                     "PushT": "_compute_push_t",
                     "PickCubePandaAllegro": "_compute_pick_cube_allegro",
+                    "RotateSingleObjectInHand": "_compute_rotate_single_object",
                 }
                 try:
                     method_name = _reward_method_map[task_id]

@@ -86,6 +86,12 @@ TASK_DEFAULTS = {
         "w_velocity": 4.0,
         "w_progress": 1.0,
     },
+    "RotateSingleObjectInHand": {
+        "w_rotation": 20.0,
+        "w_velocity_penalty": 0.1,
+        "w_fall_penalty": 50.0,
+        "w_fingertip_dist": 1.0,
+    },
     "UnitreeG1TransportBox": {
         "w_face_box": 1.0,
         "w_grasp": 1.0,
@@ -157,6 +163,7 @@ class RewardWrapperDynamic(gym.Wrapper):
             "PushT": self._compute_push_t,
             "PickCubePandaAllegro": self._compute_pick_cube_allegro,
             "RotateValve": self._compute_rotate_valve,
+            "RotateSingleObjectInHand": self._compute_rotate_single_object,
             "UnitreeG1TransportBox": self._compute_transport_box,
         }[self.task_id]
 
@@ -734,6 +741,43 @@ class RewardWrapperDynamic(gym.Wrapper):
             "contact": (scale * w["w_contact"] * contact_r).mean().item(),
             "velocity": (scale * w["w_velocity"] * velocity_r).mean().item(),
             "progress": (scale * w["w_progress"] * progress_r).mean().item(),
+            "norm_scale": scale,
+        }
+        return reward
+
+    # --- RotateSingleObjectInHand ---
+    def _compute_rotate_single_object(self, info: dict) -> torch.Tensor:
+        base = self.env.unwrapped
+        w = self.weights
+
+        # rotation: per-step rotation angle
+        rotation_r = info["rotation_angle"]
+
+        # velocity penalty
+        velocity_penalty = info["obj_vel"]
+
+        # fall penalty
+        fall_penalty = info["obj_fall"].float()
+
+        # fingertip distance to object
+        obj_tip_dist = info["obj_tip_dist"]  # (b, 4)
+        fingertip_r = torch.mean(
+            0.1 / (0.02 + 4 * obj_tip_dist), dim=-1
+        ).clamp(0, 1)
+
+        scale = self._norm_scale()
+        reward = scale * (
+            w["w_rotation"] * rotation_r
+            - w["w_velocity_penalty"] * velocity_penalty
+            - w["w_fall_penalty"] * fall_penalty
+            + w["w_fingertip_dist"] * fingertip_r
+        )
+
+        self._last_breakdown = {
+            "rotation": (scale * w["w_rotation"] * rotation_r).mean().item(),
+            "velocity_penalty": (scale * w["w_velocity_penalty"] * velocity_penalty).mean().item(),
+            "fall_penalty": (scale * w["w_fall_penalty"] * fall_penalty).mean().item(),
+            "fingertip_dist": (scale * w["w_fingertip_dist"] * fingertip_r).mean().item(),
             "norm_scale": scale,
         }
         return reward

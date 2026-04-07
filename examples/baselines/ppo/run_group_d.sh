@@ -1,9 +1,9 @@
 #!/bin/bash
 # Group D: GPU 0 — RotateValve + OpenCabinetDoor + OpenCabinetDrawer
 # Per-task: vlm_failureselection then eureka (cross-resume from vlm iter 0)
-export GPUS_OVERRIDE="0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1"
+export GPUS_OVERRIDE="0,0,0,0,0,0,0,0"
 
-for ENV in OpenCabinetDrawer-v1; do
+for ENV in RotateValveLevel0-v1 OpenCabinetDoor-v1 OpenCabinetDrawer-v1; do
     export ENVS_OVERRIDE="${ENV}"
 
     # Per-task total_timesteps

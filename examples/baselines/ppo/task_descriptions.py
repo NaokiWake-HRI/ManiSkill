@@ -67,6 +67,12 @@ def get_llm_task_descs(env_id: str) -> dict:
             "日本語補足: 3本指のDClawハンドでバルブを90度回転させるタスク。"
             "回答の末尾に日本語での簡潔な要約も追加してください。"
         ),
+        "RotateSingleObjectInHand": (
+            "An Allegro dexterous hand must rotate a cube in-hand by 360 degrees around "
+            "the Z-axis (RotateSingleObjectInHandLevel0).\n\n"
+            "日本語補足: Allegro多指ハンドで立方体を手の中でZ軸周りに360度回転させるタスク。"
+            "回答の末尾に日本語での簡潔な要約も追加してください。"
+        ),
         "UnitreeG1TransportBox": (
             "A humanoid robot (UnitreeG1 upper body) must pick up a box from one table "
             "and place it on a second table (UnitreeG1TransportBox).\n\n"
@@ -338,6 +344,44 @@ Success condition (from environment):
 
 Reward design guidelines:
 - Total reward MUST be in [0, 6] range. No explicit success bonus (reward is continuous).
+
+Required function signature:
+def compute_reward(info: dict, base) -> torch.Tensor:
+    # Return: torch.Tensor, shape (batch_size,)
+    pass
+""",
+    "RotateSingleObjectInHand": """
+Available state attributes (base = env.unwrapped):
+- base.obj.pose.p: Object position, torch.Tensor (batch_size, 3)
+- base.obj.pose.q: Object rotation (quaternion), torch.Tensor (batch_size, 4)
+- base.obj.get_linear_velocity(): Object linear velocity, torch.Tensor (batch_size, 3)
+- base.agent.tip_links: List of 4 fingertip links [thumb, index, middle, ring]
+- base.agent.tip_links[i].pose.p: Fingertip position, torch.Tensor (batch_size, 3)
+- base.agent.robot.qpos: Joint positions, torch.Tensor (batch_size, 16)
+- base.agent.robot.qvel: Joint velocities, torch.Tensor (batch_size, 16)
+- base.hand_init_height: Initial hand height (0.25m), float
+- base.rot_dir: Rotation axis as one-hot vector (Z-axis for Level0: [0,0,1]), torch.Tensor (batch_size, 3)
+- base.cum_rotation_angle: Cumulative rotation angle so far, torch.Tensor (batch_size,)
+- base.success_threshold: Required cumulative rotation (pi*2 for 360 degrees), float
+
+info dict keys:
+- info["success"]: torch.Tensor (batch_size,) bool
+- info["rotation_angle"]: torch.Tensor (batch_size,) float (per-step rotation angle)
+- info["obj_vel"]: torch.Tensor (batch_size,) float (object linear velocity norm)
+- info["obj_fall"]: torch.Tensor (batch_size,) bool (object fell below hand)
+- info["obj_tip_dist"]: torch.Tensor (batch_size, 4) float (distance from each fingertip to object)
+- info["fail"]: torch.Tensor (batch_size,) bool (same as obj_fall)
+
+Success condition (from environment):
+- Cumulative unsigned rotation around Z-axis > pi*2 (360 degrees) AND object not fallen.
+- Object falls when Z position < hand_init_height - 0.05m.
+- Max episode steps: 300.
+
+Reward design guidelines:
+- Total reward MUST be in [0, 4] range. No explicit success bonus (reward is continuous).
+- Reward per-step rotation angle.
+- Penalize object falling heavily.
+- Reward fingertip proximity to object.
 
 Required function signature:
 def compute_reward(info: dict, base) -> torch.Tensor:

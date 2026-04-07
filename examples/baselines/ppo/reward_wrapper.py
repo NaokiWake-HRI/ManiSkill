@@ -80,6 +80,12 @@ TASK_DEFAULTS = {
         "w_directed_velocity": 4.0,
         "w_rotation_progress": 1.0,
     },
+    "RotateSingleObjectInHand": {
+        "w_rotation": 20.0,
+        "w_velocity_penalty": 0.1,
+        "w_fall_penalty": 50.0,
+        "w_fingertip_dist": 1.0,
+    },
     "UnitreeG1TransportBox": {
         "w_face_table": 1.0,
         "w_grasp": 2.0,

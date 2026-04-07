@@ -193,7 +193,7 @@ class RotateSingleObjectInHand(BaseEnv):
             vector_axis = (axis + 1) % 3
             vector = F.one_hot(vector_axis, num_classes=3).float()
 
-            self.success_threshold = torch.pi * 4
+            self.success_threshold = torch.pi * 2  # 1 full rotation (360 degrees)
             # Controller parameters
             stiffness = torch.tensor(self.agent.controller.config.stiffness)
             damping = torch.tensor(self.agent.controller.config.damping)
@@ -272,9 +272,9 @@ class RotateSingleObjectInHand(BaseEnv):
             obj_tip_vec = tip_poses[..., :3] - obj_pose.p[:, None, :]  # (b, 4, 3)
             obj_tip_dist = torch.linalg.norm(obj_tip_vec, dim=-1)  # (b, 4)
 
-            # 5. cum rotation angle
-            self.cum_rotation_angle += angle
-            success = self.cum_rotation_angle > self.success_threshold
+            # 5. cum rotation angle (ignore rotation when object has fallen)
+            self.cum_rotation_angle += angle * (~obj_fall).float()
+            success = (self.cum_rotation_angle > self.success_threshold) & (~obj_fall)
 
             # 6. controller effort
             qpos_target = self.agent.controller._target_qpos

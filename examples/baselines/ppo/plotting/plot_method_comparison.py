@@ -106,10 +106,10 @@ def latest_run(method: str, task: str, seed: str) -> Path | None:
     runs = [r for r in task_dir.iterdir() if _extract_seed(r.name) == seed]
     if not runs:
         return None
-    # Prefer run with best results; break ties by timestamp
+    # Prefer latest run by timestamp (early-stopped runs have fewer iters but are still valid)
     runs_with_history = [r for r in runs if _history_length(r) > 0]
     if runs_with_history:
-        runs_with_history.sort(key=lambda p: (_best_success(p), _extract_timestamp(p.name)))
+        runs_with_history.sort(key=lambda p: _extract_timestamp(p.name))
         return runs_with_history[-1]
     # No run has history yet
     runs.sort(key=lambda p: _extract_timestamp(p.name))

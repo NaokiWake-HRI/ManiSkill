@@ -190,7 +190,7 @@ class RewardFamilyCurator:
             model=self.model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
-            max_tokens=4096,
+            max_completion_tokens=4096,
         )
 
         raw_text = response.choices[0].message.content.strip()
@@ -499,7 +499,7 @@ class RewardFamilyCurator:
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                max_tokens=8192,
+                max_completion_tokens=8192,
             )
             raw_text = response.choices[0].message.content.strip()
 

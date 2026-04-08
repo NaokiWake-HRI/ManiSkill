@@ -2289,10 +2289,15 @@ if __name__ == "__main__":
                 print(f"[INFO] LLM disabled, proceeding with {len(candidates)} elite candidate(s)")
 
         # ========== STEP 1.5: Curator — diversity-preserving filter ==========
-        if curator is not None and len(candidates) > args.num_reward_candidates:
+        if curator is not None and len(candidates) >= args.num_reward_candidates:
             print(f"\n[Curator] Filtering {len(candidates)} candidates down to ~{args.num_reward_candidates}...")
             elite_ids_set = {c["id"] for c in candidates if c.get("is_elite")}
-            candidates = curator.curate(candidates, elite_ids=elite_ids_set)
+            candidates = curator.curate(
+                candidates,
+                elite_ids=elite_ids_set,
+                training_summary=training_summary,
+                compile_fn=lambda code: RewardWrapperDynamic._compile_custom_function_with_error(code)[1] is None,
+            )
             # Re-index candidate ids after filtering
             for i, cand in enumerate(candidates):
                 cand["id"] = i
@@ -2307,14 +2312,40 @@ if __name__ == "__main__":
                 print(f"[Curator] Failed to save debug info: {e}")
 
         # ========== STEP 2: Train and evaluate each candidate ==========
+        # Elite candidates skip training — carry forward previous eval results as-is
+        candidate_results = []
+        train_candidates = []
+        for cand in candidates:
+            if cand.get("is_elite") and outer_iter > 0:
+                prev_best = outer_loop_history[-1]["best_candidate"]
+                candidate_results.append({
+                    "candidate_id": cand["id"],
+                    "code": cand["code"],
+                    "rationale": cand["rationale"],
+                    "is_elite": True,
+                    "fitness": prev_best["fitness"],
+                    "fitness_success_at_end": prev_best.get("fitness_success_at_end", prev_best["fitness"]),
+                    "fitness_success_once": prev_best.get("fitness_success_once", prev_best.get("eval_metrics", {}).get("success_once", 0.0)),
+                    "fitness_return": prev_best.get("fitness_return", prev_best.get("eval_metrics", {}).get("return", float("-inf"))),
+                    "eval_metrics": prev_best["eval_metrics"],
+                    "learning_curve": prev_best["learning_curve"],
+                    "reward_statistics": prev_best.get("reward_statistics", {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}),
+                    "eval_video_dir": prev_best.get("eval_video_dir", ""),
+                    "vlm_eval_video": prev_best.get("vlm_eval_video"),
+                    "env_last_outcomes": prev_best.get("env_last_outcomes", {}),
+                })
+                print(f"\n[Elite] Candidate {cand['id']+1} skipped training — carrying forward prev best (fitness={prev_best['fitness']:.4f})")
+            else:
+                train_candidates.append(cand)
+
         gpu_list = [int(g) for g in args.gpus.split(",")] if args.gpus else []
 
         if len(gpu_list) > 1:
             # --- Parallel K-candidate training across GPUs ---
-            print(f"\n[Parallel Mode] Training {len(candidates)} candidates across {len(gpu_list)} GPUs: {gpu_list}")
-            candidate_results = _train_candidates_parallel(
+            print(f"\n[Parallel Mode] Training {len(train_candidates)} candidates across {len(gpu_list)} GPUs: {gpu_list}")
+            candidate_results.extend(_train_candidates_parallel(
                 args=args,
-                candidates=candidates,
+                candidates=train_candidates,
                 outer_iter=outer_iter,
                 run_dir=run_dir,
                 global_step_offset=global_step_offset,
@@ -2323,15 +2354,14 @@ if __name__ == "__main__":
                 training_summary=training_summary,
                 save_llm_debug_html=save_llm_debug_html,
                 debug_dir=debug_dir,
-            )
+            ))
             # Advance global_step_offset by one training run worth of steps
             global_step_offset += args.total_timesteps_per_iter
         else:
             # --- Sequential K-candidate training (original code path) ---
-            candidate_results = []
             MAX_RUNTIME_RETRIES = 2
 
-            for cand in candidates:
+            for cand in train_candidates:
                 print(f"\n{'='*50}")
                 print(f"[Candidate {cand['id']+1}] Training PPO")
                 print(f"{'='*50}")

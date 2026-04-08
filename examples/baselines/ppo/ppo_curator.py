@@ -3,15 +3,20 @@ Reward Family Curator: diversity-preserving filter for LLM-generated reward cand
 
 Sits between LLM candidate generation and PPO training in the outer loop.
 Uses an LLM call to classify candidates into "reward families" by structural
-strategy, then enforces a per-family cap and removes near-duplicates so that
-the PPO training pool stays diverse and avoids mode collapse.
+strategy, then enforces balanced allocation across families and removes
+near-duplicates so that the PPO training pool stays diverse and avoids
+mode collapse.
 
 Elite candidates (is_elite=True) are never removed.
+
+When families are underrepresented, the curator generates targeted refill
+candidates by asking the LLM to write reward code for specific strategies.
 """
 
 import json
+import math
 import textwrap
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import openai
 
@@ -26,12 +31,14 @@ class RewardFamilyCurator:
         target_k: int = 16,
         max_per_family: int = 3,
         enable_refill: bool = True,
+        max_refill_attempts: int = 2,
     ):
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
         self.target_k = target_k
         self.max_per_family = max_per_family
         self.enable_refill = enable_refill
+        self.max_refill_attempts = max_refill_attempts
         # Stores debug info from the last curate() call
         self.last_debug_info: Optional[Dict[str, Any]] = None
 
@@ -43,14 +50,25 @@ class RewardFamilyCurator:
         self,
         candidates: List[Dict],
         elite_ids: Optional[Set[int]] = None,
+        training_summary: Optional[Dict] = None,
+        compile_fn: Optional[Callable[[str], bool]] = None,
     ) -> List[Dict]:
         """Top-level curation pipeline.
 
         1. Classify candidates into reward families via LLM.
         2. Remove near-duplicates (identified by LLM).
-        3. Select diverse subset (max_per_family cap, round-robin trim).
-        4. Elite candidates are always kept.
+        3. Allocate slots per family (balanced, elite always kept).
+        4. If underrepresented families exist and enable_refill=True,
+           generate targeted refill candidates via LLM.
         5. Return curated list with ``reward_family`` annotations.
+
+        Args:
+            candidates: List of candidate dicts with "id", "code", "rationale".
+            elite_ids: Set of candidate IDs that must never be removed.
+            training_summary: Context dict passed to LLM for refill generation
+                (task description, history, etc.).
+            compile_fn: Optional function to test-compile reward code.
+                Signature: compile_fn(code: str) -> bool.
         """
         if elite_ids is None:
             elite_ids = set()
@@ -67,10 +85,18 @@ class RewardFamilyCurator:
             for member_id in info.get("members", []):
                 family_map[int(member_id)] = label
 
-        # Step 2 + 3: select diverse subset
+        # Step 2 + 3: select diverse subset with balanced allocation
         curated = self.select_diverse_subset(
             candidates, family_map, duplicate_pairs, elite_ids
         )
+
+        # Step 4: targeted refill for underrepresented families
+        refill_info = []
+        if self.enable_refill and len(curated) < self.target_k and training_summary:
+            curated, refill_info = self._targeted_refill(
+                curated, families, family_map, elite_ids,
+                training_summary, compile_fn,
+            )
 
         # Annotate each candidate with its family label
         for cand in curated:
@@ -93,6 +119,7 @@ class RewardFamilyCurator:
             "duplicate_pairs": duplicate_pairs,
             "elite_ids": sorted(elite_ids),
             "kept_ids": sorted(c["id"] for c in curated if "id" in c),
+            "refill_info": refill_info,
         }
 
         return curated
@@ -310,9 +337,189 @@ class RewardFamilyCurator:
                 c for fam in sorted_families for c in family_selected[fam]
             ]
 
-        # Step 5: Refill if under target_k (from overflow pool)
-        if self.enable_refill and len(selected) < self.target_k:
+        # Step 5: Refill from overflow if under target_k
+        if len(selected) < self.target_k:
             needed = self.target_k - len(selected)
             selected.extend(overflow[:needed])
 
         return selected
+
+    # ------------------------------------------------------------------
+    # Targeted refill
+    # ------------------------------------------------------------------
+
+    def _targeted_refill(
+        self,
+        curated: List[Dict],
+        families: Dict[str, Dict],
+        family_map: Dict[int, str],
+        elite_ids: Set[int],
+        training_summary: Dict,
+        compile_fn: Optional[Callable[[str], bool]],
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Generate new candidates for underrepresented families.
+
+        Returns (updated_curated, refill_info_list).
+        """
+        refill_info = []
+        n_elite = sum(1 for c in curated if c.get("id") in elite_ids)
+        non_elite_slots = self.target_k - n_elite
+        n_families = max(len(families), 1)
+        slots_per_family = max(1, non_elite_slots // n_families)
+
+        # Count current allocation per family
+        family_counts: Dict[str, int] = {}
+        for cand in curated:
+            cid = cand.get("id")
+            if cid in elite_ids:
+                continue
+            label = family_map.get(cid, "unknown")
+            family_counts[label] = family_counts.get(label, 0) + 1
+
+        # Identify families that need more candidates
+        deficit: Dict[str, int] = {}
+        for label in families:
+            current = family_counts.get(label, 0)
+            needed = slots_per_family - current
+            if needed > 0:
+                deficit[label] = needed
+
+        if not deficit:
+            return curated, refill_info
+
+        total_needed = min(
+            sum(deficit.values()),
+            self.target_k - len(curated),
+        )
+        if total_needed <= 0:
+            return curated, refill_info
+
+        print(f"  [Curator Refill] Need {total_needed} candidates for families: "
+              f"{', '.join(f'{k}({v})' for k, v in deficit.items())}")
+
+        # Build refill requests
+        next_id = max((c.get("id", -1) for c in curated), default=-1) + 1
+        for attempt in range(self.max_refill_attempts):
+            if total_needed <= 0:
+                break
+
+            refill_candidates = self._generate_refill(
+                deficit, families, training_summary, total_needed,
+            )
+
+            for rc in refill_candidates:
+                code = rc.get("code", "")
+                if not code:
+                    continue
+                # Compile check
+                if compile_fn and not compile_fn(code):
+                    continue
+
+                rc["id"] = next_id
+                next_id += 1
+                family_label = rc.get("target_family", "refill")
+                rc["reward_family"] = family_label
+                rc["is_refill"] = True
+                family_map[rc["id"]] = family_label
+                curated.append(rc)
+
+                refill_info.append({
+                    "id": rc["id"],
+                    "family": family_label,
+                    "attempt": attempt,
+                })
+
+                # Update deficit
+                if family_label in deficit:
+                    deficit[family_label] -= 1
+                    if deficit[family_label] <= 0:
+                        del deficit[family_label]
+                total_needed -= 1
+                if total_needed <= 0:
+                    break
+
+            if not deficit:
+                break
+
+        if total_needed > 0:
+            print(f"  [Curator Refill] Warning: still {total_needed} slots unfilled after {self.max_refill_attempts} attempts")
+
+        return curated, refill_info
+
+    def _generate_refill(
+        self,
+        deficit: Dict[str, int],
+        families: Dict[str, Dict],
+        training_summary: Dict,
+        total_needed: int,
+    ) -> List[Dict]:
+        """Ask LLM to generate candidates for specific reward families."""
+
+        task_desc = training_summary.get("llm_task_description", "")
+        state_docs = training_summary.get("state_access_docs", "")
+        reward_src = training_summary.get("reward_fn_source", "")
+
+        family_requests = []
+        for label, count in deficit.items():
+            desc = families.get(label, {}).get("description", label)
+            family_requests.append(f"- {count} candidate(s) using strategy: '{label}' ({desc})")
+
+        prompt = textwrap.dedent(f"""\
+            You are writing reward functions for a reinforcement learning task.
+
+            Task: {task_desc}
+
+            {f'State Access Documentation:{chr(10)}{state_docs}' if state_docs else ''}
+
+            Generate reward function candidates with SPECIFIC strategies as requested below.
+            Each candidate must use a DIFFERENT approach from the requested family.
+
+            Requested candidates:
+            {chr(10).join(family_requests)}
+
+            Total candidates needed: {total_needed}
+
+            For each candidate, write a complete `compute_reward(info, base)` function.
+            Store per-component values in `info["_reward_components"]`.
+
+            Respond with ONLY valid JSON:
+            {{
+                "candidates": [
+                    {{
+                        "target_family": "family_label",
+                        "rationale": "Brief explanation of this candidate's strategy",
+                        "code": "import torch\\ndef compute_reward(info, base):\\n    ...\\n    return reward"
+                    }}
+                ]
+            }}
+        """)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=8192,
+            )
+            raw_text = response.choices[0].message.content.strip()
+
+            json_text = raw_text
+            if "```" in json_text:
+                parts = json_text.split("```")
+                for part in parts[1:]:
+                    lines = part.strip().split("\n")
+                    if lines[0].strip().lower() in ("json", ""):
+                        lines = lines[1:]
+                    candidate_json = "\n".join(lines).strip()
+                    if candidate_json:
+                        json_text = candidate_json
+                        break
+
+            result = json.loads(json_text)
+            candidates = result.get("candidates", [])
+            print(f"  [Curator Refill] LLM generated {len(candidates)} refill candidates")
+            return candidates
+
+        except Exception as e:
+            print(f"  [Curator Refill] Error generating refill: {e}")
+            return []

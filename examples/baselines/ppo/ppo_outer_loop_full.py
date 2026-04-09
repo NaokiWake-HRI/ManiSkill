@@ -73,7 +73,6 @@ from ppo_common import (
     resolve_vlm_categories_to_show,
     generate_reward_plot_html, append_html_to_file, generate_random_weights,
 )
-from ppo_curator import RewardFamilyCurator
 from reward_wrapper_dynamic import RewardWrapperDynamic, TASK_DEFAULTS, _resolve_task_id
 from task_descriptions import get_llm_task_descs, STATE_ACCESS_DOCS
 
@@ -237,11 +236,8 @@ class Args:
     """stop outer loop early when best candidate reaches success_at_end >= 1.0"""
 
     # Curator (diversity-preserving filter between LLM generation and PPO training)
-    enable_curator: bool = False
-    """enable reward family curator to maintain candidate diversity and prevent mode collapse"""
-    curator_oversample_factor: float = 1.5
-    """when curator is enabled, oversample LLM candidates by this factor before filtering"""
-    curator_max_per_family: int = 3
+    enable_family_diversity: bool = False
+    """ask LLM to label each candidate with a reward family and maintain diversity"""
     """maximum candidates to keep from any single reward family"""
 
     # Parallel K-candidate training
@@ -1509,21 +1505,6 @@ if __name__ == "__main__":
         print("[info] VLM/LLM disabled (--skip_vlm_llm)")
 
     # --- Curator initialization ---
-    curator = None
-    if args.enable_curator and not args.skip_vlm_llm:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if api_key:
-            curator = RewardFamilyCurator(
-                api_key=api_key,
-                model=args.llm_model,
-                target_k=args.num_reward_candidates,
-                max_per_family=args.curator_max_per_family,
-            )
-            print(f"[Curator] Initialized (target_k={args.num_reward_candidates}, max_per_family={args.curator_max_per_family}, oversample={args.curator_oversample_factor}x)")
-        else:
-            print("[Curator] Skipped (no OPENAI_API_KEY)")
-    elif args.enable_curator:
-        print("[Curator] Skipped (VLM/LLM disabled)")
 
     def analyze_candidate_video_with_vlm(
         best_candidate: Dict[str, Any],
@@ -1953,9 +1934,6 @@ if __name__ == "__main__":
                 print(f"  Skipping elite carry-over (previous iteration had no valid candidates)")
 
         llm_candidate_count = args.num_reward_candidates - len(candidates)
-        # Oversample when curator is enabled so filtering still reaches target_k
-        if curator is not None:
-            llm_candidate_count = int(llm_candidate_count * args.curator_oversample_factor)
 
         if llm is not None and args.enable_function_code:
             print(f"\n[Eureka] Generating {llm_candidate_count} LLM candidates (total slots: {args.num_reward_candidates})...")
@@ -2027,6 +2005,7 @@ if __name__ == "__main__":
                     "state_access_docs": _state_access_docs.get(task_id, ""),
                     "eureka_full_replacement": True,
                     "num_reward_candidates": llm_candidate_count,  # Batch: generate K candidates in one LLM call
+                    "enable_family_diversity": args.enable_family_diversity,
                 }
             else:
                 # Iteration 1+: Include statistics from previous iteration
@@ -2051,6 +2030,7 @@ if __name__ == "__main__":
                     "episode_len": prev_best["eval_metrics"].get("episode_len", 0.0),
                     "learning_curve": prev_best["learning_curve"],
                     "num_episodes": int(prev_best["eval_metrics"].get("num_episodes", 0)),
+                    "enable_family_diversity": args.enable_family_diversity,
                 }
 
                 # Add Reward Reflection from previous iteration (if available)
@@ -2287,29 +2267,6 @@ if __name__ == "__main__":
                 })
             else:
                 print(f"[INFO] LLM disabled, proceeding with {len(candidates)} elite candidate(s)")
-
-        # ========== STEP 1.5: Curator — diversity-preserving filter ==========
-        if curator is not None and len(candidates) >= args.num_reward_candidates:
-            print(f"\n[Curator] Filtering {len(candidates)} candidates down to ~{args.num_reward_candidates}...")
-            elite_ids_set = {c["id"] for c in candidates if c.get("is_elite")}
-            candidates = curator.curate(
-                candidates,
-                elite_ids=elite_ids_set,
-                training_summary=training_summary,
-                compile_fn=lambda code: RewardWrapperDynamic._compile_custom_function_with_error(code)[1] is None,
-            )
-            # Re-index candidate ids after filtering
-            for i, cand in enumerate(candidates):
-                cand["id"] = i
-            print(f"[Curator] Kept {len(candidates)} candidates across {len(curator.last_debug_info.get('families', {}))} families")
-            # Save curator debug info
-            curator_debug_path = debug_dir / f"iter_{outer_iter+1:02d}_curator.json"
-            try:
-                with open(curator_debug_path, "w") as f:
-                    json.dump(curator.last_debug_info, f, indent=2, default=str)
-                print(f"[Curator] Debug info saved to {curator_debug_path}")
-            except Exception as e:
-                print(f"[Curator] Failed to save debug info: {e}")
 
         # ========== STEP 2: Train and evaluate each candidate ==========
         # Elite candidates skip training — carry forward previous eval results as-is

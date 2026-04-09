@@ -1241,12 +1241,13 @@ if __name__ == "__main__":
     # Append VLM category focus to distinguish experiment variants
     _cat_focus = getattr(args, "vlm_category_focus", "failure")
     _cat_suffix = f"_{_cat_focus}" if _cat_focus not in ("failure", None, "") else ""
+    _div_suffix = "_famdiv" if args.enable_family_diversity else ""
     if args.eureka_mode:
-        experiment_type = f"eureka_full{_cat_suffix}{k_suffix}"
+        experiment_type = f"eureka_full{_cat_suffix}{_div_suffix}{k_suffix}"
     elif args.vlm_reward_plot:
         experiment_type = f"outer-loop_full_reward_plot{k_suffix}"
     elif _is_failureselection_mode(args):
-        experiment_type = f"outer-loop_full_failureselection{_cat_suffix}{k_suffix}"
+        experiment_type = f"outer-loop_full_failureselection{_cat_suffix}{_div_suffix}{k_suffix}"
     else:
         experiment_type = f"outer-loop_full{k_suffix}"
     run_dir = f"{experiment_type}/{args.env_id}/{run_name}"

@@ -274,6 +274,7 @@ for seed in "${seeds[@]}"; do
           ${RESUME_DIR_ARG} \
           ${EARLY_STOP_ARG} \
           ${VLM_REWARD_PLOT_ARG} \
+          ${EXTRA_ARGS_OVERRIDE} \
           2>&1 | tee "${log_file}"
         rc=${PIPESTATUS[0]}
         if [ $rc -ne 0 ]; then

@@ -1,16 +1,15 @@
 #!/bin/bash
-# Paper experiments Group 1: GPU 2,3 — fast tasks first
-export GPUS_OVERRIDE="2,2,2,2,2,2,2,2,3,3,3,3,3,3,3,3"
+# Paper experiments Group 1: GPU 0,1 — fast tasks
+export GPUS_OVERRIDE="0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1"
 export VLM_CATEGORY_FOCUS_OVERRIDE="failure"
 export EXTRA_ARGS_OVERRIDE="--enable_family_diversity"
 
-for ENV in PushCube-v1 PickCube-v1 AnymalC-Reach-v1 PushT-v1 OpenCabinetDrawer-v1 UnitreeG1PlaceAppleInBowl-v1; do
+for ENV in PushCube-v1 PickCube-v1 AnymalC-Reach-v1 PushT-v1; do
     export ENVS_OVERRIDE="${ENV}"
 
-    # Per-task TOTAL (reduced where validated)
     case "${ENV}" in
-        PushCube-v1|PickCube-v1|OpenCabinetDrawer-v1) export TOTAL_OVERRIDE=5_000_000 ;;
-        *) unset TOTAL_OVERRIDE ;;  # use outer_loop_full.sh default
+        PushCube-v1|PickCube-v1) export TOTAL_OVERRIDE=5_000_000 ;;
+        *) unset TOTAL_OVERRIDE ;;
     esac
 
     bash outer_loop_full.sh vlm_failureselection

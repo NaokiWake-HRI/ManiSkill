@@ -6,7 +6,15 @@ export EXTRA_ARGS_OVERRIDE="--enable_family_diversity"
 
 for ENV in OpenCabinetDoor-v1 PegInsertionSide-v1 RotateValveLevel0-v1 RotateSingleObjectInHandLevel0-v1 UnitreeG1TransportBox-v1; do
     export ENVS_OVERRIDE="${ENV}"
-    unset TOTAL_OVERRIDE
+
+    # Per-task TOTAL (reduced where validated)
+    case "${ENV}" in
+        OpenCabinetDoor-v1)                 export TOTAL_OVERRIDE=5_000_000 ;;
+        RotateValveLevel0-v1)               export TOTAL_OVERRIDE=10_000_000 ;;
+        RotateSingleObjectInHandLevel0-v1)  ;; # use outer_loop_full.sh default (25M)
+        *) unset TOTAL_OVERRIDE ;;
+    esac
+
     bash outer_loop_full.sh vlm_failureselection
     CROSS_RESUME_OVERRIDE=1 OUTER_ITERS_OVERRIDE=4 bash outer_loop_full.sh eureka
 done

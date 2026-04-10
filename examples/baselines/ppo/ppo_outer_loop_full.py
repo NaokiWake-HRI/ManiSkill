@@ -466,6 +466,8 @@ def _run_worker_mode(task_path: str):
             "code": cand["code"],
             "rationale": cand["rationale"],
             "is_elite": cand.get("is_elite", False),
+            "family": cand.get("family"),
+            "design_intent": cand.get("design_intent"),
             "eval_metrics": result["eval_metrics"],
             "learning_curve": result["learning_curve"],
             "reward_stats": reward_stats,
@@ -2162,6 +2164,8 @@ if __name__ == "__main__":
                                 "rationale": rationale,
                                 "id": cand_id,
                                 "is_elite": False,
+                                "family": sug.get("family"),
+                                "design_intent": sug.get("design_intent"),
                             })
                             print(f"    ✓ Batch candidate {cand_id+1} compiled OK")
                             continue

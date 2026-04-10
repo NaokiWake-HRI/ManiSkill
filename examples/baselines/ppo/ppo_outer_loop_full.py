@@ -2629,9 +2629,9 @@ if __name__ == "__main__":
             if removed_best:
                 print(f"  [Cleanup] Removed {removed_best} intermediate ckpt(s) from best cand_{best_cand_id} (finals kept)")
 
-        # Early stop if success_once reached 1.0
+        # Early stop if final eval success_once reached 1.0
         if args.early_stop_success:
-            best_fitness = best.get("fitness_success_once", best["eval_metrics"].get("success_once", 0.0))
+            best_fitness = best["eval_metrics"].get("success_once", 0.0)
             if best_fitness >= 1.0:
                 print(f"\n{'='*60}")
                 print(f"SUCCESS RATE reached {best_fitness:.4f} at iteration {outer_iter+1}. Early stopping.")

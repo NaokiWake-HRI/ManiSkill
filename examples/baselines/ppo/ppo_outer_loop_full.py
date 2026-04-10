@@ -1260,9 +1260,9 @@ if __name__ == "__main__":
         # Eureka ↔ VLM+LLM (failureselection preferred, fallback to plain)
         # k_suffix ensures K=16 eureka finds K=16 counterpart, not K=4
         if args.eureka_mode:
-            counterpart_types = [f"outer-loop_full_failureselection{_cat_suffix}{k_suffix}", f"outer-loop_full_failureselection{k_suffix}", f"outer-loop_full{k_suffix}"]
+            counterpart_types = [f"outer-loop_full_failureselection{_cat_suffix}{_div_suffix}{k_suffix}", f"outer-loop_full_failureselection{_cat_suffix}{k_suffix}", f"outer-loop_full_failureselection{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif _is_failureselection_mode(args):
-            counterpart_types = [f"eureka_full{_cat_suffix}{k_suffix}", f"eureka_full{k_suffix}", f"outer-loop_full{k_suffix}"]
+            counterpart_types = [f"eureka_full{_cat_suffix}{_div_suffix}{k_suffix}", f"eureka_full{_cat_suffix}{k_suffix}", f"eureka_full{k_suffix}", f"outer-loop_full{k_suffix}"]
         elif args.vlm_reward_plot:
             counterpart_types = [f"outer-loop_full{k_suffix}"]
         else:

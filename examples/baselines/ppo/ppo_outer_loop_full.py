@@ -2493,19 +2493,15 @@ if __name__ == "__main__":
                 json.dump(outer_loop_history, f, indent=2, default=str)
             continue
 
-        # Primary fitness is success_at_end (paper-style), but this often ties at 0.0
-        # in early experiments. Break ties with success_once, then avg return.
+        # Primary fitness is success_once (standard RL metric).
+        # Break ties with avg return.
         best = max(
             candidate_results,
             key=lambda x: (
-                x.get("fitness_success_at_end", x["fitness"]),
                 x.get("fitness_success_once", x["eval_metrics"].get("success_once", 0.0)),
                 x.get("fitness_return", x["eval_metrics"].get("return", float("-inf"))),
             ),
         )
-        fitness_end_values = [c.get("fitness_success_at_end", c["fitness"]) for c in candidate_results]
-        if len(fitness_end_values) > 1 and max(fitness_end_values) == min(fitness_end_values):
-            print("  [Selection] success_at_end tied across candidates; tie-break used: peak_success_once -> return")
         if best.get("code") is not None:
             last_good_code = best["code"]
         print(f"\n{'='*60}")
@@ -2633,9 +2629,9 @@ if __name__ == "__main__":
             if removed_best:
                 print(f"  [Cleanup] Removed {removed_best} intermediate ckpt(s) from best cand_{best_cand_id} (finals kept)")
 
-        # Early stop if success rate reached 1.0
+        # Early stop if success_once reached 1.0
         if args.early_stop_success:
-            best_fitness = best.get("fitness_success_at_end", best["fitness"])
+            best_fitness = best.get("fitness_success_once", best["eval_metrics"].get("success_once", 0.0))
             if best_fitness >= 1.0:
                 print(f"\n{'='*60}")
                 print(f"SUCCESS RATE reached {best_fitness:.4f} at iteration {outer_iter+1}. Early stopping.")

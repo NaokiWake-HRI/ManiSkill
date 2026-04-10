@@ -9,7 +9,7 @@ for ENV in PushCube-v1 PickCube-v1 AnymalC-Reach-v1 PushT-v1 OpenCabinetDrawer-v
 
     # Per-task TOTAL (reduced where validated)
     case "${ENV}" in
-        OpenCabinetDrawer-v1) export TOTAL_OVERRIDE=5_000_000 ;;
+        PushCube-v1|PickCube-v1|OpenCabinetDrawer-v1) export TOTAL_OVERRIDE=5_000_000 ;;
         *) unset TOTAL_OVERRIDE ;;  # use outer_loop_full.sh default
     esac
 

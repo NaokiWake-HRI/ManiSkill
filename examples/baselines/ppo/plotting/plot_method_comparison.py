@@ -34,9 +34,15 @@ METHODS_FULL_FNM = {
     "outer-loop_full_failureselection_failure_and_near_miss_k_16": {"label": "VLM+LLM F+NM K=16", "color": "#27ae60", "marker": "^"},
 }
 
+METHODS_FULL_FAMDIV = {
+    "eureka_full_famdiv_k_16": {"label": "Eureka K=16 (famdiv)", "color": "#2980b9", "marker": "s"},
+    "outer-loop_full_failureselection_famdiv_k_16": {"label": "VLM+LLM famdiv K=16", "color": "#27ae60", "marker": "^"},
+}
+
 METHODS_FULL_GROUPS = [
     ("failure", METHODS_FULL_FAILURE),
     ("failure_and_near_miss", METHODS_FULL_FNM),
+    ("famdiv", METHODS_FULL_FAMDIV),
 ]
 
 TASKS_STANDARD = [
